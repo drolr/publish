@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8" /><title>合成图文算法夹具</title>
+<style>
+  img {
+    width: 20px;
+    height: 20px;
+  }
+  [contenteditable] {
+    min-height: 20px;
+  }
+</style>
+<textarea placeholder="请输入标题（5–30个汉字）">  合成标题  </textarea>
+<!-- prettier-ignore -->
+<div contenteditable="true"><p>  开始 原文  </p><p><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="></p><p><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="></p><p>结束段</p><templ style="display:none"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="></templ></div>
+<div contenteditable="true" role="textbox">
+  <p><br /></p>
+</div>
+<input placeholder="请输入图片描述(最多25字)" />
+<label><input type="radio" checked /><span></span><span>单图</span></label
+><label><input type="radio" /><span></span><span>三图</span></label>
+<button><span>存草稿</span></button><span>已保存</span>

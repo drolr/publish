@@ -1,0 +1,45 @@
+<!doctype html><meta charset="utf-8" />
+<!-- Pre-upload shape transcribed from G1 v5 observations. Post-upload content in
+ tests is deliberate fault injection, never a live terminal/resource contract. -->
+<style>
+  .arco-modal-wrapper {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+  }
+  .arco-modal {
+    background: white;
+    padding: 24px;
+  }
+  .arco-modal-mask {
+    position: fixed;
+    inset: 0;
+    background: #0003;
+  }
+  .plus-icon {
+    width: 24px;
+    height: 24px;
+  }
+</style>
+<textarea>已填写的标题</textarea>
+<div contenteditable="true"><p>已填写的正文</p></div>
+<!-- prettier-ignore -->
+<section id="cover"><div>展示封面</div><label><input type="radio" name="cover" checked><span>单图</span></label><label><input type="radio" name="cover"><span>三图</span></label><div class="article-cover-images"><div class="article-cover-add"><img class="plus-icon" alt=""></div></div></section>
+<script>
+  window.actions = [];
+  document
+    .querySelectorAll('input[type=radio]')
+    .forEach((e) =>
+      e.addEventListener('change', () => window.actions.push('mode')),
+    );
+  document.querySelector('.article-cover-add').onclick = () => {
+    window.actions.push('open');
+    const root = document.createElement('div');
+    root.id = 'layer';
+    root.innerHTML =
+      '<div class="arco-modal-mask"></div><div class="arco-modal-wrapper"><div class="arco-modal" role="dialog"><div>上传图片</div><button>选择图片</button><input type="file" multiple accept="image/jpeg,image/jpg,image/png,image/x-png,image/gif"><button aria-label="Close">×</button></div></div>';
+    document.body.append(root);
+    root.querySelector('input').onchange = () => window.actions.push('upload');
+  };
+</script>

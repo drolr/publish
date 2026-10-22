@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "article_id": "a",
+  "title": "标题",
+  "body": [{ "type": "paragraph", "text": "正文" }],
+  "images": [],
+  "source_platform": "来源",
+  "publication_history": [{ "secret": "do-not-return" }],
+  "rights_status": "unknown"
+}

@@ -1,0 +1,92 @@
+{
+  "name": "draft-assistant",
+  "productName": "懂车帝草稿助手",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local desktop draft assistant engineering baseline",
+  "license": "UNLICENSED",
+  "main": ".webpack/main/index.cjs",
+  "engines": {
+    "node": ">=24.0.0 <25",
+    "npm": ">=11.17.0 <12"
+  },
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package --platform=win32 --arch=x64",
+    "make": "electron-forge make --platform=win32 --arch=x64",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.renderer.json --noEmit",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:contract": "vitest run tests/contracts",
+    "test:fixture": "playwright test fixture.spec.ts",
+    "test:renderer": "playwright test batch-renderer.spec.ts library-renderer.spec.ts article-library-management.spec.ts continuous-editor-renderer.spec.ts article-edit-workspace.spec.ts draft-renderer.spec.ts article-cover-renderer.spec.ts manual-stop-settlement.spec.ts",
+    "test:dev": "playwright test dev.spec.ts",
+    "test:desktop": "playwright test desktop.spec.ts",
+    "test:package": "playwright test package.spec.ts",
+    "check:boundaries": "tsx scripts/check-boundaries.ts",
+    "check:migrations": "tsx scripts/check-migrations.ts",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run check:boundaries && npm run check:migrations && npm run test:unit && npm run test:integration && npm run test:contract"
+  },
+  "config": {
+    "forge": "./forge.config.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "htmlparser2": "6.1.0",
+    "playwright-core": "1.63.0",
+    "prosemirror-commands": "1.7.2",
+    "prosemirror-history": "1.5.1",
+    "prosemirror-keymap": "1.2.3",
+    "prosemirror-model": "1.25.12",
+    "prosemirror-state": "1.4.4",
+    "prosemirror-transform": "1.12.2",
+    "prosemirror-view": "1.42.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "sharp": "0.35.5",
+    "zod": "4.6.5"
+  },
+  "overrides": {
+    "@electron/packager": "20.3.0",
+    "extract-zip": "npm:@electron-internal/extract-zip@1.0.5",
+    "@electron/rebuild": "4.2.0",
+    "tmp": "0.2.7",
+    "webpack-dev-server": "6.0.0",
+    "http-cache-semantics": "4.3.0",
+    "shell-quote": "1.11.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "8.0.1",
+    "@electron-forge/maker-zip": "8.0.1",
+    "@electron-forge/plugin-auto-unpack-natives": "8.0.1",
+    "@electron-forge/plugin-webpack": "8.0.1",
+    "@electron-forge/shared-types": "8.0.1",
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.63.0",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "24.13.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vercel/webpack-asset-relocator-loader": "1.7.3",
+    "css-loader": "7.1.5",
+    "electron": "44.3.0",
+    "eslint": "10.10.0",
+    "mini-css-extract-plugin": "2.10.2",
+    "node-loader": "2.1.0",
+    "prettier": "3.9.6",
+    "ts-loader": "9.6.2",
+    "ts-node": "10.9.2",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.70.0",
+    "vitest": "5.0.1",
+    "webpack": "5.111.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "better-sqlite3": false
+  }
+}

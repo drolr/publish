@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "article_id": "collector-article-001",
+  "title": "一次城市通勤体验",
+  "body": [
+    { "type": "paragraph", "text": "早高峰从城区出发。" },
+    { "type": "image", "image_id": "front" },
+    { "type": "paragraph", "text": "结束后记录了这次体验。" },
+    { "type": "image", "image_id": "front" }
+  ],
+  "images": [
+    {
+      "image_id": "front",
+      "source": { "type": "local", "path": "images/front.jpg" }
+    }
+  ],
+  "content_declaration": "repost"
+}

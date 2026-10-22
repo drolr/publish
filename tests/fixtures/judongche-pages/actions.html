@@ -1,0 +1,39 @@
+<!doctype html><meta charset="utf-8" /><title>SYNTHETIC action fixture</title>
+<textarea aria-label="Synthetic title"></textarea
+><textarea aria-label="Synthetic paragraph"></textarea
+><button id="append">Append paragraph</button>
+<input aria-label="Synthetic image" type="file" />
+<div contenteditable="true" id="body"></div>
+<div hidden><img /></div>
+<button id="first">First material</button
+><button id="second">Second material</button
+><input aria-label="Mandatory declaration" type="checkbox" /><button id="save">
+  Save draft</button
+><button id="publish">Publish</button><button id="delete">Delete</button
+><output id="events"></output>
+<script>
+  const body = document.getElementById('body');
+  const events = document.getElementById('events');
+  const record = (value) => (events.textContent += value + '|');
+  document.getElementById('append').onclick = () => {
+    const p = document.createElement('p');
+    p.textContent = document.querySelector(
+      '[aria-label="Synthetic paragraph"]',
+    ).value;
+    body.append(p);
+    record('paragraph');
+  };
+  document.querySelector('input[type=file]').onchange = (event) => {
+    const img = document.createElement('img');
+    img.dataset.resource = String(body.children.length).repeat(64);
+    img.src =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
+    body.append(img);
+    record('image');
+    event.target.value = '';
+  };
+  for (const id of ['first', 'second', 'save', 'publish', 'delete'])
+    document.getElementById(id).onclick = () => record(id);
+  document.querySelector('input[type=checkbox]').onchange = () =>
+    record('declaration');
+</script>

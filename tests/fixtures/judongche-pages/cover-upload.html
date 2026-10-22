@@ -1,0 +1,130 @@
+<!doctype html><meta charset="utf-8" />
+<!-- WHOLLY SYNTHETIC: every selector, slot, state, association and cancellation signal is invented for this controlled contract. No production locator provenance. -->
+<main
+  id="synthetic-editor"
+  data-generation="generation-1"
+  data-context="article-context-1"
+  data-store="store-1"
+  data-settlement="settled"
+>
+  <label
+    ><input
+      type="radio"
+      name="synthetic-cover-mode"
+      value="single"
+    />合成单图</label
+  >
+  <label
+    ><input
+      type="radio"
+      name="synthetic-cover-mode"
+      value="triple"
+    />合成三图</label
+  >
+  <textarea id="title">合成封面测试文章</textarea>
+  <div id="body"><p>合成正文保持不变</p></div>
+  <div id="selected"></div>
+  <button id="open">合成封面入口</button>
+</main>
+<div id="cover-modal" role="dialog" hidden>
+  <input id="cover-input" type="file" multiple accept="image/png,image/jpeg" />
+  <div id="previews"></div>
+  <label><input id="library" type="checkbox" checked />保存到素材库</label
+  ><button id="confirm">确定</button><button id="cancel">取消</button>
+</div>
+<script>
+  const options = /*OPTIONS*/ {};
+  const editor = document.querySelector('#synthetic-editor'),
+    modal = document.querySelector('#cover-modal'),
+    input = document.querySelector('#cover-input'),
+    library = document.querySelector('#library');
+  window.actions = [];
+  window.coverItems = [];
+  window.coverMode = null;
+  window.uploadResult = null;
+  document
+    .querySelectorAll('input[name=synthetic-cover-mode]')
+    .forEach((radio) => {
+      radio.onchange = () => {
+        window.coverMode = radio.value;
+        window.actions.push('mode:' + radio.value);
+      };
+    });
+  if (options.unreadable) library.remove();
+  if (options.disabled) library.disabled = true;
+  if (options.unchecked) library.checked = false;
+  document.querySelector('#open').onclick = () => {
+    window.actions.push('open');
+    modal.hidden = false;
+  };
+  library.onchange = () => window.actions.push('library:' + library.checked);
+  input.onchange = async () => {
+    window.actions.push(
+      'upload:' +
+        Array.from(input.files)
+          .map((f) => f.name)
+          .join(','),
+    );
+    editor.dataset.settlement = 'pending';
+    window.uploadResult = null;
+    const files = Array.from(input.files);
+    const items = [];
+    for (let position = 0; position < files.length; position++) {
+      const file = files[position];
+      const bytes = await file.arrayBuffer();
+      const digest = Array.from(
+        new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)),
+      )
+        .map((n) => n.toString(16).padStart(2, '0'))
+        .join('');
+      if (options.partial && position === 2) continue;
+      if (options.rejected) continue;
+      const img = document.createElement('img');
+      img.src = URL.createObjectURL(file);
+      img.width = 24;
+      await new Promise((resolve) => {
+        img.onload = resolve;
+        img.onerror = resolve;
+      });
+      previews.append(img);
+      items.push({
+        position,
+        assetKey: file.name.replace(/\.(png|jpg)$/, ''),
+        sha256: digest,
+        resourceKey: digest,
+        loaded: img.complete && img.naturalWidth > 0,
+      });
+    }
+    window.coverItems = items;
+    editor.dataset.settlement = 'settled';
+    window.uploadResult = options.rejected
+      ? 'rejected'
+      : options.partial
+        ? 'incomplete'
+        : 'complete';
+  };
+  document.querySelector('#confirm').onclick = () => {
+    window.actions.push('confirm:' + library.checked);
+    selected.replaceChildren(...Array.from(previews.children));
+    modal.hidden = true;
+  };
+  cancel.onclick = () => {
+    window.actions.push('cancel');
+    modal.hidden = true;
+    if (options.late) {
+      editor.dataset.settlement = 'unknown';
+      setTimeout(() => {
+        editor.dataset.settlement = 'pending';
+        window.actions.push('late-upload');
+      }, 100);
+    } else editor.dataset.settlement = 'settled';
+    if (options.drift === 'generation')
+      editor.dataset.generation = 'generation-2';
+    if (options.drift === 'context') editor.dataset.context = 'other';
+    if (options.drift === 'store') editor.dataset.store = 'other';
+    if (options.drift === 'body')
+      document.querySelector('#body p').textContent = '已改变';
+    if (options.drift === 'title') title.value = '已改变';
+    if (options.modalStays) modal.hidden = false;
+  };
+</script>

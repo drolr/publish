@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "article_id": "original-1",
+  "title": "原创记录",
+  "body": [{ "type": "paragraph", "text": "原创正文" }],
+  "images": [],
+  "content_declaration": "original"
+}

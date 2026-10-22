@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>合成已上传正文图夹具</title>
+<style>
+  [contenteditable] {
+    min-height: 20px;
+  }
+  .pgc-image img {
+    width: 20px;
+    height: 20px;
+  }
+</style>
+<textarea>合成单篇标题</textarea>
+<div contenteditable="true">
+  <p>第一段</p>
+  <p><br class="ProseMirror-trailingBreak" /></p>
+  <div __syl_tag="true" contenteditable="false" draggable="true">
+    <templ style="display: none">
+      <div class="pgc-img">
+        <img
+          web_uri="synthetic/body-resource"
+          src="https://www.autoengine.com/fixture-image.png?web_uri=synthetic%2Fbody-resource&amp;rendition=template"
+        />
+      </div>
+    </templ>
+    <mask>
+      <div class="pgc-image pgc-card-fixWidth">
+        <div class="pgc-img-wrapper">
+          <img
+            web_uri="synthetic/body-resource"
+            src="https://www.autoengine.com/fixture-image.png?web_uri=synthetic%2Fbody-resource&amp;rendition=visible"
+          />
+        </div>
+      </div>
+    </mask>
+  </div>
+  <p>第二段</p>
+  <p><br class="ProseMirror-trailingBreak" /></p>
+</div>
+<div contenteditable="true" role="textbox">
+  <p><br /></p>
+</div>

@@ -1,0 +1,47 @@
+CREATE TABLE judongche_draft_tasks_next (
+  task_id TEXT PRIMARY KEY NOT NULL,
+  preparation_id TEXT NOT NULL UNIQUE,
+  article_key TEXT NOT NULL REFERENCES articles(article_key) ON DELETE RESTRICT,
+  platform TEXT NOT NULL CHECK (platform = 'judongche'),
+  mode TEXT NOT NULL CHECK (mode = 'draft'),
+  store_key TEXT NOT NULL,
+  store_json TEXT NOT NULL CHECK (json_valid(store_json)),
+  snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+  snapshot_digest TEXT NOT NULL,
+  cover_policy TEXT NOT NULL CHECK (cover_policy IN ('store-material-first', 'manual-after-draft')),
+  state TEXT NOT NULL CHECK (state IN ('queued','running','draft_saved','failed','needs_human','stopped','interrupted','closed_without_save')),
+  stage TEXT NOT NULL CHECK (stage IN ('reserved','editor','body','cover','save','verify','settled')),
+  revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0),
+  possible_remote_effect INTEGER NOT NULL CHECK (possible_remote_effect IN (0,1)),
+  save_attempted INTEGER NOT NULL CHECK (save_attempted IN (0,1)),
+  stop_requested INTEGER NOT NULL CHECK (stop_requested IN (0,1)),
+  holds_platform INTEGER NOT NULL CHECK (holds_platform IN (0,1)),
+  evidence_json TEXT NOT NULL CHECK (json_valid(evidence_json)),
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (save_attempted <= possible_remote_effect),
+  CHECK (state NOT IN ('queued','running','needs_human','interrupted') OR holds_platform = 1),
+  CHECK (state <> 'draft_saved' OR (holds_platform = 0 AND possible_remote_effect = 1)),
+  CHECK (state NOT IN ('failed','stopped') OR (holds_platform = 0 AND possible_remote_effect = 0)),
+  CHECK (state <> 'closed_without_save' OR (holds_platform = 0 AND save_attempted = 0 AND stage = 'settled'))
+);
+INSERT INTO judongche_draft_tasks_next SELECT * FROM judongche_draft_tasks;
+DROP TABLE judongche_draft_tasks;
+ALTER TABLE judongche_draft_tasks_next RENAME TO judongche_draft_tasks;
+CREATE UNIQUE INDEX judongche_one_occupied_task
+  ON judongche_draft_tasks(platform) WHERE holds_platform = 1;
+
+CREATE UNIQUE INDEX judongche_one_unclosed_identity
+  ON judongche_draft_tasks(article_key, platform, store_key, mode)
+  WHERE state <> 'closed_without_save';
+CREATE TABLE judongche_task_closures (
+  task_id TEXT PRIMARY KEY NOT NULL REFERENCES judongche_draft_tasks(task_id) ON DELETE RESTRICT,
+  prior_revision INTEGER NOT NULL CHECK (prior_revision >= 0),
+  prior_state TEXT NOT NULL CHECK (prior_state IN ('needs_human','interrupted')),
+  prior_stage TEXT NOT NULL CHECK (prior_stage IN ('reserved','editor','body','cover','save','verify','settled')),
+  prior_reason TEXT,
+  event_json TEXT NOT NULL CHECK (json_valid(event_json)),
+  closed_at TEXT NOT NULL,
+  successor_task_id TEXT UNIQUE REFERENCES judongche_draft_tasks(task_id) ON DELETE RESTRICT
+);
