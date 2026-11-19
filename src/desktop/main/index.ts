@@ -1,3 +1,9 @@
+import { registerUploadWaitSettings } from './upload-wait-settings';
+import { parseUploadWaits } from '../../infrastructure/platforms/judongche/upload-waits';
+import { createCoverSaveService } from '../../application/cover-save';
+import { createBrowserHealthController } from '../../application/browser-health-controller';
+import { registerBrowserHealthHandlers } from './browser-health-ipc';
+import type { BrowserHealthView } from '../../contracts/browser-health';
 import {
   createBatchController,
   type BatchController,
@@ -22,7 +28,8 @@ import { registerArticleDeletionHandlers } from './article-delete-ipc';
 import { app, BrowserWindow, dialog, clipboard, ClipboardItem } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { readFileSync as readArchiveBytes } from 'original-fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   createDraftController,
   type DraftController,
@@ -32,7 +39,7 @@ import { createDraftSnapshotPort } from '../../infrastructure/assets/draft-snaps
 import { openDraftTaskRepository } from '../../infrastructure/persistence/draft-task-repository';
 import { createBrowserSession } from '../../infrastructure/automation/browser-session';
 import { createJudongcheAdapter } from '../../infrastructure/platforms/judongche/draft-adapter';
-import { writeProbeLog } from './probe-log';
+import { createRuntimeIdentity, writeProbeLog } from './probe-log';
 import type {
   DraftCommandResult,
   DraftView,
@@ -67,7 +74,7 @@ import { registerManualCloseHandlers } from './manual-close-ipc';
 import { createManualTempStore } from '../../infrastructure/assets/manual-temp-store';
 import { createManualImageSource } from '../../infrastructure/assets/manual-image-source';
 import { createWebPasteImageReader } from '../../infrastructure/assets/web-paste-image-reader';
-import { createWebPasteConverter } from '../../infrastructure/content/web-paste-converter';
+import { createRichWebPasteConverter } from '../../infrastructure/content/web-paste-converter';
 import { registerManualHandlers, createManualDesktopApi } from './manual-ipc';
 import {
   createLibraryWriteGate,
@@ -90,6 +97,14 @@ app.on('second-instance', () => {
 });
 if (primaryInstance)
   void app.whenReady().then(async () => {
+    const runtimeIdentity = createRuntimeIdentity(
+      {
+        appVersion: app.getVersion(),
+        packaged: app.isPackaged,
+        asarPath: app.getAppPath(),
+      },
+      readArchiveBytes,
+    );
     let repository: ReturnType<typeof openArticleRepository> | undefined;
     let service: ReturnType<typeof createArticleImportService> | undefined;
     let library: ReturnType<typeof createArticleLibrary> | undefined;
@@ -131,7 +146,8 @@ if (primaryInstance)
     let batch: BatchController | undefined;
     let batches: ReturnType<typeof openDraftBatchRepository> | undefined;
     // Main owns only lifecycle capabilities; browser handles stay in infrastructure.
-    let browser: { close(): Promise<void> } | undefined;
+    let browser: { close(): Promise<void>; isOccupied(): boolean } | undefined;
+    let health: ReturnType<typeof createBrowserHealthController> | undefined;
     try {
       const data = join(app.getPath('userData'), 'data');
       mkdirSync(data, { recursive: true });
@@ -211,6 +227,18 @@ if (primaryInstance)
       MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY,
       MAIN_WINDOW_WEBPACK_ENTRY,
     );
+    const getUploadWaitSettings = registerUploadWaitSettings(
+      window,
+      MAIN_WINDOW_WEBPACK_ENTRY,
+      app.getPath('userData'),
+      app.isPackaged ? dirname(app.getPath('exe')) : undefined,
+      () => {
+        void dialog.showMessageBox(window, {
+          type: 'warning',
+          message: '已使用默认等待时间。可在左上角 Settings中重新保存。',
+        });
+      },
+    );
     const controller =
       store && service
         ? createImportController({
@@ -276,10 +304,39 @@ if (primaryInstance)
             draft?.isActive()
           ? ('busy' as const)
           : ('ready' as const);
+    const coverPicker = createCoverFilePicker(async (count, signal) => {
+      if (signal.aborted) return undefined;
+      const selected = await dialog.showOpenDialog(window, {
+        title: '选择封面图片',
+        properties:
+          count === 1 ? ['openFile'] : ['openFile', 'multiSelections'],
+        filters: [{ name: '封面图片', extensions: ['jpg', 'jpeg', 'png'] }],
+      });
+      if (signal.aborted || selected.canceled) return undefined;
+      return selected.filePaths;
+    });
+    const coverAssets = repository
+      ? createCoverAssetStore(app.getPath('userData'), repository)
+      : undefined;
+    const coverWriter =
+      repository && coverAssets
+        ? createCoverSaveService(repository, coverAssets)
+        : undefined;
     const manual =
       store && service && repository
         ? createManualArticleController({
             documents: {
+              covers:
+                coverWriter && coverAssets
+                  ? {
+                      picker: coverPicker,
+                      loadCover: (key) => repository!.loadCover(key),
+                      readImage: (config, assetKey) =>
+                        coverAssets.readCoverAsset(config, assetKey),
+                      save: coverWriter.save,
+                      getSaveResult: coverWriter.getSaveResult,
+                    }
+                  : undefined,
               createEditorCompatibilityLease: (...args) =>
                 repository!.createEditorCompatibilityLease(...args),
               releaseEditorCompatibilityLease: (lease) =>
@@ -300,7 +357,7 @@ if (primaryInstance)
                 closeProtocol?.respond(...args) ?? false,
             },
             newId: randomUUID,
-            converter: createWebPasteConverter(
+            converter: createRichWebPasteConverter(
               app.isPackaged
                 ? join(process.resourcesPath, 'web-paste-worker.cjs')
                 : join(
@@ -377,17 +434,7 @@ if (primaryInstance)
       cover = createArticleCoverController({
         repository,
         assets: createCoverAssetStore(app.getPath('userData'), repository),
-        picker: createCoverFilePicker(async (count, signal) => {
-          if (signal.aborted) return undefined;
-          const selected = await dialog.showOpenDialog(window, {
-            title: '选择封面图片',
-            properties:
-              count === 1 ? ['openFile'] : ['openFile', 'multiSelections'],
-            filters: [{ name: '封面图片', extensions: ['jpg', 'jpeg', 'png'] }],
-          });
-          if (signal.aborted || selected.canceled) return undefined;
-          return selected.filePaths;
-        }),
+        picker: coverPicker,
         gate: () =>
           !store ||
           !recovery?.isReady() ||
@@ -419,12 +466,76 @@ if (primaryInstance)
         const contained = relative(root, profile);
         if (!contained || contained.startsWith('..') || isAbsolute(contained))
           throw new Error('BROWSER_UNAVAILABLE');
-        const session = createBrowserSession(profile);
+        let browserOperationEpoch = 0;
+        const session = createBrowserSession(profile, {
+          temporaryRoot: resolve(root, 'browser-health'),
+          onBusinessDisconnect: (check, closeRequested) => {
+            const task = tasks?.occupied();
+            writeProbeLog(
+              root,
+              { operation: 'business-browser', check, closeRequested },
+              task ? { taskId: task.taskId } : null,
+              runtimeIdentity,
+            );
+          },
+          operationEpoch: () => browserOperationEpoch,
+        });
         browser = session;
+        const invalidateOperation = () => {
+          browserOperationEpoch++;
+          session.invalidateHealth();
+        };
+        health = createBrowserHealthController({
+          runtime: session,
+          operationEpoch: () => browserOperationEpoch,
+          invalidateOperation,
+          admission: (): BrowserHealthView['reason'] => {
+            try {
+              if (
+                isClosing() ||
+                operationsStopping() ||
+                unresolvedStop() ||
+                !store ||
+                !recovery?.isReady() ||
+                !revisions?.isReady() ||
+                !manualClipboard.isReady() ||
+                !draft ||
+                draft.isActive() ||
+                draft.isBlocked() ||
+                isBatchBlocked() ||
+                controller?.isActive() ||
+                controller?.isBlocked() ||
+                manual?.hasSession() ||
+                manual?.isActive() ||
+                manual?.isBlocked() ||
+                cover?.hasSession() ||
+                cover?.isActive() ||
+                cover?.isBlocked()
+              )
+                return 'task_busy';
+              return session.hasBusinessSession() ? 'business_open' : null;
+            } catch {
+              return 'task_busy';
+            }
+          },
+        });
         const platform = createJudongcheAdapter(
           session,
           (event) => {
-            const task = tasks!.occupied() ?? tasks!.latest();
+            if (event.coverClick) {
+              writeProbeLog(
+                root,
+                event,
+                { taskId: event.coverClick.taskId },
+                runtimeIdentity,
+              );
+              return;
+            }
+            const task =
+              tasks!.occupied() ??
+              (event.check === 'editor-page-crashed'
+                ? undefined
+                : tasks!.latest());
             const taskState = task
               ? {
                   taskId: task.taskId,
@@ -438,16 +549,19 @@ if (primaryInstance)
                   hasRemoteRef: !!task.evidence.remote,
                 }
               : null;
-            writeProbeLog(root, event, taskState);
+            writeProbeLog(root, event, taskState, runtimeIdentity);
           },
           {
+            get uploadWaits() {
+              return parseUploadWaits(getUploadWaitSettings());
+            },
             manualReview: true,
             automaticDraftReview: false,
             batchSubmissionReview: 'operator',
-            // Private store bindings and historical approvals are not distributed.
           },
         );
         const preparation = createDraftPreparation({
+          contentCapabilities: () => platform.contentCapabilities(),
           repository,
           covers: repository,
           tasks,
@@ -464,7 +578,8 @@ if (primaryInstance)
           manual?.isBlocked() ||
           cover?.isBlocked()
             ? 'unavailable'
-            : unresolvedStop() ||
+            : session.isOccupied() ||
+                unresolvedStop() ||
                 cover?.hasSession() ||
                 cover?.isActive() ||
                 controller?.isActive() ||
@@ -473,7 +588,7 @@ if (primaryInstance)
               ? 'busy'
               : 'ready';
         draft = createDraftController({
-          // Historical account-specific recovery approvals remain local.
+          invalidateBrowserHealth: invalidateOperation,
           tasks,
           snapshots,
           preparation,
@@ -596,6 +711,7 @@ if (primaryInstance)
         } finally {
           store?.close();
         }
+        health?.dispose();
         tasks = undefined;
         store = undefined;
         library = undefined;
@@ -746,7 +862,8 @@ if (primaryInstance)
               );
             }
             const state = manual.getManualArticleState();
-            if (!('sessionId' in state) || !state.dirty) return true;
+            if (!('sessionId' in state) || !manual.hasUnsavedChanges())
+              return true;
             const answer = await dialog.showMessageBox(window, {
               type: 'question',
               title: '关闭应用',
@@ -923,10 +1040,14 @@ if (primaryInstance)
       };
     const draftCommand = async (
       run: () => Promise<DraftCommandResult>,
+      requiresBrowserAdmission: boolean,
       allowBatch = false,
     ): Promise<DraftCommandResult> => {
       const reason =
         draftReason() ??
+        (requiresBrowserAdmission && browser?.isOccupied()
+          ? 'PLATFORM_BUSY'
+          : undefined) ??
         (!allowBatch && isBatchBlocked() ? 'PLATFORM_BUSY' : undefined);
       // Admission must be checked before any await, including view projection.
       return reason
@@ -935,24 +1056,34 @@ if (primaryInstance)
     };
     registerDraftHandlers(window, MAIN_WINDOW_WEBPACK_ENTRY, {
       getDraftState: draftView,
-      openDraftSession: () => draftCommand(() => draft!.openDraftSession()),
-      checkDraftSession: () => draftCommand(() => draft!.checkDraftSession()),
-      closeDraftSession: () => draftCommand(() => draft!.closeDraftSession()),
+      finishHandledTask: (input) =>
+        draftCommand(() => draft!.finishHandledTask(input), true),
+      openDraftSession: () =>
+        draftCommand(() => draft!.openDraftSession(), true),
+      checkDraftSession: () =>
+        draftCommand(() => draft!.checkDraftSession(), true),
+      closeDraftSession: () =>
+        draftCommand(() => draft!.closeDraftSession(), false),
       prepareDraft: async (articleKey, bindingToken) => {
         const reason =
-          draftReason() ?? (isBatchBlocked() ? 'PLATFORM_BUSY' : undefined);
+          draftReason() ??
+          (browser?.isOccupied() || isBatchBlocked()
+            ? 'PLATFORM_BUSY'
+            : undefined);
         return reason
           ? { status: 'blocked', reason }
           : draft!.prepareDraft(articleKey, bindingToken);
       },
-      startDraft: (id) => draftCommand(() => draft!.startDraft(id)),
-      stopDraft: (id) => draftCommand(() => draft!.stopDraft(id), true),
-      reconcileDraft: (id) => draftCommand(() => draft!.reconcileDraft(id)),
+      startDraft: (id) => draftCommand(() => draft!.startDraft(id), true),
+      stopDraft: (id) => draftCommand(() => draft!.stopDraft(id), false, true),
+      reconcileDraft: (id) =>
+        draftCommand(() => draft!.reconcileDraft(id), true),
       prepareTaskClosure: (id) =>
-        draftCommand(() => draft!.prepareTaskClosure(id)),
+        draftCommand(() => draft!.prepareTaskClosure(id), true),
       confirmTaskClosure: (token) =>
-        draftCommand(() => draft!.confirmTaskClosure(token)),
-      openSavedDraft: (id) => draftCommand(() => draft!.openSavedDraft(id)),
+        draftCommand(() => draft!.confirmTaskClosure(token), true),
+      openSavedDraft: (id) =>
+        draftCommand(() => draft!.openSavedDraft(id), true),
     });
     const batchUnavailable = async (): Promise<BatchCommandResult> => ({
       status: 'blocked',
@@ -961,14 +1092,36 @@ if (primaryInstance)
     });
     registerBatchHandlers(window, MAIN_WINDOW_WEBPACK_ENTRY, {
       prepare: (input) =>
-        !isClosing() && batch
+        !isClosing() && batch && !browser?.isOccupied()
           ? batch.prepare(input)
           : Promise.resolve({
               status: 'blocked',
-              reason: isClosing() ? 'STOP_REQUESTED' : 'STORAGE_UNAVAILABLE',
+              reason: isClosing()
+                ? 'STOP_REQUESTED'
+                : browser?.isOccupied()
+                  ? 'PLATFORM_BUSY'
+                  : 'STORAGE_UNAVAILABLE',
             }),
       start: (input) =>
-        !isClosing() && batch ? batch.start(input) : batchUnavailable(),
+        browser?.isOccupied()
+          ? Promise.resolve({
+              status: 'blocked',
+              reason: 'PLATFORM_BUSY',
+              view: null,
+            })
+          : !isClosing() && batch
+            ? batch.start(input)
+            : batchUnavailable(),
+      skipCurrentAndContinue: (input) =>
+        !isClosing() && batch && !browser?.isOccupied()
+          ? batch.skipCurrentAndContinue(input)
+          : browser?.isOccupied()
+            ? Promise.resolve({
+                status: 'blocked',
+                reason: 'PLATFORM_BUSY',
+                view: null,
+              })
+            : batchUnavailable(),
       stop: (input) => (batch ? batch.stop(input) : batchUnavailable()),
       finish: (input) =>
         !isClosing() && batch ? batch.finish(input) : batchUnavailable(),
@@ -981,6 +1134,23 @@ if (primaryInstance)
           ? batch.getCurrent()
           : Promise.resolve(batches?.getCurrent() ?? null),
     });
+    const unavailableHealth: BrowserHealthView = {
+      status: 'unavailable',
+      version: null,
+      stage: null,
+      reason: 'task_busy',
+    };
+    registerBrowserHealthHandlers(window, MAIN_WINDOW_WEBPACK_ENTRY, {
+      getBrowserHealth: () =>
+        health?.getBrowserHealth() ?? Promise.resolve(unavailableHealth),
+      checkBrowserHealth: () =>
+        health?.checkBrowserHealth() ??
+        Promise.resolve({ status: 'blocked', view: unavailableHealth }),
+      openBrowserUpdate: () =>
+        health?.openBrowserUpdate() ??
+        Promise.resolve({ status: 'blocked', view: unavailableHealth }),
+    });
+    window.once('closed', () => health?.dispose());
     registerStatusHandler(window, MAIN_WINDOW_WEBPACK_ENTRY, () =>
       getAppStatus(store, app.getVersion()),
     );

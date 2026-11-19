@@ -1,12 +1,44 @@
 import { JudongcheCoverRequiredError } from '../../src/infrastructure/platforms/judongche/production-state';
 import { expect, it } from 'vitest';
-import { createHash } from 'node:crypto';
 import { coverDraftHarness, coverSession } from '../fixtures/cover-draft';
 import { createAdapterWithPages } from '../../src/infrastructure/platforms/judongche/draft-adapter';
 import { JudongchePageError } from '../../src/infrastructure/platforms/judongche/production-state';
 import { reduceTask } from '../../src/domain/draft-task';
 const execute = (h: ReturnType<typeof coverDraftHarness>) =>
   createAdapterWithPages(coverSession, h.pages).execute(h.task, h.hooks);
+
+it.each(['taskId', 'rootKey', 'coverKey'] as const)(
+  'never reuses a cancelled cover proof from an older %s',
+  async (field) => {
+    const h = coverDraftHarness();
+    h.observed.operation = {
+      taskId: h.task.taskId,
+      rootKey: 'current-root',
+      coverKey: 'current-cover',
+      saving: false,
+    };
+    h.pages.inspectOperationEditor = async () => structuredClone(h.observed);
+    h.pages.uploadLocalCover = async () => ({
+      status: 'recoverable_failure',
+      reason: 'UPLOAD_REJECTED',
+      items: [],
+      safeEditorProof: {
+        generation: 'fixture',
+        contextKey: h.observed.contextKey!,
+        storeKey: h.task.store.storeKey,
+        editorUrl: h.observed.editorUrl!,
+        modalClosed: true,
+        uploadsSettled: true,
+        operation: { ...h.observed.operation!, [field]: 'older-operation' },
+      },
+    });
+    expect(await execute(h)).toEqual({
+      status: 'blocked',
+      reason: 'PAGE_CHANGED',
+    });
+    expect(h.calls).not.toContain('save');
+  },
+);
 it('completed upload stays pending until loaded unique reopen, then body and cover settle', async () => {
   const h = coverDraftHarness('triple');
   const inspect = h.pages.inspectDraft;
@@ -40,14 +72,7 @@ it('recoverable_failure_saves_once and retains partial triple warning without do
       generation: 'fixture',
       contextKey: h.observed.contextKey!,
       storeKey: h.task.store.storeKey,
-      bodyDigest: createHash('sha256')
-        .update(
-          JSON.stringify({
-            title: h.observed.title,
-            blocks: h.observed.blocks,
-          }),
-        )
-        .digest('hex'),
+      editorUrl: h.observed.editorUrl!,
       modalClosed: true,
       uploadsSettled: true,
     },
@@ -70,6 +95,28 @@ it('recoverable_failure_saves_once and retains partial triple warning without do
         h.durable().updatedAt,
       ).state,
     ).toBe('draft_saved');
+});
+it('an explicitly rejected cover with a clean current proof permits one body-only save and records the cover failure', async () => {
+  const h = coverDraftHarness();
+  h.pages.uploadLocalCover = async () => ({
+    status: 'recoverable_failure',
+    reason: 'UPLOAD_REJECTED',
+    items: [],
+    safeEditorProof: {
+      generation: 'fixture',
+      contextKey: h.observed.contextKey!,
+      storeKey: h.task.store.storeKey,
+      editorUrl: h.observed.editorUrl!,
+      modalClosed: true,
+      uploadsSettled: true,
+    },
+  });
+  expect((await execute(h)).status).toBe('verified');
+  expect(h.durable().coverPlan?.report).toMatchObject({
+    phase: 'failed',
+    reason: 'UPLOAD_REJECTED',
+  });
+  expect(h.calls.filter((call) => call === 'save')).toHaveLength(1);
 });
 it('cover_mismatch_body_verified retains body success and warning without second save', async () => {
   const h = coverDraftHarness();
@@ -121,14 +168,7 @@ it.each(['unknown', 'stop', 'pending', 'body', 'proof'] as const)(
           generation: fault === 'proof' ? 'foreign' : 'fixture',
           contextKey: h.observed.contextKey!,
           storeKey: h.task.store.storeKey,
-          bodyDigest: createHash('sha256')
-            .update(
-              JSON.stringify({
-                title: h.observed.title,
-                blocks: h.observed.blocks,
-              }),
-            )
-            .digest('hex'),
+          editorUrl: h.observed.editorUrl!,
           modalClosed: true,
           uploadsSettled: true,
         },
@@ -392,4 +432,37 @@ it('missing reopened editor evidence persists an independent page warning before
     reason: 'PAGE_UNVERIFIED',
   });
   expect(h.calls.filter((c) => c === 'save')).toHaveLength(1);
+});
+
+it('blocked cover upload records failed report and abort evidence without saving', async () => {
+  const h = coverDraftHarness();
+  h.pages.uploadLocalCover = async () => ({
+    status: 'blocked',
+    reason: 'COVER_UPLOAD_FAILED',
+    safeEditorProof: {
+      generation: 'fixture',
+      contextKey: h.observed.contextKey!,
+      storeKey: h.task.store.storeKey,
+      editorUrl: h.observed.editorUrl!,
+      modalClosed: true,
+      uploadsSettled: true,
+    },
+  });
+  expect(await execute(h)).toMatchObject({
+    status: 'blocked',
+    reason: 'COVER_UPLOAD_FAILED',
+  });
+  expect(h.durable().coverPlan?.report).toMatchObject({
+    phase: 'failed',
+    reason: 'COVER_UPLOAD_FAILED',
+  });
+  expect(h.durable().evidence.coverAbort).toEqual({
+    attempts: 2,
+    step: 'wait-for-upload',
+    modalClosed: true,
+    editorClean: true,
+  });
+  expect(h.durable().saveAttempted).toBe(false);
+  expect(h.calls).not.toContain('save');
+  expect(h.calls.filter((c) => c === 'report:failed')).toHaveLength(1);
 });

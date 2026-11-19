@@ -7,7 +7,12 @@ import { validateArticlePackage } from '../../src/contracts/article-package';
 
 const id = (n = 1) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const pending = { blockKey: id(), type: 'image-pending', candidateId: id(2) };
-const draft = { title: '', contentDeclaration: 'repost', blocks: [pending] };
+const draft = {
+  bodyVersion: 2,
+  title: '',
+  contentDeclaration: 'repost',
+  blocks: [pending],
+};
 const contract = () => import('../../src/contracts/web-paste');
 
 it('reject_forged_candidate_fields', () => {
@@ -222,7 +227,12 @@ it('bounds session candidate lists with ready image ownership and rejects privat
     nextSaveOperationId: id(6),
     externalId: 'manual-' + id(),
     nextPasteCommandId: id(3),
-    draft: { title: '', contentDeclaration: 'repost', blocks: [] },
+    draft: {
+      bodyVersion: 2,
+      title: '',
+      contentDeclaration: 'repost',
+      blocks: [],
+    },
     images: [
       {
         imageToken: id(4),
@@ -280,4 +290,109 @@ it('normalizes a missing trusted image source to the explicit undefined source s
       plainOnly: false,
     }).blocks,
   ).toStrictEqual([{ type: 'image', source: undefined }]);
+});
+
+const richContract = () => import('../../src/contracts/rich-web-paste');
+it('rich contract preserves source slots and canonical marks without accepting original HTML', async () => {
+  const { ConvertedRichPasteSchema } = await richContract();
+  const result = ConvertedRichPasteSchema.parse({
+    version: 2,
+    plainOnly: false,
+    warnings: ['STYLE_NORMALIZED'],
+    blocks: [
+      {
+        type: 'paragraph',
+        content: [
+          { type: 'text', text: '甲', marks: ['italic', 'bold', 'bold'] },
+          { type: 'text', text: '乙', marks: ['bold', 'italic'] },
+        ],
+      },
+      { type: 'image', source: 'relative' },
+    ],
+  });
+  expect(result.blocks).toStrictEqual([
+    {
+      type: 'paragraph',
+      content: [{ type: 'text', text: '甲乙', marks: ['bold', 'italic'] }],
+    },
+    { type: 'image', source: 'relative' },
+  ]);
+  expect(
+    ConvertedRichPasteSchema.safeParse({ ...result, html: '<b>甲</b>' })
+      .success,
+  ).toBe(false);
+  expect(
+    ConvertedRichPasteSchema.safeParse({
+      ...result,
+      warnings: ['PRIVATE_HTML'],
+    }).success,
+  ).toBe(false);
+  expect(
+    ConvertedRichPasteSchema.safeParse({
+      ...result,
+      warnings: ['STYLE_NORMALIZED', 'STYLE_NORMALIZED'],
+    }).success,
+  ).toBe(false);
+  expect(
+    ConvertedRichPasteSchema.safeParse({ ...result, plainOnly: true }).success,
+  ).toBe(false);
+});
+it('rich contract counts all nested leaves, image positions, inline nodes and original source bytes', async () => {
+  const { ConvertedRichPasteSchema } = await richContract();
+  const base = { version: 2, plainOnly: false, warnings: [] };
+  const paragraph = { type: 'paragraph', content: [] };
+  expect(
+    ConvertedRichPasteSchema.safeParse({
+      ...base,
+      blocks: [
+        {
+          type: 'list',
+          kind: 'bullet',
+          items: Array.from({ length: 999 }, () => paragraph),
+        },
+      ],
+    }).success,
+  ).toBe(true);
+  expect(
+    ConvertedRichPasteSchema.safeParse({
+      ...base,
+      blocks: [
+        {
+          type: 'list',
+          kind: 'bullet',
+          items: Array.from({ length: 1000 }, () => paragraph),
+        },
+      ],
+    }).success,
+  ).toBe(false);
+  expect(
+    ConvertedRichPasteSchema.safeParse({
+      ...base,
+      blocks: Array.from({ length: 201 }, () => ({
+        type: 'image',
+        source: 'x',
+      })),
+    }).success,
+  ).toBe(false);
+  expect(
+    ConvertedRichPasteSchema.safeParse({
+      ...base,
+      blocks: [{ type: 'image', source: 'x'.repeat(2097152) }],
+    }).success,
+  ).toBe(false);
+  expect(
+    ConvertedRichPasteSchema.safeParse({
+      ...base,
+      blocks: [
+        {
+          type: 'paragraph',
+          content: Array.from({ length: 200001 }, () => ({
+            type: 'text',
+            text: 'x',
+            marks: [],
+          })),
+        },
+      ],
+    }).success,
+  ).toBe(false);
 });

@@ -7,8 +7,8 @@ import {
 describe('initialization boundary', () => {
   it('reports ready only for the supported database version', () => {
     expect(
-      getAppStatus({ getSchemaVersion: () => 14, close() {} }, '0.1.0'),
-    ).toEqual({ state: 'ready', appVersion: '0.1.0', schemaVersion: 14 });
+      getAppStatus({ getSchemaVersion: () => 15, close() {} }, '0.1.0'),
+    ).toEqual({ state: 'ready', appVersion: '0.1.0', schemaVersion: 15 });
     expect(
       getAppStatus({ getSchemaVersion: () => 3, close() {} }, '0.1.0').state,
     ).toBe('unavailable');
@@ -35,7 +35,7 @@ describe('initialization boundary', () => {
       AppStatusSchema.safeParse({
         state: 'ready',
         appVersion: '0.1.0',
-        schemaVersion: 14,
+        schemaVersion: 15,
         path: 'secret',
       }).success,
     ).toBe(false);

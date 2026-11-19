@@ -29,7 +29,7 @@ import {
   manualArticleInput,
   type ManualSession,
 } from './manual-article-mapper';
-import { admitManualPaste } from './manual-paste-admission';
+import { admitRichManualPaste } from './manual-paste-admission';
 import {
   runManualPasteImages,
   isPasteSource,
@@ -82,6 +82,11 @@ type Session = ManualSession;
 type Issues = NonNullable<Session['issues']>;
 const isSession = (state: ManualState): state is Session =>
   'sessionId' in state;
+const coverUncertain = (session: Session) =>
+  !!session.cover?.outcome &&
+  ['pending', 'needs_review', 'unavailable', 'not_started'].includes(
+    session.cover.outcome.status,
+  );
 function failure(code: ImportErrorCode): ImportOutcome {
   return { status: 'failed', code, message: importMessages[code] };
 }
@@ -155,7 +160,9 @@ export function createManualArticleController(
   let blocked = false;
   let continuous = false;
   let trustedClose = false;
-  let releaseDocumentCompatibility: (sessionId: string) => void = () => {};
+  let releaseDocumentCompatibility: (
+    sessionId: string,
+  ) => void | Promise<void> = () => {};
   let knownVersionConflict = false,
     verifiedConflictDiscard = false,
     resourcesSettled = true;
@@ -175,7 +182,13 @@ export function createManualArticleController(
     { abort: AbortController; settled: Promise<ImageResult> } | undefined;
   let lastSave:
     { sessionId: string; revision: number; jobId: string } | undefined;
-  const snapshot = (): ManualState => structuredClone(current);
+  const snapshot = (): ManualState => {
+    const value = structuredClone(current);
+    if (isSession(value))
+      value.hasUnsavedChanges =
+        value.dirty || !!value.cover?.dirty || coverUncertain(value);
+    return value;
+  };
   const reply = (status: ManualReply['status']): ManualReply => ({
     status,
     snapshot: snapshot(),
@@ -215,7 +228,8 @@ export function createManualArticleController(
   async function release(session: Session): Promise<boolean> {
     reading?.abort.abort();
     try {
-      releaseDocumentCompatibility(session.sessionId);
+      if (coverUncertain(session)) return false;
+      await releaseDocumentCompatibility(session.sessionId);
       await ports.releaseImages(session.sessionId);
       return true;
     } catch {
@@ -239,6 +253,7 @@ export function createManualArticleController(
     if (ready !== 'ready') return reply(ready);
     if (!isSession(current) || current.sessionId !== sessionId)
       return reply('unavailable');
+    if (coverUncertain(current)) return reply('unavailable');
     if (active || mutation) return reply('busy');
     if (current.state === 'finished') return reply('unavailable');
     if (current.revision !== revision) return reply('conflict');
@@ -502,6 +517,7 @@ export function createManualArticleController(
       imagePositions: input ? 0 : 1,
       unresolved: 0,
       plainOnly: false,
+      warnings: [],
     };
     const settled = Promise.resolve().then(async () => {
       let items: PasteRunItem[] = input
@@ -610,12 +626,12 @@ export function createManualArticleController(
           input = undefined;
           assertActiveSession(session, jobId);
           if (abort.signal.aborted) throw new WebPasteFailure('CANCELLED');
-          const admitted = admitManualPaste(
+          const admitted = admitRichManualPaste(
             session,
             converted,
-            initialBlock,
             ports.newId,
             undefined,
+            initialBlock,
             continuous,
           );
           documents.confirmLegacyDocument(
@@ -637,6 +653,7 @@ export function createManualArticleController(
             paragraphs: admitted.paragraphs,
             imagePositions: items.length,
             plainOnly: admitted.plainOnly,
+            warnings: admitted.warnings,
           });
           session.pasteProgress = {
             jobId,
@@ -842,6 +859,18 @@ export function createManualArticleController(
           assertActiveSession(session, jobId);
           await operation(abort.signal);
         } catch (error) {
+          if (kind === 'paste' && session.pasteSummary?.jobId === jobId) {
+            session.pasteSummary.outcome = abort.signal.aborted
+              ? 'cancelled'
+              : session.pasteSummary.admitted
+                ? 'partial'
+                : 'rejected';
+            session.pasteSummary.reason = abort.signal.aborted
+              ? 'CANCELLED'
+              : error instanceof WebPasteFailure
+                ? error.code
+                : 'RECOVERY_REQUIRED';
+          }
           if (error instanceof ManualVersionConflict) {
             markBlocked();
             knownVersionConflict = true;
@@ -993,7 +1022,9 @@ export function createManualArticleController(
     },
     hasSession: () => isSession(current) && current.state !== 'finished',
     hasUnsavedChanges: () =>
-      isSession(current) && current.dirty && current.state !== 'finished',
+      isSession(current) &&
+      (current.dirty || !!current.cover?.dirty || coverUncertain(current)) &&
+      current.state !== 'finished',
     isActive: () =>
       restarting !== undefined ||
       active !== undefined ||
@@ -1033,12 +1064,21 @@ export function createManualArticleController(
           draft: {
             title: '',
             contentDeclaration: 'repost',
-            blocks: [{ blockKey: ports.newId(), type: 'paragraph', text: '' }],
+            bodyVersion: 2,
+            blocks: [
+              { blockKey: ports.newId(), type: 'paragraph', content: [] },
+            ],
           },
           images: [],
           candidates: [],
           nextPasteCommandId: ports.newId(),
           dirty: false,
+          cover: {
+            draftRevision: 0,
+            baseCoverRevision: 0,
+            mode: 'none',
+            dirty: false,
+          },
         };
         lastSave = undefined;
         continuous = false;
@@ -1105,7 +1145,8 @@ export function createManualArticleController(
       )
         return invalid([{ message: '图片位置已失效，请重新检查。' }]);
       const changed =
-        JSON.stringify(previous.draft) !== JSON.stringify(parsed.data);
+        JSON.stringify(ManualDraftSchema.parse(previous.draft)) !==
+        JSON.stringify(parsed.data);
       const retainedCandidates = new Set(
         parsed.data.blocks.flatMap((block) =>
           block.type === 'image-pending' ? [block.candidateId] : [],
@@ -1141,7 +1182,7 @@ export function createManualArticleController(
               (b) =>
                 b.blockKey === initialBlock &&
                 b.type === 'paragraph' &&
-                b.text === '',
+                b.content.length === 0,
             ))
         )
           initialBlock = undefined;
@@ -1233,6 +1274,16 @@ export function createManualArticleController(
       if (!isSession(current)) return reply('unavailable');
       if (current.draft.blocks.some((block) => block.type === 'image-pending'))
         return invalid([{ message: '还有图片需要处理，请先完成或移除。' }]);
+      try {
+        manualArticleInput(current);
+      } catch {
+        return invalid([
+          {
+            message:
+              '当前保存通道无法保留这些格式，正文已保留，请使用文章编辑保存。',
+          },
+        ]);
+      }
       return start(current, 'saving');
     },
     cancelManualOperation,
@@ -1274,7 +1325,13 @@ export function createManualArticleController(
             } finally {
               restartFlush = false;
             }
-            if (current.dirty || blocked || current.state !== 'editing')
+            if (
+              current.dirty ||
+              current.cover?.dirty ||
+              coverUncertain(current) ||
+              blocked ||
+              current.state !== 'editing'
+            )
               throw new WebPasteFailure('RECOVERY_REQUIRED');
             if (!(await release(current)))
               throw new WebPasteFailure('RECOVERY_REQUIRED');
@@ -1301,7 +1358,13 @@ export function createManualArticleController(
       shutdownSettlement = (async () => {
         await Promise.all([running?.settled, read?.settled, mutation]);
         // Unknown ownership from any awaited operation cannot authorize database close.
-        if (blocked || (isSession(current) && !(await release(current))))
+        if (
+          blocked ||
+          (isSession(current) &&
+            (current.cover?.dirty ||
+              coverUncertain(current) ||
+              !(await release(current))))
+        )
           throw new WebPasteFailure('RECOVERY_REQUIRED');
         sources.clear();
       })().finally(() => {

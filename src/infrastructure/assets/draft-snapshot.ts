@@ -1,3 +1,5 @@
+import { EditableArticleSchema } from '../../contracts/article-revision';
+import { upgradeEditorBody } from '../../domain/rich-text-body';
 import {
   DraftSnapshotSchema,
   type DraftSnapshot,
@@ -10,7 +12,8 @@ import type { AssetStore } from '../../domain/ports/article-import';
 import type { SnapshotPort } from '../../domain/ports/draft-task';
 import {
   canonicalDraftArticle,
-  createDraftSnapshotDigest,
+  createDraftSnapshotV2Digest,
+  verifyDraftSnapshotIntegrity,
   createCoverSnapshotDigest,
 } from '../draft-snapshot-integrity';
 
@@ -56,8 +59,11 @@ function checkAssets(article: StoredArticle): void {
 }
 
 function checkDigest(snapshot: DraftSnapshot): void {
-  if (createDraftSnapshotDigest(snapshot.article) !== snapshot.digest)
+  try {
+    verifyDraftSnapshotIntegrity(snapshot);
+  } catch {
     throw new DraftInputError('INPUT_UNSUPPORTED');
+  }
 }
 
 export function createDraftSnapshotPort(
@@ -115,14 +121,23 @@ export function createDraftSnapshotPort(
         throw Error('Invalid cover snapshot');
       return covers.assets.readCoverAsset(c, assetKey);
     },
-    async capture(article) {
-      const normalized = input(article);
-      await verifyAssets(normalized);
-      return DraftSnapshotSchema.parse({
-        version: 1,
-        article: normalized,
-        digest: createDraftSnapshotDigest(normalized),
-      });
+    async capture(value) {
+      let snapshot: DraftSnapshot;
+      try {
+        const editable = EditableArticleSchema.parse(value);
+        const article = input(editable.article),
+          editorBody = upgradeEditorBody(editable.editorBody, article.body);
+        snapshot = DraftSnapshotSchema.parse({
+          version: 2,
+          article,
+          editorBody,
+          digest: createDraftSnapshotV2Digest(article, editorBody),
+        });
+      } catch {
+        throw new DraftInputError('INPUT_UNSUPPORTED');
+      }
+      await verifyAssets(snapshot.article);
+      return snapshot;
     },
     async verify(value) {
       let snapshot: DraftSnapshot;

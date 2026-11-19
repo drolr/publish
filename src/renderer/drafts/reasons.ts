@@ -1,5 +1,7 @@
 import type { ReasonCode } from '../../contracts/draft-task';
+export const manualUploadMessage = '上传遇到问题，请人工处理。';
 export const reasons: Record<ReasonCode, string> = {
+  FORMAT_UNSUPPORTED: '这篇文章包含当前平台尚未支持的格式',
   INPUT_UNSUPPORTED: '文章内容不符合要求，请检查本地文章。',
   TITLE_UNSUPPORTED: '标题不符合要求，请检查本地文章。',
   IMAGE_FORMAT_UNSUPPORTED: '正文图片只支持 JPEG 或 PNG。',
@@ -16,6 +18,7 @@ export const reasons: Record<ReasonCode, string> = {
   EDITOR_NOT_EMPTY:
     '新建页恢复了旧内容或无法确认空白，批次已停止；请保留页面并人工处理。',
   COVER_REQUIRED: '封面未完成，平台未允许保存草稿，请人工处理。',
+  COVER_UPLOAD_FAILED: '封面上传未完成，本篇未保存；批次已暂停，可稍后重试。',
   COVER_UNAVAILABLE:
     '展示封面未确认为空，尚未点击存草稿。请保留页面并联系维护人员。',
   DECLARATION_REQUIRED: '后台要求确认声明，请人工核对。',
@@ -23,8 +26,9 @@ export const reasons: Record<ReasonCode, string> = {
   MANUAL_REVIEW_REQUIRED:
     '平台已接受本次存草稿，待人工核对。请在巨懂车检查唯一草稿、标题、正文图片和顺序；不要再次保存。',
   CONTENT_MISMATCH: '草稿内容核对未通过，请人工核对。',
-  BROWSER_UNAVAILABLE: '专用浏览器暂时不可用，请检查后核对状态。',
-  BROWSER_UNSUPPORTED: '当前浏览器版本暂不支持，请联系维护人员。',
+  BROWSER_UNAVAILABLE: '专用浏览器暂时不可用，请查看下方浏览器状态并重新检查。',
+  BROWSER_UNSUPPORTED:
+    '浏览器基础检查未通过，请查看下方浏览器状态并按提示处理。',
   STORAGE_UNAVAILABLE: '本地记录暂时无法确认，请保留现场并联系维护人员。',
   STOP_REQUESTED: '已请求停止，请核对已完成的操作。',
   INTERRUPTED: '上次操作中断，请先核对状态。',

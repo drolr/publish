@@ -9,6 +9,7 @@ const coverReasons: Record<
   LIBRARY_OPTION_UNVERIFIED: '无法确认未保存到平台素材库。',
   COVER_MISMATCH: '重开草稿后的封面与所选图片不一致。',
   COVER_REQUIRED: '平台要求补充封面，请人工处理。',
+  COVER_UPLOAD_FAILED: '封面上传未完成，本篇草稿未保存。',
   PAGE_UNVERIFIED: '封面显示状态尚未核实，请人工核对。',
 };
 export const coverModeLabel = (mode: 'none' | 'single' | 'triple') =>

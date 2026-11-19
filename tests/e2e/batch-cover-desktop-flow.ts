@@ -1,3 +1,4 @@
+import { returnToArticlePool } from './focused-editor-navigation';
 import { _electron as electron, expect } from '@playwright/test';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -63,7 +64,7 @@ export async function checkSharedCoverDesktop(executablePath?: string) {
       await expect(page.getByLabel('文章标题')).toHaveValue(
         '所选封面本机验证' + i,
       );
-      await page.getByRole('button', { name: '结束编辑', exact: true }).click();
+      await returnToArticlePool(page);
     }
     await page.getByRole('tab', { name: '批量存草稿', exact: true }).click();
     await page

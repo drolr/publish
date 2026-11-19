@@ -266,3 +266,153 @@ it('inert Worker parsing never requests images, linked styles or script resource
     );
   }
 });
+
+it('rich bundled Worker preserves V2 structure and safe warnings while old converter remains V1', async () => {
+  const { createRichWebPasteConverter } =
+    await import('../../src/infrastructure/content/web-paste-converter');
+  const input = {
+    html: '<h2 class="source"><b>甲</b><span style="font-weight:normal">乙</span></h2><img src="relative">',
+    plain: '',
+  };
+  expect(
+    await createRichWebPasteConverter(workerPath).convert(
+      input,
+      new AbortController().signal,
+    ),
+  ).toEqual({
+    version: 2,
+    plainOnly: false,
+    warnings: ['HEADING_NORMALIZED', 'STYLE_NORMALIZED'],
+    blocks: [
+      {
+        type: 'heading',
+        content: [
+          { type: 'text', text: '甲', marks: ['bold'] },
+          { type: 'text', text: '乙', marks: [] },
+        ],
+      },
+      { type: 'image', source: 'relative' },
+    ],
+  });
+  expect(
+    await createWebPasteConverter(workerPath).convert(
+      input,
+      new AbortController().signal,
+    ),
+  ).toEqual({
+    plainOnly: false,
+    blocks: [
+      { type: 'paragraph', text: '甲乙' },
+      { type: 'image', source: 'relative' },
+    ],
+  });
+});
+it.each([
+  'error-worker.mjs',
+  'malformed-worker.mjs',
+  'exit-worker.mjs',
+  'reply-worker.mjs',
+])(
+  'rich rejects unsafe or V1 replies from %s with fixed reason',
+  async (fixture) => {
+    const { createRichWebPasteConverter } =
+      await import('../../src/infrastructure/content/web-paste-converter');
+    await expect(
+      createRichWebPasteConverter(
+        resolve('tests/fixtures/web-paste', fixture),
+      ).convert({ html: '<p>x</p>', plain: '' }, new AbortController().signal),
+    ).rejects.toMatchObject({
+      code: 'INVALID_FRAGMENT',
+      message: 'INVALID_FRAGMENT',
+    });
+  },
+);
+it('rich worker shares startup deadline and abort disposal', async () => {
+  const { createRichWebPasteConverter } =
+    await import('../../src/infrastructure/content/web-paste-converter');
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const convert = createRichWebPasteConverter(
+    resolve('tests/fixtures/web-paste/startup-worker.mjs'),
+  );
+  const result = convert
+    .convert({ html: '<p>x</p>', plain: '' }, new AbortController().signal)
+    .catch((error) => error);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(await result).toMatchObject({
+    code: 'PARSE_TIMEOUT',
+    message: 'PARSE_TIMEOUT',
+  });
+  const abort = new AbortController();
+  const cancelled = convert
+    .convert({ html: '<p>x</p>', plain: '' }, abort.signal)
+    .catch((error) => error);
+  abort.abort();
+  expect(await cancelled).toMatchObject({ code: 'CANCELLED' });
+});
+
+it.each(['warning', 'html', 'nested'])(
+  'rich revalidates trusted-thread V2 %s payloads',
+  async (plain) => {
+    const { createRichWebPasteConverter } =
+      await import('../../src/infrastructure/content/web-paste-converter');
+    await expect(
+      createRichWebPasteConverter(
+        resolve('tests/fixtures/web-paste/rich-reply-worker.mjs'),
+      ).convert({ html: '<p>x</p>', plain }, new AbortController().signal),
+    ).rejects.toMatchObject({ code: 'INVALID_FRAGMENT' });
+  },
+);
+it('rich actual worker never executes or requests linked resources', async () => {
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests++;
+    response.end('unexpected');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === 'string')
+      throw Error('fixture unavailable');
+    const source = `http://127.0.0.1:${address.port}/resource`;
+    const { createRichWebPasteConverter } =
+      await import('../../src/infrastructure/content/web-paste-converter');
+    const result = await createRichWebPasteConverter(workerPath).convert(
+      {
+        html: `<link href="${source}"><script src="${source}">fetch('${source}')</script><p onclick="fetch('${source}')"><b>甲</b><img src="${source}"></p>`,
+        plain: '',
+      },
+      new AbortController().signal,
+    );
+    expect(result.blocks).toEqual([
+      {
+        type: 'paragraph',
+        content: [{ type: 'text', text: '甲', marks: ['bold'] }],
+      },
+      { type: 'image', source },
+    ]);
+    expect(result.warnings).toEqual(['STYLE_NORMALIZED']);
+    expect(requests).toBe(0);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+it.each([
+  { version: 2, input: { html: '<p>x</p>', plain: '', htmlSource: 'SECRET' } },
+  { version: 2, input: { html: '<p>x</p>', plain: '' }, extra: 'SECRET' },
+  { version: 3, input: { html: '<p>x</p>', plain: '' } },
+])(
+  'rich worker rejects malformed versioned requests with a fixed code',
+  async (request) => {
+    const worker = new Worker(workerPath);
+    try {
+      const reply = new Promise((resolve) => worker.once('message', resolve));
+      worker.postMessage(request);
+      expect(await reply).toEqual({ ok: false, code: 'INPUT_LIMIT' });
+    } finally {
+      await worker.terminate();
+    }
+  },
+);

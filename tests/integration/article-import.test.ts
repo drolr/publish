@@ -82,8 +82,13 @@ async function pastedRuntime(root: string) {
     gate: () => 'ready',
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [
-          { type: 'paragraph', text: '正文' },
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: '正文', marks: [] }],
+          },
           { type: 'image', source: 'https://example.com/private-image' },
         ],
         plainOnly: false,

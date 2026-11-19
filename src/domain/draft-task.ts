@@ -1,3 +1,4 @@
+import { snapshotImageCount } from '../contracts/draft-task';
 import {
   DraftTaskSchema,
   TaskEventSchema,
@@ -64,11 +65,21 @@ function mergeEvidence(
         invalid();
     } else images.push(image);
   }
+  const coverAbort = previous.coverAbort ?? incoming.coverAbort;
+  if (
+    previous.submission &&
+    incoming.submission &&
+    (previous.submission.observation !== incoming.submission.observation ||
+      previous.submission.attemptedAt !== incoming.submission.attemptedAt)
+  )
+    invalid();
+  const submission = previous.submission ?? incoming.submission;
   return {
     remote,
     cover,
     images,
-    ...(previous.submission ? { submission: previous.submission } : {}),
+    ...(coverAbort ? { coverAbort } : {}),
+    ...(submission ? { submission } : {}),
   };
 }
 export function reduceTask(
@@ -202,7 +213,12 @@ export function reduceTask(
     case 'evidence':
       if (
         !['running', 'needs_human', 'interrupted'].includes(task.state) ||
-        !task.possibleRemoteEffect
+        !task.possibleRemoteEffect ||
+        (event.evidence.submission &&
+          (!task.saveAttempted ||
+            event.evidence.remote ||
+            Date.parse(event.evidence.submission.attemptedAt) >
+              Date.parse(now)))
       )
         invalid();
       next.evidence = mergeEvidence(task.evidence, event.evidence);
@@ -235,9 +251,7 @@ export function reduceTask(
           event.reason !== null
         )
           invalid();
-        const imageCount = task.snapshot.article.body.filter(
-          (block) => block.type === 'image',
-        ).length;
+        const imageCount = snapshotImageCount(task.snapshot);
         if (task.evidence.images.length !== imageCount) invalid();
         next.holdsPlatform = false;
       } else if (event.state === 'failed' || event.state === 'stopped') {

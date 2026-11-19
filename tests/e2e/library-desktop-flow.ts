@@ -1,3 +1,4 @@
+import { returnToArticlePool } from './focused-editor-navigation';
 import { expect, type ElectronApplication, type Page } from '@playwright/test';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
@@ -10,6 +11,11 @@ export async function checkLibraryFlow(
   run: number,
   packaged: boolean,
 ) {
+  const body = page.getByRole('textbox', { name: '文章正文', exact: true });
+  // The first ordered body image is the user-visible editor image, not the retained hidden preview.
+  const firstBodyImage = body
+    .getByRole('img', { name: '正文图片', exact: true })
+    .first();
   if (run === 0) {
     await expect(page.getByText('还没有文章', { exact: true })).toBeVisible();
     const source = join(root, 'input');
@@ -27,6 +33,7 @@ export async function checkLibraryFlow(
       JSON.stringify({
         schema_version: 1,
         article_id: 'desktop-test',
+        content_declaration: 'original',
         title: '秋日自驾笔记',
         body: [
           { type: 'paragraph', text: '周末沿着山路出发，记录沿途的风景。' },
@@ -49,6 +56,7 @@ export async function checkLibraryFlow(
         filePaths: [selected],
       });
     }, file);
+    await returnToArticlePool(page);
     await page.getByRole('button', { name: '导入文章', exact: true }).click();
     await expect
       .poll(async () => {
@@ -58,17 +66,17 @@ export async function checkLibraryFlow(
         return s.state === 'finished' ? s.result.status : s.state;
       })
       .toBe('imported');
-    await expect(page.getByRole('img').first()).toBeVisible();
-    expect(
-      await page
-        .getByRole('img')
-        .first()
-        .evaluate(
+    await expect(body).toBeVisible();
+    await expect(firstBodyImage).toBeVisible();
+    await expect
+      .poll(() =>
+        firstBodyImage.evaluate(
           (node: HTMLImageElement) => node.complete && node.naturalWidth > 0,
         ),
-    ).toBe(true);
+      )
+      .toBe(true);
     await expect(
-      page.getByText('<script>window.untrusted = true</script>', {
+      body.getByText('<script>window.untrusted = true</script>', {
         exact: true,
       }),
     ).toBeVisible();
@@ -100,6 +108,7 @@ export async function checkLibraryFlow(
         key,
       ),
     ).toEqual({ status: 'not_found' });
+    await returnToArticlePool(page);
     await page.getByRole('button', { name: '导入文章', exact: true }).click();
     await expect
       .poll(async () => {
@@ -109,10 +118,14 @@ export async function checkLibraryFlow(
         return s.state === 'finished' ? s.result.status : s.state;
       })
       .toBe('already_exists');
+    // Import completion precedes the renderer's asynchronous editor handover.
+    await expect(
+      page.getByRole('textbox', { name: '文章标题', exact: true }),
+    ).toHaveValue('秋日自驾笔记');
     await page.reload();
     await expect(
-      page.getByText('秋日自驾笔记', { exact: true }).first(),
-    ).toBeVisible();
+      page.getByRole('textbox', { name: '文章标题', exact: true }),
+    ).toHaveValue('秋日自驾笔记');
     // Cancellation and renderer reload while the native chooser is still unresolved.
     await application.evaluate(({ dialog }) => {
       let calls = 0;
@@ -124,6 +137,7 @@ export async function checkLibraryFlow(
         );
       };
     });
+    await returnToArticlePool(page);
     await page.getByRole('button', { name: '导入文章', exact: true }).click();
     await expect
       .poll(() =>
@@ -171,11 +185,11 @@ export async function checkLibraryFlow(
     expect(source.startsWith(resolve(root) + sep)).toBe(true);
     rmSync(source, { recursive: true });
     await page
-      .getByRole('button')
-      .filter({ hasText: '秋日自驾笔记' })
-      .first()
+      .getByRole('region', { name: '文章列表', exact: true })
+      .getByRole('button', { name: /^秋日自驾笔记 文章编号/ })
       .click();
-    await expect(page.getByRole('img').first()).toBeVisible();
+    await expect(body).toBeVisible();
+    await expect(firstBodyImage).toBeVisible();
     await page.screenshot({
       path: resolve(
         `test-results/library-${packaged ? 'package' : 'desktop'}.png`,
@@ -185,6 +199,7 @@ export async function checkLibraryFlow(
     await application.evaluate(({ BrowserWindow }) =>
       BrowserWindow.getAllWindows()[0].setSize(800, 600),
     );
+    await returnToArticlePool(page);
     await expect(
       page.getByRole('button', { name: '导入文章', exact: true }),
     ).toBeVisible();
@@ -199,39 +214,41 @@ export async function checkLibraryFlow(
     expect(list.status).toBe('ok');
     if (list.status !== 'ok') throw new Error('list');
     expect(list.page.items).toHaveLength(2);
-    expect(list.page.items.map((item) => item.contentDeclaration)).toEqual([
-      'original',
-      'original',
-    ]);
+    expect(
+      Object.fromEntries(
+        list.page.items.map((item) => [item.title, item.contentDeclaration]),
+      ),
+    ).toEqual({
+      秋日自驾笔记: 'original',
+      城市通勤随记: 'repost',
+    });
     await page
-      .getByRole('button')
-      .filter({ hasText: '秋日自驾笔记' })
-      .first()
+      .getByRole('region', { name: '文章列表', exact: true })
+      .getByRole('button', { name: /^秋日自驾笔记 文章编号/ })
       .click();
-    await expect(page.getByRole('img').first()).toBeVisible();
+    await expect(body).toBeVisible();
+    await expect(firstBodyImage).toBeVisible();
     // Close during selection: application must cancel and settle, then exit cleanly.
     // Selecting a saved article now opens the one canonical editor session;
     // settle that unchanged session before starting the import chooser.
-    await page.getByRole('button', { name: '结束编辑', exact: true }).click();
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          window.desktopApi
-            .getManualArticleState()
-            .then((value) => value.state),
-        ),
-      )
-      .toBe('idle');
+    await returnToArticlePool(page);
+    await expect(
+      page.getByRole('button', { name: '导入文章', exact: true }),
+    ).toBeVisible();
     await application.evaluate(({ dialog }) => {
       dialog.showOpenDialog = () =>
         new Promise((resolve) =>
           setTimeout(() => resolve({ canceled: true, filePaths: [] }), 500),
         );
     });
-    const started = await page.evaluate(() =>
-      window.desktopApi.startArticleImport(),
-    );
-    expect(started.status).toBe('started');
+    await page.getByRole('button', { name: '导入文章', exact: true }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          window.desktopApi.getImportStatus().then((s) => s.state),
+        ),
+      )
+      .toBe('selecting');
   }
 }
 

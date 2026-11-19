@@ -1,3 +1,4 @@
+import { HelpTip } from '../HelpTip';
 import { readArticlePreview } from '../library/readArticlePreview';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -347,8 +348,12 @@ export function BatchCoverPanel({
   }
   return (
     <section className="batch-cover-panel" aria-label="所选文章与封面">
-      <h3>所选文章与封面</h3>
-      <p>封面先保存到本机，存草稿时按各篇配置上传。仅影响本次所选文章。</p>
+      <div className="heading-with-help">
+        <h3>所选文章与封面</h3>
+        <HelpTip label="批量封面帮助">
+          封面先保存到本机，存草稿时按各篇配置上传。仅影响本次所选文章。
+        </HelpTip>
+      </div>
       {notice && <p role="status">{notice}</p>}
       {error ? (
         <p role="alert">所选文章或封面暂时无法读取，请重新检查。</p>
@@ -423,7 +428,6 @@ export function BatchCoverPanel({
               <strong>{article.title}</strong>
               <p>
                 {article.imageCount} 张正文图 ·{' '}
-                {article.contentDeclaration === 'original' ? '原创' : '转载'} ·{' '}
                 {cover.mode === 'none'
                   ? '未配置封面'
                   : cover.mode === 'single'

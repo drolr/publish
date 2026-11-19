@@ -4,6 +4,7 @@ import webpack from 'webpack';
 import MiniCssExtractPlugin from 'mini-css-extract-plugin';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import type { TaskView } from '../../src/contracts/draft-task';
 import type { ManualDraft } from '../../src/contracts/manual-article';
 import type {
   DocumentCommand,
@@ -56,6 +57,8 @@ export async function mount(
   mismatchedProof = false,
   count = 2,
   coverOptions = {},
+  initialTask?: TaskView,
+  legacyDeclaration?: 'original' | 'repost',
 ) {
   await page.route('**/*', async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -85,6 +88,8 @@ export async function mount(
       unknownEdit,
       mismatchedProof,
       count,
+      initialTask,
+      legacyDeclaration,
     }) => {
       let state = JSON.parse('{"state":"idle","revision":0}'),
         revision = 1,
@@ -99,11 +104,22 @@ export async function mount(
           '11111111-1111-4111-8111-' + String(i + 1).padStart(12, '0'),
         externalId: 'a' + i,
         title: '文章' + (i + 1),
-        contentDeclaration: 'repost',
+        contentDeclaration: legacyDeclaration ?? 'repost',
         imageCount: 0,
         articleRevision: 1,
         createdAt: '2026-10-08T00:00:00.000Z',
         body: [{ type: 'paragraph', text: '已保存正文' + (i + 1) }],
+        editorBody: {
+          version: 2,
+          blocks: [
+            {
+              type: 'paragraph',
+              content: [
+                { type: 'text', text: '已保存正文' + (i + 1), marks: [] },
+              ],
+            },
+          ],
+        },
         assets: [],
       }));
       let closeListener: ((request: { requestId: string }) => void) | undefined;
@@ -118,6 +134,10 @@ export async function mount(
       Object.assign(window, {
         workspaceLog: () => logs,
         workspaceState: () => state,
+        workspaceTask: (next?: TaskView) => {
+          if (next) initialTask = next;
+          return initialTask;
+        },
         workspaceClose: () => closeListener?.({ requestId: ids[1] }),
       });
       const reply = () => ({ status: 'ok', snapshot: structuredClone(state) });
@@ -191,7 +211,7 @@ export async function mount(
           getAppStatus: async () => ({
             state: 'ready',
             appVersion: '1',
-            schemaVersion: 14,
+            schemaVersion: 15,
           }),
           getImportStatus: async () => ({ state: 'idle', revision: 0 }),
           listArticles: async (cursor?: { pageNumber: number }) => ({
@@ -240,7 +260,9 @@ export async function mount(
               articleRevision: command.expectedArticleRevision + 1,
             };
           },
-          setArticleDeclarations: async (change: { declaration: string }) => {
+          setArticleDeclarations: async (change: {
+            declaration: 'original' | 'repost';
+          }) => {
             articles[0].contentDeclaration = change.declaration;
             revision++;
             logs.push(['declaration', revision]);
@@ -301,10 +323,17 @@ export async function mount(
               candidates: [],
               images: [],
               draft: {
+                bodyVersion: 2,
                 title: a.title,
                 contentDeclaration: a.contentDeclaration,
                 blocks: [
-                  { type: 'paragraph', blockKey: key, text: a.body[0].text },
+                  {
+                    type: 'paragraph',
+                    blockKey: key,
+                    content: [
+                      { type: 'text', text: a.body[0].text, marks: [] },
+                    ],
+                  },
                 ],
               },
             };
@@ -325,7 +354,26 @@ export async function mount(
               revision: state.revision + 1,
               sessionId: crypto.randomUUID(),
               target: { kind: 'new' },
-              draft: { title: '', contentDeclaration: 'repost', blocks: [] },
+              cover: {
+                draftRevision: 0,
+                baseCoverRevision: 0,
+                mode: 'none',
+                dirty: false,
+              },
+              documentRevision: 0,
+              nextClientSequence: 0,
+              nextEditCommandId: crypto.randomUUID(),
+              nextSaveOperationId: crypto.randomUUID(),
+              nextPasteCommandId: crypto.randomUUID(),
+              acknowledgedEdit: null,
+              candidates: [],
+              images: [],
+              draft: {
+                bodyVersion: 2,
+                title: '',
+                contentDeclaration: 'repost',
+                blocks: [],
+              },
               dirty: false,
             };
             return reply();
@@ -382,16 +430,35 @@ export async function mount(
             }
             if (!a) throw Error('missing article');
             a.title = state.draft.title;
+            a.contentDeclaration = state.draft.contentDeclaration;
             a.articleRevision = revision;
-            a.body[0].text = state.draft.blocks[0].text;
+            a.body[0].text =
+              state.draft.blocks[0]?.content
+                ?.map((run: { text: string }) => run.text)
+                .join('') ?? '';
+            a.editorBody = {
+              version: 2,
+              blocks: [
+                {
+                  type: 'paragraph',
+                  content: a.body[0].text
+                    ? [{ type: 'text', text: a.body[0].text, marks: [] }]
+                    : [],
+                },
+              ],
+            };
             state = {
               ...state,
               revision: state.revision + 1,
               dirty: false,
-              state: isNew ? 'finished' : state.state,
-              target: isNew
-                ? state.target
-                : { ...state.target, baseArticleRevision: revision },
+              state: 'editing',
+              target: {
+                kind: 'existing',
+                articleKey: a.articleKey,
+                externalId: a.externalId,
+                importId: a.articleKey,
+                baseArticleRevision: revision,
+              },
               saveOutcome: {
                 kind: isNew ? 'created' : 'updated',
                 articleKey: a.articleKey,
@@ -424,7 +491,7 @@ export async function mount(
               reason: null,
             },
             preparation: prepared,
-            task: null,
+            task: initialTask ?? null,
           }),
           prepareDraft: async (key: string) => {
             logs.push(['prepare', key, revision, state.state]);
@@ -445,7 +512,16 @@ export async function mount(
         },
       });
     },
-    { unknown, delayedSave, conflictSave, unknownEdit, mismatchedProof, count },
+    {
+      unknown,
+      delayedSave,
+      conflictSave,
+      unknownEdit,
+      mismatchedProof,
+      count,
+      initialTask,
+      legacyDeclaration,
+    },
   );
   await installCoverBridge(page, coverOptions);
   await page.goto('http://localhost');

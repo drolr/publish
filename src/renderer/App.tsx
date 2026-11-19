@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AppStatusSchema, type AppStatus } from '../contracts/app-status';
 import { ArticleWorkspace } from './manual/ArticleWorkspace';
+import { UploadWaitSettingsMenuDialog } from './UploadWaitSettings';
 export function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   useEffect(() => {
@@ -23,6 +24,7 @@ export function App() {
   }, []);
   return (
     <main>
+      <UploadWaitSettingsMenuDialog />
       <header>
         <span className="eyebrow">文章 · 草稿</span>
         <h1>汽车经销商草稿助手</h1>

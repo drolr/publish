@@ -103,7 +103,7 @@ async function mount(page: Page, mode = 'normal', count = 11) {
         desktopApi: {
           getAppStatus: async () => ({
             state: 'ready',
-            schemaVersion: 14,
+            schemaVersion: 15,
             appVersion: '1',
           }),
           getManualArticleState: async () => ({ state: 'idle', revision: 0 }),
@@ -176,6 +176,10 @@ async function mount(page: Page, mode = 'normal', count = 11) {
               status: 'ok',
               article: {
                 ...items.find((a) => a.articleKey === key),
+                editorBody: {
+                  version: 2,
+                  blocks: [{ type: 'image', imageId: 'image' }],
+                },
                 body: [{ type: 'image', image_id: 'image' }],
                 assets: [
                   {
@@ -266,12 +270,19 @@ test('eleven_articles_ten_then_one', async ({ page }) => {
   ).toBeVisible();
   await expect(page.locator('.article-rows > li')).toHaveCount(10);
   await expect(
-    page.getByText('第 1 页 / 共 2 页', { exact: true }),
+    page
+      .getByRole('navigation', { name: '文章分页', exact: true })
+      .getByText('第 1 页 / 共 2 页', { exact: true }),
   ).toBeVisible();
-  await page.getByRole('button', { name: '下一页' }).click();
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '下一页' })
+    .click();
   await expect(page.locator('.article-rows > li')).toHaveCount(1);
   await expect(
-    page.getByText('第 2 页 / 共 2 页', { exact: true }),
+    page
+      .getByRole('navigation', { name: '文章分页', exact: true })
+      .getByText('第 2 页 / 共 2 页', { exact: true }),
   ).toBeVisible();
 });
 test('delete_last_page_item preserves other selected keys', async ({
@@ -281,7 +292,10 @@ test('delete_last_page_item preserves other selected keys', async ({
   await page
     .getByRole('checkbox', { name: '选择 文章 1', exact: true })
     .check();
-  await page.getByRole('button', { name: '下一页' }).click();
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '下一页' })
+    .click();
   await page
     .getByRole('checkbox', { name: '选择 文章 11', exact: true })
     .check();
@@ -290,7 +304,9 @@ test('delete_last_page_item preserves other selected keys', async ({
     page.getByText('本机文章共 10 篇', { exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByText('第 1 页 / 共 1 页', { exact: true }),
+    page
+      .getByRole('navigation', { name: '文章分页', exact: true })
+      .getByText('第 1 页 / 共 1 页', { exact: true }),
   ).toBeVisible();
   await expect(page.getByText('已选择 1 篇', { exact: true })).toBeVisible();
   await expect(
@@ -325,7 +341,9 @@ test('metadata_only_deletion does not need image preview', async ({ page }) => {
     page.getByText('本机文章共 0 篇', { exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByText('第 1 页 / 共 1 页', { exact: true }),
+    page
+      .getByRole('navigation', { name: '文章分页', exact: true })
+      .getByText('第 1 页 / 共 1 页', { exact: true }),
   ).toBeVisible();
 });
 for (const oldQuery of ['resolved', 'rejected'])
@@ -727,9 +745,14 @@ test('late preview cannot resurrect deleted item', async ({ page }) => {
 test('membership_change_resets_cursor', async ({ page }) => {
   await mount(page);
   await page.evaluate(() => Reflect.get(window, 'changeMembership')());
-  await page.getByRole('button', { name: '下一页' }).click();
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '下一页' })
+    .click();
   await expect(
-    page.getByText('第 1 页 / 共 1 页', { exact: true }),
+    page
+      .getByRole('navigation', { name: '文章分页', exact: true })
+      .getByText('第 1 页 / 共 1 页', { exact: true }),
   ).toBeVisible();
 });
 
@@ -796,8 +819,14 @@ test('count failure remains distinct from empty count', async ({ page }) => {
 for (const scenario of ['repeated_cursor', 'second_stale', 'page_limit'])
   test(`deletion_metadata_walk_fails_closed_${scenario}`, async ({ page }) => {
     await mount(page, 'normal', 21);
-    await page.getByRole('button', { name: '下一页', exact: true }).click();
-    await page.getByRole('button', { name: '下一页', exact: true }).click();
+    await page
+      .getByRole('navigation', { name: '文章分页', exact: true })
+      .getByRole('button', { name: '下一页', exact: true })
+      .click();
+    await page
+      .getByRole('navigation', { name: '文章分页', exact: true })
+      .getByRole('button', { name: '下一页', exact: true })
+      .click();
     await expect(del(page, 21)).toBeVisible();
     await page.evaluate((scenario) => {
       const original = window.desktopApi.listArticles;
@@ -855,19 +884,29 @@ for (const [count, pages] of [
       page.getByText(`本机文章共 ${count} 篇`, { exact: true }),
     ).toBeVisible();
     await expect(
-      page.getByText(`第 1 页 / 共 ${pages} 页`, { exact: true }),
+      page
+        .getByRole('navigation', { name: '文章分页', exact: true })
+        .getByText(`第 1 页 / 共 ${pages} 页`, { exact: true }),
     ).toBeVisible();
     const seen: string[] = [];
     for (let i = 1; i <= pages; i++) {
       seen.push(
         ...(await page.locator('.article-rows strong').allTextContents()),
       );
-      if (i < pages) await page.getByRole('button', { name: '下一页' }).click();
+      if (i < pages)
+        await page
+          .getByRole('navigation', { name: '文章分页', exact: true })
+          .getByRole('button', { name: '下一页' })
+          .click();
     }
     expect(seen).toEqual(
       Array.from({ length: count }, (_, i) => `文章 ${i + 1}`),
     );
-    await expect(page.getByRole('button', { name: '下一页' })).toBeDisabled();
+    await expect(
+      page
+        .getByRole('navigation', { name: '文章分页', exact: true })
+        .getByRole('button', { name: '下一页' }),
+    ).toBeDisabled();
   });
 
 test('batch uses cross-page selection in click order and invalidates changed summary', async ({
@@ -907,15 +946,24 @@ test('batch uses cross-page selection in click order and invalidates changed sum
   await page
     .getByRole('checkbox', { name: '选择 文章 3', exact: true })
     .check();
-  await page.getByRole('button', { name: '下一页' }).click();
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '下一页' })
+    .click();
   await page
     .getByRole('checkbox', { name: '选择 文章 11', exact: true })
     .check();
-  await page.getByRole('button', { name: '上一页' }).click();
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '上一页' })
+    .click();
   await page
     .getByRole('checkbox', { name: '选择 文章 3', exact: true })
     .uncheck();
-  await page.getByRole('button', { name: '下一页' }).click();
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '下一页' })
+    .click();
   await panel.getByRole('button', { name: '检查批量草稿摘要' }).click();
   await expect(
     panel.getByRole('button', { name: '确认逐篇存草稿' }),

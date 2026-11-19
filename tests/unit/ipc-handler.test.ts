@@ -27,7 +27,7 @@ it('registered privileged handler rejects arguments and wrong sender before quer
   const query = vi.fn(() => ({
     state: 'ready' as const,
     appVersion: '0.1.0',
-    schemaVersion: 14 as const,
+    schemaVersion: 15 as const,
   }));
   registerStatusHandler(window as unknown as BrowserWindow, frame.url, query);
   expect([...harness.handlers.keys()]).toEqual(['app:get-status']);
@@ -41,7 +41,7 @@ it('registered privileged handler rejects arguments and wrong sender before quer
   expect(handler(event)).toEqual({
     state: 'ready',
     appVersion: '0.1.0',
-    schemaVersion: 14,
+    schemaVersion: 15,
   });
   closed!();
   expect(harness.handlers.size).toBe(0);

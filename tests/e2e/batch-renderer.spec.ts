@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { createDraftHarness } from '../fixtures/draft-harness';
 import { createBatchController } from '../../src/application/batch-controller';
 import { openDraftBatchRepository } from '../../src/infrastructure/persistence/draft-batch-repository';
+import { operatorSettlement } from '../fixtures/operator-settlement';
 
 test.beforeAll(async () => {
   await new Promise<void>((done, reject) => {
@@ -359,6 +360,9 @@ test('requires summary confirmation, shows durable progress and stops at narrow 
   await page.getByRole('button', { name: '检查批量草稿摘要' }).click();
   await expect(page.getByText('目标门店：测试门店')).toBeVisible();
   await expect(page.getByText('测试文章', { exact: true })).toBeVisible();
+  await expect(page.locator('.draft-panel')).not.toContainText(
+    /原创|转载|声明/,
+  );
   expect(
     await page.evaluate(
       () => (window as unknown as { batchCalls: string[] }).batchCalls,
@@ -678,6 +682,44 @@ test('operator-reviewed submissions are attempted counts, never saved successes'
   ).toBeEnabled();
 });
 
+for (const [observation, stopped, message] of [
+  ['acknowledged', false, '平台已响应，实际草稿待人工核对'],
+  ['rejected', false, '保存返回失败，待人工核对'],
+  ['unknown', false, '保存结果未知，待人工核对'],
+  ['pending', false, '草稿状态尚未确认，请先核对后台记录。'],
+  ['acknowledged', true, '平台已响应，实际草稿待人工核对'],
+  ['rejected', true, '保存返回失败，待人工核对'],
+  ['unknown', true, '保存结果未知，待人工核对'],
+] as const)
+  test(`persisted operator result remains visible ${observation} stopped=${stopped}`, async ({
+    browser,
+    page,
+  }) => {
+    const platform = await browser.newContext();
+    try {
+      const result = await operatorSettlement(
+        platform,
+        await platform.newPage(),
+        observation,
+        stopped ? 'settling' : undefined,
+      );
+      await boot(page);
+      await page.evaluate((view) => {
+        window.desktopApi.batch.getCurrent = async () => view;
+        Reflect.get(window, 'remountBatch')();
+      }, result.view);
+      const item = page
+        .getByRole('listitem')
+        .filter({ hasText: 'Durable operator result' });
+      await expect(item).toContainText(message);
+      await expect(item).not.toContainText('草稿已保存');
+      if (stopped)
+        await expect(item).toContainText('已请求停止，请核对已完成的操作。');
+    } finally {
+      await platform.close();
+    }
+  });
+
 test('shared cover previews replacement scope before saving and applies only selected articles', async ({
   page,
 }) => {
@@ -737,6 +779,15 @@ async function bootCovers(page: Page) {
           imageCount: key.startsWith('1') ? 9 : 3,
           articleRevision: 1,
           createdAt: '2026-10-16T00:00:00.000Z',
+          editorBody: {
+            version: 2,
+            blocks: [
+              {
+                type: 'paragraph',
+                content: [{ type: 'text', text: '原文', marks: [] }],
+              },
+            ],
+          },
           body: [{ type: 'paragraph', text: '原文' }],
           assets: [],
         },
@@ -1231,4 +1282,134 @@ test('the fixed action bar counts executable articles in a mixed skipped selecti
   await expect(
     page.getByText('选择2篇，可执行1篇，跳过1篇，需处理0篇'),
   ).toBeVisible();
+});
+
+test('manual skip binds current identity, disables pending recovery and keeps unknown-save history visible', async ({
+  page,
+}) => {
+  await boot(page);
+  await page.evaluate((key) => {
+    const api = window.desktopApi.batch;
+    const view = {
+      id: key,
+      revision: 7,
+      state: 'paused' as const,
+      storeName: '测试门店',
+      stopRequested: false,
+      reason: 'RESULT_AMBIGUOUS' as const,
+      counts: {
+        total: 1,
+        saved: 0,
+        attempted: 0,
+        failed: 0,
+        skipped: 0,
+        pending: 0,
+        needsHuman: 1,
+        stopped: 0,
+      },
+      items: [
+        {
+          articleKey: key,
+          title: '测试文章',
+          contentDeclaration: 'original' as const,
+          coverSummary: null,
+          taskId: key,
+          state: 'needs_human' as const,
+          reason: 'RESULT_AMBIGUOUS' as const,
+          saveAttempted: true,
+        },
+      ],
+    };
+    api.getCurrent = async () => view;
+    api.skipCurrentAndContinue = async (input) => {
+      Reflect.set(window, 'recoveryInput', input);
+      await new Promise<void>((resolve) =>
+        Reflect.set(window, 'releaseRecovery', resolve),
+      );
+      return { status: 'blocked', reason: 'LOGIN_REQUIRED', view };
+    };
+  }, key);
+  await page.getByRole('button', { name: '跳过这篇，继续上传' }).click();
+  await expect(page.getByRole('button', { name: '正在接续…' })).toBeDisabled();
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'recoveryInput')),
+  ).toEqual({ batchId: key, expectedRevision: 7, taskId: key });
+  await page.evaluate(() => Reflect.get(window, 'releaseRecovery')());
+  await expect(
+    page.getByRole('button', { name: '跳过这篇，继续上传' }),
+  ).toBeEnabled();
+  await expect(
+    page.getByText('请在专用浏览器中登录，再检查登录状态。'),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    const api = window.desktopApi.batch;
+    api.skipCurrentAndContinue = async () => {
+      const current = (await api.getCurrent())!;
+      const view = {
+        ...current,
+        revision: 8,
+        state: 'completed' as const,
+        reason: null,
+        counts: { ...current.counts, needsHuman: 0, skipped: 1 },
+        items: current.items.map((item) => ({
+          ...item,
+          state: 'skipped' as const,
+        })),
+      };
+      api.getCurrent = async () => view;
+      return { status: 'ok', view };
+    };
+  });
+  await page.getByRole('button', { name: '跳过这篇，继续上传' }).click();
+  await expect(
+    page.getByText('曾尝试保存，原保存结果仍需人工核对；不会重传这篇。'),
+  ).toBeVisible();
+  await expect(page.getByText(/已跳过/)).toBeVisible();
+});
+
+test('restart without a current task exposes explicit untouched-queue recovery', async ({
+  page,
+}) => {
+  await boot(page);
+  await page.evaluate((key) => {
+    const api = window.desktopApi.batch;
+    const view = {
+      id: key,
+      revision: 9,
+      state: 'interrupted' as const,
+      storeName: '测试门店',
+      stopRequested: true,
+      reason: 'RESULT_AMBIGUOUS' as const,
+      counts: {
+        total: 1,
+        saved: 0,
+        attempted: 0,
+        failed: 0,
+        skipped: 0,
+        pending: 1,
+        needsHuman: 0,
+        stopped: 0,
+      },
+      items: [
+        {
+          articleKey: key,
+          title: '测试文章',
+          contentDeclaration: 'original' as const,
+          coverSummary: null,
+          taskId: null,
+          state: 'queued' as const,
+          reason: null,
+        },
+      ],
+    };
+    api.getCurrent = async () => view;
+    api.skipCurrentAndContinue = async (input) => {
+      Reflect.set(window, 'recoveryInput', input);
+      return { status: 'blocked', reason: 'LOGIN_REQUIRED', view };
+    };
+  }, key);
+  await page.getByRole('button', { name: '继续上传', exact: true }).click();
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'recoveryInput')),
+  ).toEqual({ batchId: key, expectedRevision: 9, taskId: null });
 });

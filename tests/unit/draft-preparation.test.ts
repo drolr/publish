@@ -1,3 +1,5 @@
+import { upgradeEditorBody } from '../../src/domain/rich-text-body';
+import type { EditableArticle } from '../../src/contracts/article-revision';
 import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { createDraftPreparation } from '../../src/application/draft-preparation';
@@ -43,6 +45,7 @@ const store = {
   identity: { source: 'visible-shop-link' as const, value: 'store-1' },
 };
 function setup() {
+  const capabilities = { revision: 'fixture-v1', features: {} };
   let next = 0;
   const repository = {
     loadEditableArticle: vi.fn(() => ({
@@ -56,9 +59,11 @@ function setup() {
     readCoverImage: async () => {
       throw Error('no cover image');
     },
-    capture: vi.fn(async (value: StoredArticle) => ({
-      version: 1 as const,
-      article: structuredClone(value),
+    verify: vi.fn(async () => {}),
+    capture: vi.fn(async (value: EditableArticle) => ({
+      version: 2 as const,
+      editorBody: upgradeEditorBody(value.editorBody, value.article.body),
+      article: structuredClone(value.article),
       digest: 'c'.repeat(64),
     })),
   } as unknown as SnapshotPort;
@@ -70,6 +75,7 @@ function setup() {
   } as unknown as DraftTaskRepository;
   const service = createDraftPreparation({
     repository,
+    contentCapabilities: () => capabilities,
     covers: {
       loadCover: (articleKey: string) => ({
         articleKey,
@@ -90,7 +96,7 @@ function setup() {
     tasks,
     newId: () => `00000000-0000-4000-8000-${String(++next).padStart(12, '0')}`,
   });
-  return { service, repository, snapshots, tasks };
+  return { service, repository, snapshots, tasks, capabilities };
 }
 
 it('keeps a binding token only for the same generation and store and invalidates preparations on change', async () => {
@@ -135,7 +141,7 @@ it('rejects stale tokens before reading and rejects a generation change during c
     await new Promise<void>((resolve) => {
       release = resolve;
     });
-    return { version: 1, article: value, digest: 'c'.repeat(64) };
+    return { version: 1, article: value.article, digest: 'c'.repeat(64) };
   });
   const pending = service.prepare(article.articleKey, view.bindingToken!);
   await vi.waitFor(() => expect(snapshots.capture).toHaveBeenCalled());
@@ -376,12 +382,18 @@ it('skips only a proven identical submitted snapshot, but explicit intent create
       second.preparation.preparationId,
     );
 });
-it.each(['digest', 'articleRevision', 'coverRevision', 'coverDigest'] as const)(
+it.each([
+  'content',
+  'articleRevision',
+  'coverRevision',
+  'coverDigest',
+] as const)(
   'prepares current snapshot when submitted %s differs',
   async (field) => {
     const { service, tasks } = setup();
     const old = submittedTask();
-    if (field === 'digest') old.snapshot.digest = 'd'.repeat(64);
+    if (field === 'content')
+      old.snapshot.article = { ...old.snapshot.article, title: '旧版标题内容' };
     if (field === 'articleRevision') old.articleRevision = 2;
     if (field === 'coverRevision') old.coverPlan!.snapshot.coverRevision = 1;
     if (field === 'coverDigest')
@@ -446,4 +458,96 @@ it('safe historical failures allow preparation while human-required ownership bl
       'new_attempt',
     ),
   ).toMatchObject({ status: 'existing', task: { state: 'needs_human' } });
+});
+
+it('blocks unsupported formatting instead of degrading to a plain snapshot and invalidates a prepared summary when capabilities change', async () => {
+  const { service, repository, capabilities, snapshots } = setup();
+  const session = service.offer({
+    status: 'ready',
+    store,
+    generation: randomUUID(),
+  });
+  const ready = await service.prepare(
+    article.articleKey,
+    session.bindingToken!,
+  );
+  expect(ready.status).toBe('ready');
+  capabilities.revision = 'fixture-v2';
+  if (ready.status === 'ready')
+    expect(service.take(ready.preparation.preparationId)).toBeUndefined();
+  vi.mocked(repository.loadEditableArticle).mockReturnValue({
+    article,
+    articleRevision: 1,
+    editorBody: {
+      version: 2,
+      blocks: [
+        {
+          type: 'paragraph',
+          content: [{ type: 'text', text: 'body', marks: ['bold'] }],
+        },
+        { type: 'image', imageId: 'image' },
+        { type: 'image', imageId: 'image' },
+      ],
+    },
+  });
+  expect(
+    await service.prepare(article.articleKey, session.bindingToken!),
+  ).toEqual({ status: 'blocked', reason: 'FORMAT_UNSUPPORTED' });
+  expect(snapshots.capture).toHaveBeenCalledTimes(1);
+});
+
+it('unknown cross-version empty layout and unverifiable history require an explicit new attempt', async () => {
+  const { service, repository, tasks, snapshots } = setup();
+  vi.mocked(tasks.findLatestIdentity).mockReturnValue(submittedTask());
+  const upgraded = upgradeEditorBody(null, article.body);
+  upgraded.blocks.unshift({ type: 'paragraph', content: [] });
+  vi.mocked(repository.loadEditableArticle).mockReturnValue({
+    article,
+    articleRevision: 1,
+    editorBody: upgraded,
+  });
+  const session = service.offer({
+    status: 'ready',
+    store,
+    generation: randomUUID(),
+  });
+  expect(
+    await service.prepare(article.articleKey, session.bindingToken!),
+  ).toEqual({ status: 'blocked', reason: 'NEW_ATTEMPT_REQUIRED' });
+  expect(
+    await service.prepare(
+      article.articleKey,
+      session.bindingToken!,
+      'new_attempt',
+    ),
+  ).toMatchObject({ status: 'ready' });
+  vi.mocked(repository.loadEditableArticle).mockReturnValue({
+    article,
+    articleRevision: 1,
+    editorBody: null,
+  });
+  vi.mocked(snapshots.verify).mockRejectedValue(
+    Error('invalid immutable history'),
+  );
+  expect(
+    await service.prepare(article.articleKey, session.bindingToken!),
+  ).toEqual({ status: 'blocked', reason: 'NEW_ATTEMPT_REQUIRED' });
+});
+
+it('capability uncertainty after asynchronous capture is PAGE_CHANGED and never produces a summary', async () => {
+  const { service, snapshots, capabilities } = setup();
+  const capture = vi.mocked(snapshots.capture).getMockImplementation()!;
+  vi.mocked(snapshots.capture).mockImplementation(async (value) => {
+    const result = await capture(value);
+    capabilities.revision = '';
+    return result;
+  });
+  const session = service.offer({
+    status: 'ready',
+    store,
+    generation: randomUUID(),
+  });
+  expect(
+    await service.prepare(article.articleKey, session.bindingToken!),
+  ).toEqual({ status: 'blocked', reason: 'PAGE_CHANGED' });
 });

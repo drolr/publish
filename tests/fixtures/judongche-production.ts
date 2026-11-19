@@ -6,6 +6,8 @@ export async function installProductionFixture(
   context: BrowserContext,
   options: {
     observedTrailingParagraphs?: boolean;
+    /** Synthetic lifecycle only; never changes the production writer. */
+    bodyInputLifecycle?: 'rebuild' | 'alternating';
     observedReopenTail?: boolean;
     changedImageCaret?: boolean;
     listAlias?: boolean;
@@ -29,6 +31,19 @@ export async function installProductionFixture(
     staleDraftList?: boolean;
     invisibleDraftListReads?: number;
     fullDraftReview?: 'unique' | 'duplicate' | 'incomplete';
+    /** Synthetic E69 notification/normal handler; never a production cache API. */
+    restoration?: {
+      delay?: number;
+      mode?:
+        | 'normal'
+        | 'repeat'
+        | 'residual-body'
+        | 'residual-image'
+        | 'residual-cover';
+      rich?: boolean;
+      images?: boolean;
+      cover?: boolean;
+    };
   } = {},
 ) {
   const origin = 'https://www.autoengine.com';
@@ -50,6 +65,8 @@ export async function installProductionFixture(
   let saved: SavedArticle | null = null;
   const history: Array<SavedArticle & { recordKey: string }> = [];
   let draftListReads = 0;
+  let editorEntries = 0;
+  let undoes = 0;
   let saves = 0,
     uploads = 0,
     covers = 0,
@@ -68,6 +85,10 @@ export async function installProductionFixture(
     }
     if (url.pathname === '/fixture/unrelated')
       return route.fulfill({ json: {} });
+    if (url.pathname === '/fixture/official-undo') {
+      undoes++;
+      return route.fulfill({ json: {} });
+    }
     if (url.pathname === '/fixture/image')
       return route.fulfill({ contentType: 'image/png', body: png });
     if (url.pathname === '/fixture/upload') {
@@ -131,14 +152,17 @@ export async function installProductionFixture(
     else if (url.pathname.endsWith('/sceneMarketing'))
       body = `<a href="https://m.dcdapp.com/motor/inapp/dshop/?dealer_id=123456">店铺</a><div><div><span>文章资讯</span></div><button onclick="location.href='${editor}'"><span>立即发布</span></button></div>`;
     else if (url.pathname === list)
-      body = `<span>状态:</span><span id="draftTab">草稿箱</span><input placeholder="请搜索标题关键字"><div id="results"></div><script>
+      body = `<span>状态:</span><div class="arco-radio-group" role="radiogroup"><label class="arco-radio-button"><input type="radio" value=""><span>全部</span></label><label class="arco-radio-button" id="draftTab"><input type="radio" value="3"><span>草稿箱</span></label></div><span class="arco-tag">草稿箱</span><span class="arco-tag">草稿箱</span><input placeholder="请搜索标题关键字"><div id="results"></div><script>
       draftTab.onclick=()=>draftTab.classList.add('active');
-      document.querySelector('input').onkeydown=async(e)=>{if(e.key!=='Enter')return;results.innerHTML='<span>加载中</span>';const item=await(await fetch('/fixture/list?title='+encodeURIComponent(e.target.value))).json();results.innerHTML='';if(!item){results.textContent='没有符合条件的内容';return;}const c=document.createElement('div');c.className='articleBox-fixture';const p=document.createElement('p');p.className='articleTitle-fixture';p.textContent=item.title;c.append(p);c.insertAdjacentHTML('beforeend','<span>草稿箱</span><span>文章资讯</span><button>编辑</button>');c.querySelector('button').onclick=()=>location.href='${editor}?pgc_id=501&pgc_status=3';results.append(c);const end=document.createElement('span');end.textContent='暂无更多数据';results.append(end);};</script>`;
+      document.querySelector('input[placeholder="请搜索标题关键字"]').onkeydown=async(e)=>{if(e.key!=='Enter')return;results.innerHTML='<span>加载中</span>';const item=await(await fetch('/fixture/list?title='+encodeURIComponent(e.target.value))).json();results.innerHTML='';if(!item){results.textContent='没有符合条件的内容';return;}const c=document.createElement('div');c.className='articleBox-fixture';const p=document.createElement('p');p.className='articleTitle-fixture';p.textContent=item.title;c.append(p);c.insertAdjacentHTML('beforeend','<span>草稿箱</span><span>文章资讯</span><button>编辑</button>');c.querySelector('button').onclick=()=>location.href='${editor}?pgc_id=501&pgc_status=3';results.append(c);const end=document.createElement('span');end.textContent='暂无更多数据';results.append(end);};</script>`;
     else if (url.pathname === editor)
       body = `<textarea placeholder="请输入文章标题（5-30个汉字）"></textarea><div class="syl-toolbar"><span class="syl-toolbar-tool image"><button id="imageTool">图片</button></span></div><div contenteditable="true" id="body"><p><br class="ProseMirror-trailingBreak"></p></div><button id="save">存草稿</button><button onclick="fetch('/fixture/cover')">选择封面</button><script>
       const existing=${JSON.stringify(url.searchParams.has('pgc_id') ? (options.batchHistory ? (history.find((item) => item.recordKey === url.searchParams.get('pgc_id')) ?? null) : saved) : null)};
       if(existing){document.querySelector('textarea').value=existing.title;body.innerHTML=existing.html;if(!body.lastElementChild||body.lastElementChild.tagName!=="P"||body.lastElementChild.textContent){const tail=document.createElement("p");tail.innerHTML='<br class="ProseMirror-trailingBreak">';body.append(tail);}else if(body.lastElementChild.innerHTML===""){body.lastElementChild.innerHTML='<br class="ProseMirror-trailingBreak">';}}
       if(!existing)body.innerHTML='<p><span class="syl-placeholder ProseMirror-widget" style="position:absolute;user-select:none" ignoreel="true" contenteditable="false">请输入正文</span><img class="ProseMirror-separator" alt=""><br class="ProseMirror-trailingBreak"></p>';
+      // Model the platform selection plugin only for exact known empty P shapes.
+      // Raw contenteditable may leave selection in BODY or before a prior image.
+      body.addEventListener('mousedown',(event)=>{const p=event.target.closest('p');if(p?.parentElement!==body)return;const caret=p.childNodes.length===1&&p.firstElementChild?.matches('br.ProseMirror-trailingBreak');const placeholder=p.childNodes.length===3&&p.children.length===3&&p.children[0].matches('span.syl-placeholder.ProseMirror-widget[contenteditable="false"][ignoreel="true"]')&&p.children[0].childNodes.length===1&&p.children[0].textContent==='请输入正文'&&p.children[1].matches('img.ProseMirror-separator')&&p.children[2].matches('br.ProseMirror-trailingBreak');if(!caret&&!placeholder)return;event.preventDefault();body.focus();const range=document.createRange();range.selectNodeContents(p);range.collapse(true);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);});
       body.onbeforeinput=(e)=>{const widget=body.querySelector('.syl-placeholder');if(!widget||e.inputType!=='insertText')return;e.preventDefault();const p=widget.parentElement;p.textContent=e.data;const r=document.createRange();r.selectNodeContents(p);r.collapse(false);getSelection().removeAllRanges();getSelection().addRange(r);};
       body.onkeydown=(e)=>{if(e.key!=='Enter'||e.shiftKey)return;e.preventDefault();const p=document.createElement('p');p.innerHTML='<br class="ProseMirror-trailingBreak">';body.append(p);const r=document.createRange();r.selectNodeContents(p);r.collapse(true);getSelection().removeAllRanges();getSelection().addRange(r);};
       imageTool.onclick=()=>{const d=document.createElement('div');d.setAttribute('role','dialog');d.innerHTML='<input type="file"><div id="preview"></div><button disabled>确定</button>';document.body.append(d);d.querySelector('input').onchange=async()=>{const data=await(await fetch('/fixture/upload',{method:'POST'})).json();const img=document.createElement('img');img.src='/fixture/image?web_uri='+data.key;img.width=100;img.onload=()=>d.querySelector('button').disabled=false;d.querySelector('#preview').append(img);d.querySelector('button').onclick=()=>{const block=document.createElement('div');block.setAttribute('__syl_tag','true');block.setAttribute('contenteditable','false');block.setAttribute('draggable','true');block.innerHTML='<templ style="display:none"><img web_uri="'+data.key+'" src="'+img.src+'"></templ><div class="pgc-image"><div class="pgc-img-wrapper"><img width="100" web_uri="'+data.key+'" src="'+img.src+'"></div></div>';body.lastElementChild.replaceWith(block);const p=document.createElement('p');p.innerHTML='<br class="ProseMirror-trailingBreak">';body.append(p);d.remove();};};};
@@ -187,18 +211,29 @@ export async function installProductionFixture(
       );
     }
     if (url.pathname === editor) {
+      if (options.bodyInputLifecycle) {
+        body += `<script>
+          window.bodyInputActions=[];
+          document.addEventListener('change',event=>{
+            const input=event.target,modal=input.closest('[role=dialog]');
+            if(input.type!=='file'||!modal||!modal.querySelector('#preview'))return;
+            const actions=window.bodyInputActions;
+            const mode=${JSON.stringify(options.bodyInputLifecycle)}==='rebuild'?'rebuilt':['retained','cleared','unmounted'][actions.length%3];
+            const action={mode,selected:1,confirmed:0};actions.push(action);
+            modal.addEventListener('click',event=>{if(event.target.tagName==='BUTTON'&&event.target.textContent==='确定')action.confirmed++;},true);
+            if(mode==='rebuilt'){const replacement=document.createElement('input');replacement.type='file';input.replaceWith(replacement);}
+            if(mode==='cleared')input.value='';
+            if(mode==='unmounted')input.remove();
+          });
+        </script>`;
+      }
+      editorEntries++;
       // Observed empty cover shape: the plus icon is a UI control, not a cover.
       body = body.replace(
         '<button id="save">',
-        '<div class="article-cover-images"><div class="article-cover-add"><img class="plus-icon" width="20" height="20" src="/fixture/image"></div></div><button id="save">',
+        '<section id="cover"><div>展示封面</div><label><input type="radio" name="cover" checked><span>单图</span></label><label><input type="radio" name="cover"><span>三图</span></label><div class="article-cover-images"><div class="article-cover-add"><img class="plus-icon" width="20" height="20" src="/fixture/image"></div></div></section><button id="save">',
       );
       if (options.singleCoverUpload) {
-        body = body
-          .replace(
-            '<div class="article-cover-images">',
-            '<section id="cover"><div>展示封面</div><label><input type="radio" name="cover" checked><span>单图</span></label><label><input type="radio" name="cover"><span>三图</span></label><div class="article-cover-images">',
-          )
-          .replace('<button id="save">', '</section><button id="save">');
         // Deliberately invented completion data. The production driver must read
         // the retained File, terminal label, HTTPS preview and checkbox itself.
         body += `<style>.arco-modal-wrapper{position:fixed;inset:0;display:grid;place-items:center}.arco-modal{background:white;padding:24px}.arco-modal-mask{position:fixed;inset:0;background:#0003}</style><script>
@@ -222,6 +257,29 @@ export async function installProductionFixture(
           };
         </script>`;
       }
+    }
+    if (
+      url.pathname === editor &&
+      options.restoration &&
+      !url.searchParams.has('pgc_id') &&
+      (!undoes || options.restoration.mode === 'repeat')
+    ) {
+      const mode = options.restoration.mode ?? 'normal';
+      const restoredImage =
+        '<div __syl_tag="true" contenteditable="false" draggable="true"><templ style="display:none"><img web_uri="restored" src="/fixture/image?web_uri=restored"></templ><div class="pgc-image"><div class="pgc-img-wrapper"><img width="100" height="100" web_uri="restored" src="/fixture/image?web_uri=restored"></div></div></div>';
+      if (options.restoration.images)
+        body =
+          '<link rel="preload" as="image" href="/fixture/image?web_uri=restored">' +
+          body;
+      body += `<script>document.addEventListener('DOMContentLoaded',()=>setTimeout(()=>{
+        document.querySelector('textarea').value='restored old title';
+        body.innerHTML=${JSON.stringify(options.restoration.rich ? '<h1><strong>restored heading</strong></h1><blockquote><p>old quote</p></blockquote><p><br class="ProseMirror-trailingBreak"></p>' : '<p>restored body</p><p><br class="ProseMirror-trailingBreak"></p>')};
+        ${options.restoration.images ? `body.firstElementChild.insertAdjacentHTML('afterend',${JSON.stringify(restoredImage)});` : ''}
+        ${options.restoration.cover ? `document.querySelector('.article-cover-images').innerHTML='<img width="100" height="100" src="/fixture/image">';` : ''}
+        const note=document.createElement('span');note.className='arco-message-content';note.textContent='已恢复上次编辑未保存的内容';
+        const undo=document.createElement('span');undo.className='publish-message-opr';undo.textContent='撤销';note.append(undo);document.body.append(note);
+        undo.onclick=async()=>{await fetch('/fixture/official-undo',{method:'POST'});document.querySelector('textarea').value='';body.innerHTML=${JSON.stringify(mode === 'residual-body' ? '<p>residual body</p>' : mode === 'residual-image' ? '<p><img width="100" height="100" src="/fixture/image"></p>' : '<p><br class="ProseMirror-trailingBreak"></p>')};${mode === 'residual-cover' ? "document.querySelector('.article-cover-images').innerHTML='<img width=100 height=100 src=\"/fixture/image\">';" : 'document.querySelector(\'.article-cover-images\').innerHTML=\'<div class="article-cover-add"><img class="plus-icon" width=20 height=20 src="/fixture/image"></div>\';'}note.remove();};
+      },${options.restoration.delay ?? 0}));</script>`;
     }
     if (options.imageClose && url.pathname === editor) {
       // A collapsed dialog is hidden to Playwright but still has client rects.
@@ -277,6 +335,8 @@ export async function installProductionFixture(
   });
   return {
     home,
+    editorEntries: () => editorEntries,
+    undoes: () => undoes,
     renameSaved: (title: string) => {
       if (!saved) throw Error('not saved');
       saved.title = title;

@@ -1,3 +1,4 @@
+import { returnToArticlePool } from './focused-editor-navigation';
 import { _electron as electron, expect } from '@playwright/test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -29,42 +30,55 @@ export async function checkManualDesktop(executablePath?: string) {
           await page.evaluate(() => window.desktopApi.getManualArticleState()),
         ).toMatchObject({ state: 'idle' });
         if (run === 0) {
+          if (
+            await page
+              .getByRole('button', { name: '返回文章池', exact: true })
+              .isVisible()
+          )
+            await returnToArticlePool(page);
           await page
             .getByRole('button', { name: '新建文章', exact: true })
             .click();
-          await page
-            .getByRole('button', { name: '手动录入', exact: true })
-            .click();
+          await expect(
+            page.getByRole('textbox', { name: '文章正文', exact: true }),
+          ).toBeEditable();
           await page.getByLabel('文章标题', { exact: true }).fill('手动纯文字');
           await page
             .getByRole('textbox', { name: '文章正文', exact: true })
             .fill('<script>字面正文</script>');
           await page
-            .getByRole('button', { name: '保存到文章池', exact: true })
+            .getByRole('button', { name: '保存到本机', exact: true })
             .click();
           await expect(
-            page.getByRole('status').filter({ hasText: '文章已保存到本机' }),
+            page.getByRole('status').filter({ hasText: '已保存到本机' }),
           ).toBeVisible();
+          if (
+            await page
+              .getByRole('button', { name: '返回文章池', exact: true })
+              .isVisible()
+          )
+            await returnToArticlePool(page);
           await page
             .getByRole('button', { name: '新建文章', exact: true })
             .click();
-          await page
-            .getByRole('button', { name: '手动录入', exact: true })
-            .click();
+          await expect(
+            page.getByRole('textbox', { name: '文章正文', exact: true }),
+          ).toBeEditable();
           await page.getByLabel('文章标题', { exact: true }).fill('手动图文');
           await page
             .getByRole('textbox', { name: '文章正文', exact: true })
             .fill('保留的段落');
-          await page
-            .getByLabel('文章声明', { exact: true })
-            .selectOption('original');
           await expect(
-            page.getByRole('status').filter({ hasText: '输入已同步' }),
-          ).toBeVisible();
+            page.getByLabel('文章声明', { exact: true }),
+          ).toHaveCount(0);
+          await expect(page.locator('.editor-save-status')).toHaveAttribute(
+            'data-input-pending',
+            'false',
+          );
           await page.reload();
-          await page
-            .getByRole('button', { name: '手动录入', exact: true })
-            .click();
+          await expect(
+            page.getByRole('textbox', { name: '文章正文', exact: true }),
+          ).toBeEditable();
           await expect(
             page.getByLabel('文章标题', { exact: true }),
           ).toHaveValue('手动图文');
@@ -107,7 +121,7 @@ export async function checkManualDesktop(executablePath?: string) {
               .click();
             await page.keyboard.press('Control+End');
             await page
-              .getByRole('button', { name: '添加图片', exact: true })
+              .getByRole('button', { name: '插入图片', exact: true })
               .click();
             await expect
               .poll(() =>
@@ -149,10 +163,10 @@ export async function checkManualDesktop(executablePath?: string) {
             page.getByLabel('文章标题', { exact: true }),
           ).toHaveValue('手动图文');
           await page
-            .getByRole('button', { name: '保存到文章池', exact: true })
+            .getByRole('button', { name: '保存到本机', exact: true })
             .click();
           await expect(
-            page.getByRole('status').filter({ hasText: '文章已保存到本机' }),
+            page.getByRole('status').filter({ hasText: '已保存到本机' }),
           ).toBeVisible();
           for (let index = 0; index < 2; index++)
             rmSync(join(root, `source-${index}`), { recursive: true });
@@ -165,7 +179,7 @@ export async function checkManualDesktop(executablePath?: string) {
         const article = list.page.items.find(
           (item) => item.title === '手动图文',
         );
-        expect(article?.contentDeclaration).toBe('original');
+        expect(article?.contentDeclaration).toBe('repost');
         if (!article) throw Error('manual article');
         const preview = await page.evaluate(
           (key) => window.desktopApi.getArticlePreview(key),
@@ -189,12 +203,18 @@ export async function checkManualDesktop(executablePath?: string) {
             ),
           ).toBe('ok');
         if (run === 1) {
+          if (
+            await page
+              .getByRole('button', { name: '返回文章池', exact: true })
+              .isVisible()
+          )
+            await returnToArticlePool(page);
           await page
             .getByRole('button', { name: '新建文章', exact: true })
             .click();
-          await page
-            .getByRole('button', { name: '手动录入', exact: true })
-            .click();
+          await expect(
+            page.getByRole('textbox', { name: '文章正文', exact: true }),
+          ).toBeEditable();
           await page.getByLabel('文章标题', { exact: true }).fill('放弃的文章');
           await application.evaluate(({ dialog }) => {
             dialog.showMessageBox = async () => ({

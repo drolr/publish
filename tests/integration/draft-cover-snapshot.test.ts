@@ -62,7 +62,7 @@ async function setup() {
       expectedArticleRevision: article.articleRevision,
       expectedCoverRevision: config.coverRevision,
       coverSnapshot: snapshots.captureCover(config),
-      snapshot: await snapshots.capture(article.article),
+      snapshot: await snapshots.capture(article),
       store: makeDraftTask().store,
       now: '2026-10-09T00:00:00.000Z',
     } satisfies ReserveInput;
@@ -173,6 +173,10 @@ it('missing_cover_file_reported_later leaves body capture, verification and prep
   const config = await s.save('single');
   unlinkSync(join(s.root, 'covers', config.assets[0].relativePath));
   const prep = createDraftPreparation({
+    contentCapabilities: () => ({
+      revision: 'judongche-rich-unknown-v1',
+      features: {},
+    }),
     repository: s.articles,
     covers: s.articles,
     snapshots: s.snapshots,
@@ -418,6 +422,10 @@ async function controlledExecution(
     generation: randomUUID(),
   };
   const platform: DraftPlatform = {
+    contentCapabilities: () => ({
+      revision: 'judongche-rich-unknown-v1',
+      features: {},
+    }),
     openSession: async () => probe,
     checkSession: async () => probe,
     closeSession: async () => {},
@@ -430,9 +438,14 @@ async function controlledExecution(
     openVerified: async () => {},
   };
   const controller = createDraftController({
+    invalidateBrowserHealth: () => {},
     tasks: s.taskStore,
     snapshots: s.snapshots,
     preparation: createDraftPreparation({
+      contentCapabilities: () => ({
+        revision: 'judongche-rich-unknown-v1',
+        features: {},
+      }),
       repository: s.articles,
       covers: s.articles,
       snapshots: s.snapshots,

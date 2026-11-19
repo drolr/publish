@@ -1,3 +1,8 @@
+import { openArticleRepository } from '../../src/infrastructure/persistence/article-repository';
+import { resolve } from 'node:path';
+import Database from 'better-sqlite3';
+import { upgradeEditorBody } from '../../src/domain/rich-text-body';
+import { createArticleLibrary } from '../../src/application/article-library';
 import { afterEach, expect, it } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -257,13 +262,16 @@ it('first_save_target_switch_duplicate_receipt reserves one identity', async () 
     externalId: 'created',
     title: 'Created',
     contentDeclaration: 'original' as const,
-    editorBody: {
-      version: 1 as const,
-      blocks: [
-        { type: 'paragraph' as const, text: '正文' },
-        { type: 'paragraph' as const, text: '' },
-      ],
-    },
+    editorBody: upgradeEditorBody(
+      {
+        version: 1 as const,
+        blocks: [
+          { type: 'paragraph' as const, text: '正文' },
+          { type: 'paragraph' as const, text: '' },
+        ],
+      },
+      [],
+    ),
     images: [],
   };
   const result = await r.service.saveRevision(
@@ -298,10 +306,13 @@ it('undo_image_after_save reuses old bytes and rejects fabricated opaque leases'
   const removed = {
     ...input,
     images: [],
-    editorBody: {
-      version: 1 as const,
-      blocks: [{ type: 'paragraph' as const, text: 'Only text' }],
-    },
+    editorBody: upgradeEditorBody(
+      {
+        version: 1 as const,
+        blocks: [{ type: 'paragraph' as const, text: 'Only text' }],
+      },
+      [],
+    ),
   };
   await r.images.retain(input.intent.sessionId, [], { preserveHistory: true });
   expect(
@@ -355,10 +366,13 @@ it('failed first save retries the same operation and original article key only a
     externalId: 'retry-created',
     title: 'Retry',
     contentDeclaration: 'repost' as const,
-    editorBody: {
-      version: 1 as const,
-      blocks: [{ type: 'paragraph' as const, text: 'Body' }],
-    },
+    editorBody: upgradeEditorBody(
+      {
+        version: 1 as const,
+        blocks: [{ type: 'paragraph' as const, text: 'Body' }],
+      },
+      [],
+    ),
     images: [],
   };
   const finalize = r.formal.finalize;
@@ -411,13 +425,16 @@ it('first create images use the trusted session capability before atomic receipt
     externalId: 'with-image',
     title: 'Image',
     contentDeclaration: 'repost' as const,
-    editorBody: {
-      version: 1 as const,
-      blocks: [
-        { type: 'paragraph' as const, text: 'Image body' },
-        { type: 'image' as const, imageId: 'new' },
-      ],
-    },
+    editorBody: upgradeEditorBody(
+      {
+        version: 1 as const,
+        blocks: [
+          { type: 'paragraph' as const, text: 'Image body' },
+          { type: 'image' as const, imageId: 'new' },
+        ],
+      },
+      [],
+    ),
     images: [
       {
         kind: 'temporary' as const,
@@ -634,4 +651,171 @@ it('retry admission never retires unresolved owned files or committed ownership 
   expect(r.repository.readRevisionOperation(input.intent.operationId)).toEqual(
     committed,
   );
+});
+
+it.each(['null', 'v1'] as const)(
+  'rich save leaves legacy %s body and revision unchanged',
+  async (version) => {
+    const r = await setup();
+    const original = {
+      version: 1 as const,
+      blocks: [
+        { type: 'paragraph' as const, text: ' 原文😀\n ' },
+        { type: 'image' as const, imageId: 'i' },
+      ],
+    };
+    if (version === 'v1') {
+      const db = new Database(join(r.root, 'app.sqlite'));
+      db.prepare('UPDATE articles SET editor_body_json = ?').run(
+        JSON.stringify(original),
+      );
+      db.close();
+    }
+    const input = await updateInput(r);
+    const result = await r.service.saveRevision(
+      {
+        ...input,
+        title: r.article.title,
+        contentDeclaration: r.article.contentDeclaration,
+        editorBody: upgradeEditorBody(original, r.article.body),
+      },
+      new AbortController().signal,
+    );
+    expect(result.status).toBe('unchanged');
+    expect(
+      r.repository.loadEditableArticle(r.article.articleKey),
+    ).toMatchObject({
+      articleRevision: 1,
+      editorBody: version === 'null' ? null : original,
+    });
+  },
+);
+it('rich marks-only save increments the same identity and preview uses the authoritative body', async () => {
+  const r = await setup();
+  const input = await updateInput(r);
+  const editorBody = upgradeEditorBody(null, r.article.body);
+  const paragraph = editorBody.blocks[0];
+  if (paragraph.type !== 'paragraph') throw Error('fixture');
+  paragraph.content[0].marks = ['bold', 'italic', 'underline'];
+  const rich = {
+    ...input,
+    title: r.article.title,
+    contentDeclaration: r.article.contentDeclaration,
+    editorBody,
+  };
+  expect(
+    (await r.service.saveRevision(rich, new AbortController().signal)).status,
+  ).toBe('committed');
+  expect(r.repository.loadEditableArticle(r.article.articleKey)).toEqual({
+    article: r.article,
+    articleRevision: 2,
+    editorBody,
+  });
+  const preview = await createArticleLibrary(
+    r.repository,
+    r.formal,
+    r.repository,
+  ).getArticlePreview(r.article.articleKey);
+  expect(preview).toMatchObject({ status: 'ok', article: { editorBody } });
+  const reopened = openArticleRepository(
+    join(r.root, 'app.sqlite'),
+    resolve('src/infrastructure/persistence/migrations'),
+  );
+  try {
+    expect(reopened.loadEditableArticle(r.article.articleKey)).toEqual({
+      article: r.article,
+      articleRevision: 2,
+      editorBody,
+    });
+  } finally {
+    reopened.close();
+  }
+  expect(await r.service.recover()).toBe(true);
+  const db = new Database(join(r.root, 'app.sqlite'));
+  paragraph.content[0].marks = [];
+  db.prepare('UPDATE articles SET editor_body_json=?').run(
+    JSON.stringify(editorBody),
+  );
+  db.close();
+  r.repository.markRevisionOperation(input.intent.operationId, {
+    status: 'needs_review',
+  });
+  expect(await r.service.recover()).toBe(false);
+});
+it('first rich save retains headings, list starts, quotes, empty paragraphs and soft breaks after reopen', async () => {
+  const r = await setup();
+  const editorBody = {
+    version: 2 as const,
+    blocks: [
+      {
+        type: 'heading' as const,
+        content: [
+          { type: 'text' as const, text: '小标题', marks: ['bold' as const] },
+        ],
+      },
+      {
+        type: 'list' as const,
+        kind: 'ordered' as const,
+        start: 7,
+        items: [
+          {
+            type: 'paragraph' as const,
+            content: [{ type: 'text' as const, text: 'a\nb', marks: [] }],
+          },
+        ],
+      },
+      {
+        type: 'blockquote' as const,
+        paragraphs: [{ type: 'paragraph' as const, content: [] }],
+      },
+      { type: 'paragraph' as const, content: [] },
+    ],
+  };
+  const input = {
+    kind: 'created' as const,
+    command: {
+      operationId: randomUUID(),
+      sessionId: randomUUID(),
+      documentRevision: 2,
+      payloadDigest: 'e'.repeat(64),
+    },
+    externalId: 'rich-created',
+    title: '富文本',
+    contentDeclaration: 'original' as const,
+    editorBody,
+    images: [],
+  };
+  expect(
+    (await r.service.saveRevision(input, new AbortController().signal)).status,
+  ).toBe('committed');
+  const article = r.repository.findExternal('rich-created')!;
+  expect(
+    r.repository.loadEditableArticle(article.articleKey)?.editorBody,
+  ).toEqual(editorBody);
+  expect(article.body).toEqual([
+    { type: 'paragraph', text: '小标题' },
+    { type: 'paragraph', text: 'a\nb' },
+  ]);
+  const declarations = r.repository.setArticleDeclarations!({
+    targets: [
+      { articleKey: article.articleKey, expectedDeclaration: 'original' },
+    ],
+    declaration: 'repost',
+  });
+  expect(declarations.status).toBe('updated');
+  expect(
+    r.repository.loadArchivedEditableArticle(article.articleKey)?.editorBody,
+  ).toEqual(editorBody);
+  expect(await r.service.recover()).toBe(true);
+  const reopened = openArticleRepository(
+    join(r.root, 'app.sqlite'),
+    resolve('src/infrastructure/persistence/migrations'),
+  );
+  try {
+    expect(
+      reopened.loadArchivedEditableArticle(article.articleKey)?.editorBody,
+    ).toEqual(editorBody);
+  } finally {
+    reopened.close();
+  }
 });

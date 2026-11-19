@@ -568,6 +568,8 @@ it('HTTP retirement retains acquisition/controller ownership and write exclusion
     save: async () => ({ status: 'cancelled' }),
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [{ type: 'image', source: 'http://fixture.example/a' }],
         plainOnly: false,
       }),

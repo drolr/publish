@@ -36,7 +36,7 @@ export function registerManualHandlers(
   });
 }
 
-// Keep the composition-root fallback and all nineteen typed bindings together.
+// Keep the composition-root fallback and all twenty-three typed bindings together.
 export function createManualDesktopApi(
   manual: ReturnType<typeof createManualArticleController> | undefined,
 ): ManualArticleApi {
@@ -46,6 +46,14 @@ export function createManualDesktopApi(
       snapshot: { state: 'unavailable', revision: 0 },
     }) as const;
   return {
+    pickManualCoverImage: async (...args) =>
+      manual?.pickManualCoverImage(...args) ?? unavailable(),
+    setManualCoverMode: async (...args) =>
+      manual?.setManualCoverMode(...args) ?? unavailable(),
+    getManualCoverImage: async (...args) =>
+      manual?.getManualCoverImage(...args) ?? { status: 'unavailable' },
+    reconcileManualCoverSave: async (...args) =>
+      manual?.reconcileManualCoverSave(...args) ?? unavailable(),
     openManualArticle: async (...args) =>
       manual?.openManualArticle(...args) ?? unavailable(),
     applyManualEdit: async (...args) =>

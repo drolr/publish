@@ -1,4 +1,4 @@
-import { WorkspaceFooter } from '../WorkspaceFooter';
+import { WorkspaceFooter, type WorkspaceTaskStatus } from '../WorkspaceFooter';
 import {
   readArticlePreview,
   resetArticlePreviewReads,
@@ -14,6 +14,13 @@ import { ManualEditor } from './ManualEditor';
 import { isSession, useManualArticle } from './useManualArticle';
 import { OperationControls, useOperationControl } from '../OperationControls';
 export function ArticleWorkspace() {
+  const [view, setView] = useState<'library' | 'editor'>('library');
+  const [singleStatus, setSingleStatus] = useState<WorkspaceTaskStatus | null>(
+    null,
+  );
+  const [batchStatus, setBatchStatus] = useState<WorkspaceTaskStatus | null>(
+    null,
+  );
   const [articleKey, setArticleKey] = useState<string | undefined>();
   const [mode, setMode] = useState<'single' | 'batch'>('single');
   const [batchCoverExpanded, setBatchCoverExpanded] = useState(false);
@@ -43,6 +50,22 @@ export function ArticleWorkspace() {
   const [draftIssue, setDraftIssue] = useState('');
   const [batchIssue, setBatchIssue] = useState('');
   const controller = useManualArticle();
+  const latestController = useRef(controller);
+  latestController.current = controller;
+  const libraryView = useRef<HTMLDivElement>(null);
+  const editorView = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const target =
+      view === 'library' ? libraryView.current : editorView.current;
+    target
+      ?.querySelector<HTMLElement>(
+        view === 'library'
+          ? '.article-rows button[aria-pressed=true], button'
+          : '.focused-editor-header button',
+      )
+      ?.focus();
+    target?.closest('main')?.scrollTo({ top: 0 });
+  }, [view]);
   const [choice, setChoice] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
@@ -84,7 +107,12 @@ export function ArticleWorkspace() {
       resetArticlePreviewReads();
       setResetRevision((v) => v + 1);
       if (
-        !(isSession(controller.snapshot) && controller.snapshot.dirty) &&
+        !(
+          isSession(controller.snapshot) &&
+          (controller.snapshot.dirty ||
+            controller.snapshot.cover?.dirty ||
+            controller.unsynced)
+        ) &&
         !(coverSession(cover.state) && cover.state.dirty)
       )
         setArticleKey(undefined);
@@ -106,8 +134,24 @@ export function ArticleWorkspace() {
           : null;
       dialog.current?.showModal();
     } else if (dialog.current?.open) {
-      dialog.current.close();
-      requestAnimationFrame(() => returnFocus.current?.focus());
+      const closedDialog = dialog.current;
+      const target = returnFocus.current;
+      closedDialog.close();
+      const frame = requestAnimationFrame(() => {
+        const active = document.activeElement;
+        if (!target?.isConnected || closedDialog.open) return;
+        // Native close can leave focus on body or a former dialog child.
+        // Preserve a newer explicit focus choice outside the closed dialog.
+        if (
+          active?.isConnected &&
+          active !== document.body &&
+          active !== document.documentElement &&
+          !closedDialog.contains(active)
+        )
+          return;
+        target.focus();
+      });
+      return () => cancelAnimationFrame(frame);
     }
   }, [choice]);
   function answer(value: 'save' | 'discard' | 'keep') {
@@ -129,7 +173,7 @@ export function ArticleWorkspace() {
     if (!isSession(state) || state.state === 'finished')
       return state?.state !== 'unavailable';
     const decision =
-      state.dirty || settled.unsynced
+      state.dirty || state.cover?.dirty || settled.unsynced
         ? await new Promise<'save' | 'discard' | 'keep'>((resolve) => {
             resolver.current = resolve;
             setChoice(true);
@@ -137,6 +181,65 @@ export function ArticleWorkspace() {
         : 'discard';
     if (ticket !== operationGeneration.current) return false;
     return controller.leave(decision);
+  }
+  async function returnToLibrary() {
+    if (operations.blocked || moving.current || deletionLock.current) return;
+    const ticket = operationGeneration.current;
+    moving.current = true;
+    setHandover(true);
+    try {
+      const settled = await controller.prepareLeave();
+      if (ticket !== operationGeneration.current || settled.blocked) return;
+      const state = settled.snapshot;
+      if (
+        isSession(state) &&
+        (state.dirty || state.cover?.dirty || settled.unsynced)
+      ) {
+        const decision = await new Promise<'save' | 'discard' | 'keep'>(
+          (resolve) => {
+            resolver.current = resolve;
+            setChoice(true);
+          },
+        );
+        if (ticket !== operationGeneration.current || decision === 'keep')
+          return;
+        if (decision === 'discard') {
+          if (!(await controller.leave('discard'))) return;
+        } else {
+          if (!(await controller.command('save'))) return;
+          let saved = await controller.prepareLeave();
+          while (
+            isSession(saved.snapshot) &&
+            saved.snapshot.state === 'saving'
+          ) {
+            if (
+              ticket !== operationGeneration.current ||
+              latestController.current.unknown
+            )
+              return;
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            saved = await controller.prepareLeave();
+          }
+          if (
+            ticket !== operationGeneration.current ||
+            saved.blocked ||
+            saved.unsynced ||
+            !isSession(saved.snapshot) ||
+            saved.snapshot.sessionId !== state.sessionId ||
+            saved.snapshot.dirty ||
+            saved.snapshot.cover?.dirty ||
+            saved.snapshot.issues?.length
+          )
+            return;
+        }
+      }
+      if (ticket === operationGeneration.current) setView('library');
+    } finally {
+      if (ticket === operationGeneration.current) {
+        moving.current = false;
+        setHandover(false);
+      }
+    }
   }
   async function beforeWrite(bodyOnly = false) {
     if (operations.blocked || moving.current || deletionLock.current)
@@ -168,6 +271,18 @@ export function ArticleWorkspace() {
   }
   async function select(key?: string, fresh = false) {
     if (
+      !fresh &&
+      key &&
+      key === articleKey &&
+      controller.isEditingArticle(key) &&
+      !operations.blocked &&
+      !moving.current &&
+      !deletionLock.current
+    ) {
+      setView('editor');
+      return;
+    }
+    if (
       operations.blocked ||
       batchBlocked ||
       moving.current ||
@@ -188,11 +303,17 @@ export function ArticleWorkspace() {
       if (!(await closeEditor())) return;
       if (ticket !== operationGeneration.current) return;
       if (fresh) {
-        if (await controller.command('begin')) setArticleKey(undefined);
+        if (await controller.command('begin')) {
+          setArticleKey(undefined);
+          setView('editor');
+        }
       } else if (!key) setArticleKey(undefined);
       else {
         const opened = await controller.openForSelection(key);
-        if (opened.known) setArticleKey(key);
+        if (opened.known) {
+          setArticleKey(key);
+          if (opened.opened) setView('editor');
+        }
       }
     } finally {
       moving.current = false;
@@ -200,6 +321,19 @@ export function ArticleWorkspace() {
     }
   }
   const snapshot = controller.snapshot;
+  const observedSession = useRef<string | undefined>(undefined);
+  const snapshotSession = isSession(snapshot) ? snapshot.sessionId : undefined;
+  useEffect(() => {
+    if (snapshot?.state === 'idle') {
+      observedSession.current = undefined;
+      setView('library');
+    } else if (snapshotSession && observedSession.current !== snapshotSession) {
+      // Restore a retained/new main-owned session once. Polls of the same session
+      // must never undo an explicit view-only return to the pool.
+      observedSession.current = snapshotSession;
+      setView('editor');
+    }
+  }, [snapshot?.state, snapshotSession]);
   // Preparation follows visible editor content, not close/ack lifecycle revisions.
   // Retain the last semantic token through an authorized close to idle. Text stays
   // in this local ref; only the serial token reaches the draft panel.
@@ -258,6 +392,7 @@ export function ArticleWorkspace() {
     return (
       <DraftPanel
         onIssueChange={setDraftIssue}
+        onTaskStatusChange={setSingleStatus}
         operationGeneration={() => operationGeneration.current}
         operationsBlocked={operations.blocked || batchBlocked || coverWork}
         onPlatformActivityChange={projectPlatformActivity}
@@ -391,6 +526,7 @@ export function ArticleWorkspace() {
               <div hidden={mode !== 'batch'}>
                 <BatchPanel
                   onIssueChange={setBatchIssue}
+                  onTaskStatusChange={setBatchStatus}
                   articleKeys={keys}
                   contentEpoch={contentEpoch}
                   configurationBlocked={coverWork || cover.hasSession}
@@ -447,61 +583,97 @@ export function ArticleWorkspace() {
       />
     );
   }
+  const taskStatuses = [singleStatus, batchStatus].filter(
+    (status): status is WorkspaceTaskStatus => status !== null,
+  );
+  const taskStatus = taskStatuses.length
+    ? {
+        message: taskStatuses.map((status) => status.message).join('；'),
+        needsAttention: taskStatuses.some((status) => status.needsAttention),
+        active: taskStatuses.some((status) => status.active),
+      }
+    : null;
   return (
     <>
       {!editing && controller.unknown && (
         <p role="alert">状态暂时无法确认，正在核对文章编辑状态…</p>
       )}
       {!editing && controller.notice && <p role="alert">{controller.notice}</p>}
-      <ArticleLibrary
-        resetRevision={resetRevision}
-        renderSelectedActions={(keys, selectionBlocked) =>
-          renderWorkspace(keys, selectionBlocked)
-        }
-        initialArticleKey={articleKey}
-        onRequestSelection={(key) => void select(key)}
-        refreshKey={refreshKey}
-        successMessage={
-          outcome
-            ? outcome.kind === 'updated'
-              ? '修改已保存到本机'
-              : '已保存到文章池'
-            : undefined
-        }
-        manualBlocked={
-          operations.blocked ||
-          coverWork ||
-          batchBlocked ||
-          !snapshot ||
-          controller.blocked ||
-          handover ||
-          cover.blocked
-        }
-        beforeWrite={() => beforeWrite()}
-        onDeletionBusyChange={(busy) => {
-          deletionLock.current = busy;
-          setDeletionBlocked(busy);
-        }}
-        onArticleDeleted={(key) => {
-          setArticleKey((previous) =>
-            previous === key ? undefined : previous,
-          );
-          setContentEpoch((value) => value + 1);
-        }}
-        onContentChange={() => setContentEpoch((value) => value + 1)}
-        onNewArticle={() => void select(undefined, true)}
-        editor={
-          editing ? (
-            <ManualEditor
-              key={snapshot.sessionId}
-              controller={controller}
-              onFinish={() => void select(undefined)}
-            />
-          ) : undefined
-        }
-      />
+      <div
+        ref={libraryView}
+        className="library-view"
+        hidden={view !== 'library'}
+        inert={view !== 'library'}
+      >
+        <ArticleLibrary
+          resetRevision={resetRevision}
+          renderSelectedActions={(keys, selectionBlocked) =>
+            renderWorkspace(keys, selectionBlocked)
+          }
+          initialArticleKey={articleKey}
+          onRequestSelection={(key) => void select(key)}
+          refreshKey={refreshKey}
+          coverEpoch={
+            String(contentEpoch) +
+            ':' +
+            (isSession(snapshot) &&
+            snapshot.cover?.outcome?.status === 'committed'
+              ? snapshot.cover.outcome.receipt.operationId
+              : '')
+          }
+          successMessage={
+            outcome && !(isSession(snapshot) && snapshot.cover?.dirty)
+              ? outcome.kind === 'updated'
+                ? '修改已保存到本机'
+                : '已保存到文章池'
+              : undefined
+          }
+          manualBlocked={
+            operations.blocked ||
+            coverWork ||
+            batchBlocked ||
+            !snapshot ||
+            controller.blocked ||
+            handover ||
+            cover.blocked
+          }
+          beforeWrite={() => beforeWrite()}
+          onDeletionBusyChange={(busy) => {
+            deletionLock.current = busy;
+            setDeletionBlocked(busy);
+          }}
+          onArticleDeleted={(key) => {
+            setArticleKey((previous) =>
+              previous === key ? undefined : previous,
+            );
+            setContentEpoch((value) => value + 1);
+          }}
+          onContentChange={() => setContentEpoch((value) => value + 1)}
+          onNewArticle={() => void select(undefined, true)}
+        />
+      </div>
+      <div
+        ref={editorView}
+        className="editor-view"
+        hidden={view !== 'editor'}
+        inert={view !== 'editor'}
+      >
+        {editing && (
+          <ManualEditor
+            key={snapshot.sessionId}
+            controller={controller}
+            onFinish={() => void returnToLibrary()}
+            taskStatus={taskStatus}
+          />
+        )}
+      </div>
       <WorkspaceFooter
         control={operations}
+        taskStatus={taskStatus}
+        onReturn={view === 'editor' ? () => void returnToLibrary() : undefined}
+        returnBlocked={
+          handover || (controller.blocked && !controller.canDiscardConflict)
+        }
         issue={
           draftIssue ||
           batchIssue ||
@@ -512,7 +684,9 @@ export function ArticleWorkspace() {
       <OperationControls
         control={operations}
         showButton={false}
-        dirty={isSession(snapshot) && snapshot.dirty}
+        dirty={
+          isSession(snapshot) && (snapshot.dirty || !!snapshot.cover?.dirty)
+        }
       />
       <dialog
         ref={dialog}

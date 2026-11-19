@@ -9,23 +9,26 @@ let imageTail: Promise<unknown> = Promise.resolve();
 function readImage(
   request: CoverImageRequest,
   current: () => boolean,
+  reader: (request: CoverImageRequest) => Promise<CoverImageResult>,
 ): Promise<CoverImageResult | null> {
   const next = imageTail.then(() =>
     current()
-      ? window.desktopApi
-          .getCoverImage(request)
-          .then((r) => CoverImageResultSchema.parse(r))
+      ? reader(request).then((r) => CoverImageResultSchema.parse(r))
       : null,
   );
   imageTail = next.catch(() => null);
   return next;
 }
+const readStoredImage = (request: CoverImageRequest) =>
+  window.desktopApi.getCoverImage(request);
 export function CoverImage({
   request,
   position,
+  reader = readStoredImage,
 }: {
   request: CoverImageRequest;
   position: number;
+  reader?: (request: CoverImageRequest) => Promise<CoverImageResult>;
 }) {
   const identity = JSON.stringify(request);
   const [preview, setPreview] = useState<{
@@ -36,7 +39,7 @@ export function CoverImage({
   useEffect(() => {
     let disposed = false,
       url: string | undefined;
-    void readImage(request, () => !disposed)
+    void readImage(request, () => !disposed, reader)
       .then((result) => {
         if (disposed || !result) return;
         if (result.status === 'ok') {
@@ -53,13 +56,16 @@ export function CoverImage({
       disposed = true;
       if (url) URL.revokeObjectURL(url);
     };
-  }, [identity]);
+  }, [identity, reader]);
   const value = preview?.identity === identity ? preview : undefined;
   return value?.url ? (
     <img
       src={value.url}
       alt={'第' + position + '张封面'}
-      onError={() => setPreview({ identity, failed: true })}
+      onError={() => {
+        URL.revokeObjectURL(value.url!);
+        setPreview({ identity, failed: true });
+      }}
     />
   ) : (
     <p role={value?.failed ? 'alert' : 'status'}>

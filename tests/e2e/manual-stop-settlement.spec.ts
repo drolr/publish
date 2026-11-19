@@ -159,7 +159,12 @@ for (const releaseFails of [false, true]) {
       await attemptInput();
       expect(manual.getManualArticleState()).toMatchObject({
         state: 'editing',
-        draft: { title: article.title, blocks: [{ text: '释放前正文' }] },
+        draft: {
+          title: article.title,
+          blocks: [
+            { content: [{ type: 'text', text: '释放前正文', marks: [] }] },
+          ],
+        },
       });
       return;
     }

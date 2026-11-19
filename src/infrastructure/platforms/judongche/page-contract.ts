@@ -1,3 +1,6 @@
+import type { UploadWaits } from './upload-waits';
+import type { RichTextBlock } from '../../../contracts/rich-text-body';
+import type { RichEditorEvidence } from './rich-content-evidence';
 import type { CoverStageGate } from './production-cover-driver';
 import { createHash } from 'node:crypto';
 import type { Page } from 'playwright-core';
@@ -17,6 +20,7 @@ import {
 export type { EditorEvidence, ObservedBlock } from './content-evidence';
 /** Internal, owner-approved single-article exception; never an automatic store proof. */
 export type JudongchePageOptions = {
+  uploadWaits?: UploadWaits;
   manualReview?: boolean;
   batchSubmissionReview?: 'operator';
   /** Read back only after saveOnce positively acknowledged its sole request. */
@@ -33,6 +37,9 @@ export type JudongchePageOptions = {
 export interface JudongcheReadPages {
   probe(): Promise<SessionProbe>;
   inspectEditor(): Promise<EditorEvidence>;
+  /** Optional only for historical V1 ports. V2 never falls back. */
+  inspectRichEditor?(): Promise<RichEditorEvidence>;
+  inspectRichDraft?(remote: RemoteRef): Promise<RichEditorEvidence | undefined>;
   inspectDraft(remote: RemoteRef): Promise<EditorEvidence | undefined>;
   locateDraft(remote: RemoteRef): Promise<RemoteRef | undefined>;
   /** Diagnostic only: zero exact-title drafts never releases a task or authorizes replay. */
@@ -40,11 +47,28 @@ export interface JudongcheReadPages {
 }
 import type { CoverUploadInput, CoverUploadOutcome } from './cover-pages';
 export interface JudongchePages extends JudongcheReadPages {
+  bindTaskForContinuation?(taskId: string, generation: string): void;
+  captureHandledTaskContinuation?(
+    taskId: string,
+  ): (cancelled: () => boolean) => Promise<SessionProbe>;
+  /** Live task/root/images/activity observation, independent of body parsing.
+   * Always supplied by production; optional only for historical in-memory ports. */
+  inspectOperationEditor?(): Promise<EditorEvidence>;
+  /** Infrastructure-only diagnostics; never changes task settlement or retries. */
+  reportAdapterFailure?(error: unknown): void;
+  readonly writesOnEditorReady?: boolean;
   readonly batchSubmissionReview?: 'operator';
   saveForOperatorReview?(
     stopped: () => boolean,
+    observed?: (
+      submission: import('../../../contracts/draft-task').Submission,
+    ) => Promise<void>,
   ): Promise<import('../../../contracts/draft-task').Submission>;
   returnHomeAfterSubmission?(stopped: () => boolean): Promise<void>;
+  returnHomeAfterHandledTask?(
+    taskId: string,
+    cancelled: () => boolean,
+  ): Promise<SessionProbe>;
   /** Absent only on legacy test ports; new local policy must treat absence as unsupported. */
   readonly localCoverUpload?: 'supported' | 'unsupported';
   uploadLocalCover?(
@@ -71,6 +95,12 @@ export interface JudongchePages extends JudongcheReadPages {
   ): Promise<void>;
   fillTitle(text: string): Promise<void>;
   appendParagraph(text: string): Promise<void>;
+  appendTextBlock?(block: RichTextBlock, stopped: () => boolean): Promise<void>;
+  reviewRichSavedDraft?(
+    taskId: string,
+    title: string,
+    editedTitle?: string,
+  ): Promise<RichEditorEvidence>;
   appendImage(
     bytes: Uint8Array,
     mime: 'image/jpeg' | 'image/png',
@@ -95,7 +125,7 @@ const candidates = {
 export async function readEditorEvidence(
   page: Page,
   parsedShape = false,
-  imageOnly = false,
+  imageOnly: boolean | 'all' = false,
 ): Promise<EditorEvidence> {
   const before = page.url();
   try {
@@ -156,19 +186,27 @@ export async function readEditorEvidence(
             return '';
           }
         };
-        const latestImage = imageOnly
-          ? Array.from(
-              bodies[0]!.querySelectorAll(
-                ':scope > div[__syl_tag="true"][contenteditable="false"][draggable="true"]',
-              ),
-            ).at(-1)
-          : undefined;
-        const nodes = imageOnly
-          ? latestImage
-            ? [latestImage]
-            : []
-          : Array.from(bodies[0]!.childNodes);
+        const latestImage =
+          imageOnly === true
+            ? Array.from(
+                bodies[0]!.querySelectorAll(
+                  ':scope > div[__syl_tag="true"][contenteditable="false"][draggable="true"]',
+                ),
+              ).at(-1)
+            : undefined;
+        const nodes =
+          imageOnly === true
+            ? latestImage
+              ? [latestImage]
+              : []
+            : Array.from(bodies[0]!.childNodes);
         for (const child of nodes) {
+          if (
+            imageOnly === 'all' &&
+            (!(child instanceof Element) ||
+              (child.tagName !== 'IMG' && !child.querySelector('img[src]')))
+          )
+            continue;
           if (child.nodeType === Node.TEXT_NODE) {
             if (child.textContent?.trim()) supported = false;
             if (!supported) break;

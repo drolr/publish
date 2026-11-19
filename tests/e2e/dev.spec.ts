@@ -93,7 +93,7 @@ test('Forge development server starts the real application', async () => {
       console.info('Owned dev checkpoint: application ready');
       expect(
         await page.evaluate(() => window.desktopApi.getAppStatus()),
-      ).toEqual({ state: 'ready', appVersion: '0.1.0', schemaVersion: 14 });
+      ).toEqual({ state: 'ready', appVersion: '0.1.0', schemaVersion: 15 });
       expect(
         await page.evaluate(() => window.desktopApi.getDraftState()),
       ).toMatchObject({

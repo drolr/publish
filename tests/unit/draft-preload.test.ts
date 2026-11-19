@@ -16,6 +16,15 @@ it('exposes a frozen allowlist, validates every draft argument before invoke and
   expect(Object.isFrozen(api)).toBe(true);
   expect(Object.keys(api).sort()).toEqual(
     [
+      'pickManualCoverImage',
+      'setManualCoverMode',
+      'getManualCoverImage',
+      'reconcileManualCoverSave',
+      'getUploadWaitSettings',
+      'saveUploadWaitSettings',
+      'getBrowserHealth',
+      'checkBrowserHealth',
+      'openBrowserUpdate',
       'batch',
       'requestStopAll',
       'getOperationControlState',
@@ -41,12 +50,14 @@ it('exposes a frozen allowlist, validates every draft argument before invoke and
       'getManualSaveResult',
       'respondManualClose',
       'onManualCloseRequest',
+      'onOpenUploadSettings',
       'beginManualArticle',
       'cancelArticleImport',
       'cancelManualOperation',
       'checkDraftSession',
       'closeDraftSession',
       'confirmTaskClosure',
+      'finishHandledTask',
       'discardManualArticle',
       'getAppStatus',
       'getArticleDeclarations',
@@ -85,6 +96,7 @@ it('exposes a frozen allowlist, validates every draft argument before invoke and
     task: null,
   };
   const args: Record<keyof DraftApi, unknown[]> = {
+    finishHandledTask: [{ taskId: id, expectedRevision: 0 }],
     openDraftSession: [],
     checkDraftSession: [],
     closeDraftSession: [],
@@ -138,4 +150,34 @@ it('exposes a frozen allowlist, validates every draft argument before invoke and
   await expect(api.prepareDraft(id, id, 'retry')).rejects.toThrow(
     'Request rejected',
   );
+});
+
+it('browser allowlist rejects arguments and invalid responses without leaking details', async () => {
+  vi.resetModules();
+  await import('../../src/desktop/preload/index');
+  const api = h.expose.mock.calls[0][1];
+  for (const [method, channel] of [
+    ['getBrowserHealth', 'browser-health:get'],
+    ['checkBrowserHealth', 'browser-health:check'],
+    ['openBrowserUpdate', 'browser-health:update'],
+  ]) {
+    h.invoke.mockClear();
+    await expect(api[method]('https://example.invalid')).rejects.toThrow(
+      'Request rejected',
+    );
+    expect(h.invoke).not.toHaveBeenCalled();
+    const view = {
+      status: 'unchecked',
+      version: null,
+      stage: null,
+      reason: null,
+    };
+    const value =
+      method === 'getBrowserHealth' ? view : { status: 'blocked', view };
+    h.invoke.mockResolvedValueOnce(value);
+    expect(await api[method]()).toEqual(value);
+    expect(h.invoke).toHaveBeenLastCalledWith(channel);
+    h.invoke.mockResolvedValueOnce({ privatePath: 'private' });
+    await expect(api[method]()).rejects.toThrow('Request unavailable');
+  }
 });

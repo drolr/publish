@@ -32,7 +32,7 @@ for (const version of [6, 7])
       const upgraded = run('upgrade');
       expect(upgraded.status, upgraded.stderr).toBe(0);
       expect(JSON.parse(upgraded.stdout)).toMatchObject({
-        schemaVersion: 14,
+        schemaVersion: 15,
         oldRowsExact: true,
         oldAssetsExact: true,
         coverModes: ['single', 'triple'],
@@ -43,7 +43,7 @@ for (const version of [6, 7])
       const reopened = run('reopen');
       expect(reopened.status, reopened.stderr).toBe(0);
       expect(JSON.parse(reopened.stdout)).toMatchObject({
-        schemaVersion: 14,
+        schemaVersion: 15,
         orderedCoverBytesExact: true,
         coverReceiptsExact: true,
         oldRowsExact: true,
@@ -98,7 +98,7 @@ it.runIf(hasSchema6Backup)(
       }
       expect(verifyHistoricalUpgrade(root, expected)).toMatchObject({
         status: 'PASS',
-        schemaVersion: 14,
+        schemaVersion: 15,
         historicalArticleCount: 1,
         originalColumnsRowsExact: true,
       });

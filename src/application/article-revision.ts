@@ -7,7 +7,8 @@ import {
   type SaveReceipt,
 } from '../contracts/article-revision';
 import { StoredArticleSchema } from '../contracts/stored-article';
-import { deriveEditorBody, projectEditorBody } from '../domain/article-edit';
+import { richBodyEquals, upgradeEditorBody } from '../domain/rich-text-body';
+import { projectEditorBody } from '../domain/article-edit';
 import type { ArticleRevisionRepository } from '../domain/ports/article-revision';
 import type {
   CreateEditedArticle,
@@ -181,9 +182,10 @@ export function createArticleRevisionService(
           const sameContent =
             current.article.title === input.title &&
             current.article.contentDeclaration === input.contentDeclaration &&
-            JSON.stringify(
-              current.editorBody ?? deriveEditorBody(current.article.body),
-            ) === JSON.stringify(input.editorBody);
+            richBodyEquals(
+              upgradeEditorBody(current.editorBody, current.article.body),
+              input.editorBody,
+            );
           if (sameContent && input.images.every((i) => i.kind === 'stored')) {
             const prepared = await assets.prepare(
               input.intent,
@@ -208,10 +210,13 @@ export function createArticleRevisionService(
               verifiedCurrent.article.title === input.title &&
               verifiedCurrent.article.contentDeclaration ===
                 input.contentDeclaration &&
-              JSON.stringify(
-                verifiedCurrent.editorBody ??
-                  deriveEditorBody(verifiedCurrent.article.body),
-              ) === JSON.stringify(input.editorBody) &&
+              richBodyEquals(
+                upgradeEditorBody(
+                  verifiedCurrent.editorBody,
+                  verifiedCurrent.article.body,
+                ),
+                input.editorBody,
+              ) &&
               sorted(prepared.assets) === sorted(verifiedCurrent.article.assets)
             )
               return {

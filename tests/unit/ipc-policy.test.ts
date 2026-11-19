@@ -141,6 +141,7 @@ it.each(['formal-false', 'temp-false', 'temp-throws'] as const)(
     expect(
       (
         await manual.updateManualDraft(id(1), 0, {
+          bodyVersion: 2 as const,
           title: 'Body',
           contentDeclaration: 'repost',
           blocks: [],

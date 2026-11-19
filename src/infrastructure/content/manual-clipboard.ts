@@ -1,5 +1,13 @@
+import {
+  ManualFragmentV2Schema,
+  type ManualFragmentV2,
+} from '../../contracts/manual-rich-draft';
+import {
+  cloneManualFragment,
+  manualFragmentText,
+} from '../../domain/manual-draft-version';
 import { createHash, randomUUID } from 'node:crypto';
-import type { ManualDraft, ManualImage } from '../../contracts/manual-article';
+import type { ManualImage } from '../../contracts/manual-article';
 import type {
   ClipboardFragmentPort,
   ManualClipboard,
@@ -10,11 +18,10 @@ import {
   encodeManualClipboardFragment,
   parseManualClipboardFragment,
 } from '../../contracts/editor-close';
-type Block = ManualDraft['blocks'][number];
 interface Grant {
   id: string;
   expires: number;
-  blocks: Block[];
+  fragment: ManualFragmentV2;
   images: ManualImage[];
   reads: Set<Promise<unknown>>;
   timer?: ReturnType<typeof setTimeout>;
@@ -84,10 +91,17 @@ export function createManualClipboard(
   return {
     isReady: () =>
       !closing && !failure && ![...owned].some((g) => g.retirement),
-    copy(sessionId, blocks, sourceImages, signal) {
+    copy(sessionId, fragment, sourceImages, signal) {
       if (closing || busy || failure)
         return Promise.reject(new WebPasteFailure('RECOVERY_REQUIRED'));
-      if (blocks.some((b) => b.type === 'image-pending'))
+      const parsed = ManualFragmentV2Schema.safeParse(fragment);
+      if (!parsed.success)
+        return Promise.reject(new WebPasteFailure('INPUT_LIMIT'));
+      const blocks = parsed.data.blocks;
+      if (
+        blocks.some((b) => b.type === 'image-pending') ||
+        blocks.filter((b) => b.type === 'image').length > 200
+      )
         return Promise.reject(new WebPasteFailure('INPUT_LIMIT'));
       const tokens = [
         ...new Set(
@@ -111,7 +125,7 @@ export function createManualClipboard(
       const grant: Grant = {
         id: randomUUID(),
         expires: clock() + TTL,
-        blocks: [],
+        fragment: { version: 2, blocks: [], openStart: false, openEnd: false },
         images: [],
         reads: new Set(),
         fingerprints: new Map(),
@@ -152,17 +166,17 @@ export function createManualClipboard(
             }
             grant.images = ready;
             grant.target = { sessionId, aliases: origin };
-            grant.blocks = blocks.map((b) =>
-              b.type === 'image'
-                ? { ...b, imageToken: aliases.get(b.imageToken)! }
-                : { ...b },
+            grant.fragment = cloneManualFragment(
+              parsed.data,
+              undefined,
+              (token) => aliases.get(token)!,
             );
-            const text = blocks
-              .map((b) => (b.type === 'paragraph' ? b.text : '[图片]'))
-              .join('\n');
+            const text = manualFragmentText(parsed.data);
             signal.throwIfAborted();
             if (closing) throw new WebPasteFailure('CANCELLED');
             await writer.write(grant.id, text);
+            signal.throwIfAborted();
+            if (closing) throw new WebPasteFailure('CANCELLED');
             const previous = current;
             current = grant;
             grant.timer = setTimeout(() => {
@@ -276,14 +290,8 @@ export function createManualClipboard(
           signal.throwIfAborted();
           grant.target = { sessionId, aliases: targetAliases };
           return {
-            blocks: grant.blocks.map((b) =>
-              b.type === 'image'
-                ? {
-                    ...b,
-                    blockKey: randomUUID(),
-                    imageToken: aliases.get(b.imageToken)!,
-                  }
-                : { ...b, blockKey: randomUUID() },
+            fragment: cloneManualFragment(grant.fragment, randomUUID, (token) =>
+              aliases.get(token)!,
             ),
             images: ready,
           };

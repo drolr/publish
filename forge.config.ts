@@ -1,3 +1,5 @@
+import { copyFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { ForgeConfig } from '@electron-forge/shared-types';
 import { MakerZIP } from '@electron-forge/maker-zip';
 import { WebpackPlugin } from '@electron-forge/plugin-webpack';
@@ -11,6 +13,13 @@ import electronMetadata from 'electron/package.json';
 import { verifiedElectronChecksums } from './scripts/electron-checksums';
 const config: ForgeConfig = {
   hooks: {
+    postPackage: async (_config, result) => {
+      for (const folder of result.outputPaths)
+        await copyFile(
+          join(__dirname, 'config', '上传等待设置.json'),
+          join(folder, '上传等待设置.json'),
+        );
+    },
     packageAfterCopy: async (_config, buildPath) => {
       await packagePlaywrightCore(__dirname, buildPath);
     },

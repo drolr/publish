@@ -7,7 +7,7 @@ import {
 } from '../../src/infrastructure/persistence/migrate';
 
 it.each([8, 9, 10, 11, 12, 13])(
-  'schema %s to14 preserves attempt and related history and retains occupied/preparation/request constraints',
+  'schema %s to15 preserves attempt and related history and retains occupied/preparation/request constraints',
   (version) => {
     const db = new Database(':memory:');
     db.pragma('foreign_keys=ON');
@@ -95,7 +95,7 @@ it.each([8, 9, 10, 11, 12, 13])(
         db
           .prepare('SELECT MAX(version) AS version FROM schema_migrations')
           .get(),
-      ).toEqual({ version: 14 });
+      ).toEqual({ version: 15 });
       expect(
         db
           .prepare('SELECT * FROM schema_migrations ORDER BY version')

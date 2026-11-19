@@ -71,6 +71,13 @@ it('checks every manual capability sender, frame, exact payload and response wit
     },
   };
   const payloads: Record<keyof ManualArticleApi, unknown[]> = {
+    pickManualCoverImage: [{ sessionId: id, expectedCoverDraftRevision: 0 }],
+    setManualCoverMode: [
+      { sessionId: id, expectedCoverDraftRevision: 0 },
+      'single',
+    ],
+    getManualCoverImage: [id, id],
+    reconcileManualCoverSave: [id],
     openManualArticle: [id],
     applyManualEdit: [
       {
@@ -79,7 +86,12 @@ it('checks every manual capability sender, frame, exact payload and response wit
         clientSequence: 1,
         commandId: id,
       },
-      { title: '', contentDeclaration: 'repost', blocks: [] },
+      {
+        bodyVersion: 2 as const,
+        title: '',
+        contentDeclaration: 'repost',
+        blocks: [],
+      },
     ],
     spliceManualPaste: [
       {
@@ -146,7 +158,12 @@ it('checks every manual capability sender, frame, exact payload and response wit
     updateManualDraft: [
       id,
       0,
-      { title: '', contentDeclaration: 'repost', blocks: [] },
+      {
+        bodyVersion: 2 as const,
+        title: '',
+        contentDeclaration: 'repost',
+        blocks: [],
+      },
     ],
     pickManualImage: [id, 0],
     getManualImage: [id, id],
@@ -163,7 +180,7 @@ it('checks every manual capability sender, frame, exact payload and response wit
           ? { state: 'idle', revision: 0 }
           : method === 'getManualSaveResult'
             ? { status: 'unavailable', operationId: id }
-            : method === 'getManualImage'
+            : method === 'getManualImage' || method === 'getManualCoverImage'
               ? { status: 'unavailable' }
               : {
                   status: 'unavailable',
@@ -177,7 +194,7 @@ it('checks every manual capability sender, frame, exact payload and response wit
     frame.url,
     api as unknown as ManualArticleApi,
   );
-  expect(harness.handlers.size).toBe(19);
+  expect(harness.handlers.size).toBe(23);
   for (const method of methods) {
     const handler = harness.handlers.get(manualChannels[method])!;
     const args = payloads[method];
@@ -219,8 +236,13 @@ it('paste_ipc_rejects_untrusted_sender_and_payload and reply_never_contains_sour
   const { manual } = manualFixture({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [
-          { type: 'paragraph', text: 'Body' },
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+          },
           {
             type: 'image',
             source: 'https://private.invalid/secret?token=private',
@@ -340,6 +362,7 @@ it('startup-unavailable production bindings reject every manual write and keep r
     api.startManualPaste(cmd, { html: '', plain: 'Body' }),
     api.retryManualPasteImage(cmd, id(5)),
     api.updateManualDraft(id(1), 0, {
+      bodyVersion: 2 as const,
       title: '',
       contentDeclaration: 'repost',
       blocks: [],
@@ -378,6 +401,16 @@ it('real preload exposes only fixed typed capabilities and routes paste to the a
   expect(Object.isFrozen(api)).toBe(true);
   expect(Object.keys(api).sort()).toEqual(
     [
+      'pickManualCoverImage',
+      'setManualCoverMode',
+      'getManualCoverImage',
+      'reconcileManualCoverSave',
+      'finishHandledTask',
+      'getUploadWaitSettings',
+      'saveUploadWaitSettings',
+      'getBrowserHealth',
+      'checkBrowserHealth',
+      'openBrowserUpdate',
       'batch',
       'requestStopAll',
       'getOperationControlState',
@@ -403,6 +436,7 @@ it('real preload exposes only fixed typed capabilities and routes paste to the a
       'getManualSaveResult',
       'respondManualClose',
       'onManualCloseRequest',
+      'onOpenUploadSettings',
       'openDraftSession',
       'checkDraftSession',
       'closeDraftSession',
@@ -453,7 +487,11 @@ it('real preload exposes only fixed typed capabilities and routes paste to the a
   ).toBe('started');
   await flush();
   expect(session(await api.getManualArticleState()).draft.blocks).toEqual([
-    { blockKey: expect.any(String), type: 'paragraph', text: 'Body' },
+    {
+      blockKey: expect.any(String),
+      type: 'paragraph',
+      content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+    },
   ]);
 });
 it('strict paste response rejects unexpected raw HTML/source fields with a safe error', async () => {
@@ -482,4 +520,98 @@ it('strict paste response rejects unexpected raw HTML/source fields with a safe 
     ),
   ).rejects.toThrow('Request unavailable');
   await flush();
+});
+
+it('actual typed preload/main V2 edit path roundtrips rich tree and rejects nested privilege/key forgery', async () => {
+  const { manual } = manualFixture();
+  const frame = { url: 'file:///app/index.html' },
+    contents = { mainFrame: frame };
+  harness.event = { sender: contents, senderFrame: frame };
+  registerManualHandlers(
+    { webContents: contents, once: () => {} } as unknown as BrowserWindow,
+    frame.url,
+    createManualDesktopApi(manual),
+  );
+  await import('../../src/desktop/preload/index');
+  const api = harness.api!,
+    initial = session((await api.beginManualArticle()).snapshot);
+  const cmd = {
+    sessionId: initial.sessionId,
+    expectedDocumentRevision: 0,
+    clientSequence: 1,
+    commandId: initial.nextEditCommandId,
+  };
+  const rich = {
+    ...initial.draft,
+    title: 'Bridge',
+    blocks: [
+      {
+        type: 'list' as const,
+        kind: 'ordered' as const,
+        start: 9,
+        blockKey: id(501),
+        items: [
+          {
+            type: 'paragraph' as const,
+            blockKey: id(502),
+            content: [
+              {
+                type: 'text' as const,
+                text: 'A😀B',
+                marks: ['bold' as const, 'italic' as const],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  const forged = {
+    ...rich,
+    blocks: [
+      {
+        ...rich.blocks[0],
+        items: [{ ...rich.blocks[0].items[0], path: 'C:/private' }],
+      },
+    ],
+  };
+  await expect(
+    Reflect.apply(api.applyManualEdit, api, [cmd, forged]),
+  ).rejects.toThrow();
+  await expect(
+    harness.handlers.get('manual:edit')!(harness.event, cmd, forged),
+  ).rejects.toThrow('Request rejected');
+  const duplicate = {
+    ...rich,
+    blocks: [
+      {
+        ...rich.blocks[0],
+        items: [{ ...rich.blocks[0].items[0], blockKey: id(501) }],
+      },
+    ],
+  };
+  await expect(
+    harness.handlers.get('manual:edit')!(harness.event, cmd, duplicate),
+  ).rejects.toThrow('Request rejected');
+  expect(session(manual.getManualArticleState()).documentRevision).toBe(0);
+  const reply = await api.applyManualEdit(cmd, rich);
+  expect(reply.status).toBe('ok');
+  expect(session(reply.snapshot).draft).toEqual(rich);
+  expect(session(await api.getManualArticleState()).dirty).toBe(true);
+  const changed = session(reply.snapshot);
+  await api.closeManualEditor(
+    {
+      sessionId: changed.sessionId,
+      expectedDocumentRevision: changed.documentRevision,
+      clientSequence: changed.nextClientSequence,
+      commandId: changed.nextEditCommandId,
+    },
+    'discard',
+  );
+  const next = session((await api.beginManualArticle()).snapshot);
+  expect((await api.applyManualEdit(cmd, rich)).status).toBe('conflict');
+  expect(session(await api.getManualArticleState()).sessionId).toBe(
+    next.sessionId,
+  );
+  expect(session(await api.getManualArticleState()).draft).toEqual(next.draft);
 });

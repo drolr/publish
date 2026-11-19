@@ -68,6 +68,7 @@ export function useDraft(
   const busy = useRef(false);
   const resetEpoch = useRef(0);
   const reading = useRef(false);
+  const readAgain = useRef(false);
   const uncertain = useRef(false);
   const unresolved = useRef(new Map<number, TaskView | null>());
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
@@ -126,7 +127,14 @@ export function useDraft(
     return true;
   }, []);
   query.current = async () => {
-    if (reading.current) return;
+    if (!alive.current) return;
+    if (reading.current) {
+      // A command may settle after this read took its snapshot. Retire that
+      // snapshot and coalesce a fresh read after it releases the bridge lane.
+      ++sequence.current;
+      readAgain.current = true;
+      return;
+    }
     reading.current = true;
     const epoch = resetEpoch.current;
     const request = ++sequence.current;
@@ -141,17 +149,22 @@ export function useDraft(
       if (timeout) timers.current.delete(timeout);
       if (epoch === resetEpoch.current) {
         reading.current = false;
-        schedule();
+        if (readAgain.current) {
+          readAgain.current = false;
+          await query.current();
+        } else schedule();
       }
     }
   };
   useEffect(() => {
     alive.current = true;
     reading.current = false;
+    readAgain.current = false;
     void query.current();
     const ownedTimers = timers.current;
     return () => {
       alive.current = false;
+      readAgain.current = false;
       ++sequence.current;
       clearTimeout(pollTimer.current);
       for (const timer of ownedTimers) clearTimeout(timer);
@@ -164,6 +177,7 @@ export function useDraft(
     sequence.current++;
     stateRead = undefined;
     reading.current = false;
+    readAgain.current = false;
     busy.current = false;
     unresolved.current.clear();
     uncertain.current = false;

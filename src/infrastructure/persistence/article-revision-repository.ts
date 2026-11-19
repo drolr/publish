@@ -16,7 +16,7 @@ import {
   StorageIdSchema,
   StoredArticleSchema,
 } from '../../contracts/stored-article';
-import { PersistedEditorBodyV1Schema } from '../../contracts/manual-edit';
+import { PersistedEditorBodySchema } from '../../contracts/rich-text-body';
 import type { ArticleRevisionRepository } from '../../domain/ports/article-revision';
 import {
   editorProjectionMatches,
@@ -78,10 +78,13 @@ export function revisionDigest(article: unknown, editorBody: unknown): string {
   const normalizedArticle = StoredArticleSchema.parse(article);
   normalizedArticle.assets.sort((a, b) => a.assetKey.localeCompare(b.assetKey));
   const normalizedBody =
-    editorBody === null ? null : PersistedEditorBodyV1Schema.parse(editorBody);
+    editorBody === null ? null : PersistedEditorBodySchema.parse(editorBody);
   return createHash('sha256')
     .update(
       JSON.stringify({
+        ...(normalizedBody?.version === 2
+          ? { domain: 'article-revision-v2' }
+          : {}),
         article: normalizedArticle,
         editorBody: normalizedBody,
       }),

@@ -50,3 +50,30 @@ it('accepts only unique new-attempt identities belonging to the frozen selection
       }).success,
     ).toBe(false);
 });
+
+it('recovery contract validates current task identity, CAS revision and explicit untouched-queue intent', async () => {
+  const { BatchRecoveryInputSchema } =
+    await import('../../src/contracts/draft-batch');
+  expect(
+    BatchRecoveryInputSchema.parse({
+      batchId: id,
+      expectedRevision: 0,
+      taskId: other,
+    }).taskId,
+  ).toBe(other);
+  expect(
+    BatchRecoveryInputSchema.parse({
+      batchId: id,
+      expectedRevision: 1,
+      taskId: null,
+    }).taskId,
+  ).toBeNull();
+  for (const input of [
+    { batchId: id, expectedRevision: -1, taskId: other },
+    { batchId: id, expectedRevision: 0.5, taskId: other },
+    { batchId: id, expectedRevision: 1 },
+    { batchId: id, expectedRevision: 1, taskId: 'private-path' },
+    { batchId: id, expectedRevision: 1, taskId: other, bypassBusy: true },
+  ])
+    expect(BatchRecoveryInputSchema.safeParse(input).success).toBe(false);
+});

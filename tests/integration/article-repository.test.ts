@@ -85,7 +85,7 @@ it('upgrades actual v1, preserves history, commits article and assets together a
   expect(store.findExternal('news-1')).toEqual(value);
   store.close();
   const reopened = open();
-  expect(reopened.getSchemaVersion()).toBe(14);
+  expect(reopened.getSchemaVersion()).toBe(15);
   expect(reopened.load(value.articleKey)).toEqual(value);
   expect(inspectImportDb(path).history.slice(0, 1)).toEqual(before);
   expect(() => openBaselineStore(path, old)).toThrow(/newer/i);

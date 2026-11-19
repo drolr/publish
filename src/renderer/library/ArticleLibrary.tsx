@@ -1,3 +1,4 @@
+import { ArticleCoverThumbnail } from './ArticleCoverThumbnail';
 import { readArticlePreview as readPreview } from './readArticlePreview';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
@@ -9,11 +10,8 @@ import type {
 import { Preview } from './Preview';
 import { ArticleDeleteDialog } from './ArticleDeleteDialog';
 import { readDeletionArticle, useArticleDeletion } from './useArticleDeletion';
-import {
-  DeclarationControls,
-  DeclarationEditor,
-  useDeclarations,
-} from './Declarations';
+import { useDeclarations } from './Declarations';
+import { HelpTip } from '../HelpTip';
 
 // Sharing the outstanding read also prevents a StrictMode remount from overlapping it.
 let statusRead: Promise<ImportSnapshot> | undefined;
@@ -36,6 +34,7 @@ export function ArticleLibrary({
   editor,
   onRequestSelection,
   refreshKey,
+  coverEpoch,
   beforeWrite,
   onContentChange,
   onArticleDeleted,
@@ -53,6 +52,7 @@ export function ArticleLibrary({
   editor?: React.ReactNode;
   onRequestSelection?: (key?: string) => void;
   refreshKey?: string;
+  coverEpoch?: string;
   beforeWrite?: () => Promise<boolean>;
   onContentChange?: () => void;
   onArticleDeleted?: (key: string) => void;
@@ -99,6 +99,21 @@ export function ArticleLibrary({
   const [previewEpoch, setPreviewEpoch] = useState(0);
   const rows = useRef(new Map<string, HTMLButtonElement>());
   const listHeading = useRef<HTMLHeadingElement>(null);
+  const selectionBar = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const bar = selectionBar.current;
+    if (!bar) return;
+    function updateSelectionHeight() {
+      bar?.parentElement?.style.setProperty(
+        '--article-select-height',
+        `${bar.getBoundingClientRect().height}px`,
+      );
+    }
+    updateSelectionHeight();
+    const observer = new ResizeObserver(updateSelectionHeight);
+    observer.observe(bar);
+    return () => observer.disconnect();
+  }, []);
   const declarationsFrozen = useRef(false);
   const deletionStatus = useRef<HTMLParagraphElement>(null);
   const load = useCallback(async (cursor?: ArticleCursor) => {
@@ -122,9 +137,12 @@ export function ArticleLibrary({
       if (sequence === listSequence.current) setListLoading(false);
     }
   }, []);
+  const currentCursor = useRef<ArticleCursor | undefined>(undefined);
+  currentCursor.current = cursors.at(-1);
   useEffect(() => {
-    setCursors([undefined]);
-    void load();
+    // Saving content does not change list membership/order. A stale membership
+    // cursor still takes the existing safe first-page fallback in load().
+    void load(currentCursor.current);
     return () => {
       listSequence.current++;
     };
@@ -380,10 +398,44 @@ export function ArticleLibrary({
     },
   });
   declarationsFrozen.current = declarations.frozen;
-  const editorItem = selection
-    ? (page?.items.find((item) => item.articleKey === selection.key) ??
-      (article?.articleKey === selection.key ? article : undefined))
-    : undefined;
+  const pagingBlocked =
+    declarations.frozen || deletion.frozen || listLoading || listError;
+  function previousPage() {
+    if (pagingBlocked || cursors.length === 1) return;
+    const next = cursors.slice(0, -1);
+    setCursors(next);
+    void load(next.at(-1));
+  }
+  function nextPage() {
+    if (pagingBlocked || !page?.nextCursor) return;
+    setCursors([...cursors, page.nextCursor]);
+    void load(page.nextCursor);
+  }
+  function renderPager(label: string) {
+    return (
+      <nav aria-label={label} className="article-pager">
+        <button
+          disabled={pagingBlocked || cursors.length === 1}
+          onClick={previousPage}
+        >
+          上一页
+        </button>
+        <span>
+          {listError
+            ? '页码暂时无法读取'
+            : listLoading
+              ? '正在读取页码…'
+              : `第 ${page?.pageNumber ?? 1} 页 / 共 ${page?.totalPages ?? 1} 页`}
+        </span>
+        <button
+          disabled={pagingBlocked || !page?.nextCursor}
+          onClick={nextPage}
+        >
+          下一页
+        </button>
+      </nav>
+    );
+  }
   const result = snapshot?.state === 'finished' ? snapshot.result : null;
   return (
     <div className="library">
@@ -391,7 +443,6 @@ export function ArticleLibrary({
         <div className="toolbar">
           <div>
             <h2>文章</h2>
-            <p>导入文章包，检查保存在本机的图文内容。</p>
           </div>
           {onNewArticle && (
             <button
@@ -405,15 +456,14 @@ export function ArticleLibrary({
             className="primary"
             disabled={busy || declarations.frozen || deletion.frozen}
             onClick={() => void start()}
-            aria-describedby="import-help"
           >
             导入文章
           </button>
+          <HelpTip label="导入文章帮助">
+            选择文章包文件后会导入；本地图片需保留相对目录，网络图片会按文章包地址下载。导入后可检查保存在本机的图文内容。
+          </HelpTip>
         </div>
         {successMessage && <p role="status">{successMessage}</p>}
-        <p id="import-help" className="hint">
-          选择文章包文件后会导入；本地图片需保留相对目录，网络图片会按文章包地址下载。
-        </p>
         <div className="operation" role="status" aria-live="polite">
           {unknown
             ? '连接状态未知，正在确认导入结果…'
@@ -468,10 +518,18 @@ export function ArticleLibrary({
             </ul>
           </div>
         )}
-        <DeclarationControls
-          controller={declarations}
-          blocked={busy || listLoading || deletion.frozen}
-        />
+        <div className="selection-toolbar">
+          <span role="status">已选择 {declarations.selected.size} 篇</span>
+          <button
+            disabled={declarations.frozen || !declarations.selected.size}
+            onClick={declarations.clear}
+          >
+            清空选择
+          </button>
+          {declarations.selected.size === 100 && (
+            <span className="hint">已达上限，每次最多选择 100 篇</span>
+          )}
+        </div>
         <p role="status" aria-live="polite" className="library-count">
           {listError
             ? '数量暂时无法读取'
@@ -508,27 +566,30 @@ export function ArticleLibrary({
             <h3 ref={listHeading} tabIndex={-1}>
               已导入本机
             </h3>
-            {!!page?.items.length && (
-              <label className="select-page">
-                <input
-                  type="checkbox"
-                  aria-label="全选本页"
-                  disabled={
-                    busy ||
-                    listLoading ||
-                    declarations.frozen ||
-                    deletion.frozen
-                  }
-                  checked={page.items.every((item) =>
-                    declarations.selected.has(item.articleKey),
-                  )}
-                  onChange={(event) =>
-                    declarations.toggle(page.items, event.target.checked)
-                  }
-                />
-                全选本页
-              </label>
-            )}
+            <div className="list-selection-bar" ref={selectionBar}>
+              {!!page?.items.length && (
+                <label className="select-page">
+                  <input
+                    type="checkbox"
+                    aria-label="全选本页"
+                    disabled={
+                      busy ||
+                      listLoading ||
+                      declarations.frozen ||
+                      deletion.frozen
+                    }
+                    checked={page.items.every((item) =>
+                      declarations.selected.has(item.articleKey),
+                    )}
+                    onChange={(event) =>
+                      declarations.toggle(page.items, event.target.checked)
+                    }
+                  />
+                  全选本页
+                </label>
+              )}
+              {renderPager('文章顶部分页')}
+            </div>
             {listError && (
               <div role="alert">
                 <p>列表暂时无法刷新，请重新加载。</p>
@@ -554,6 +615,10 @@ export function ArticleLibrary({
               <ul className="article-rows">
                 {page?.items.map((item) => (
                   <li key={item.articleKey}>
+                    <ArticleCoverThumbnail
+                      articleKey={item.articleKey}
+                      epoch={coverEpoch}
+                    />
                     <input
                       type="checkbox"
                       aria-label={`选择 ${item.title}`}
@@ -588,12 +653,7 @@ export function ArticleLibrary({
                     >
                       <strong>{item.title}</strong>
                       <span>文章编号 {item.externalId}</span>
-                      <span>
-                        {item.contentDeclaration === 'original'
-                          ? '原创'
-                          : '转载'}{' '}
-                        · {item.imageCount} 张独立图片
-                      </span>
+                      <span>{item.imageCount} 张独立图片</span>
                       <time dateTime={item.createdAt}>
                         {new Date(item.createdAt).toLocaleString('zh-CN')}
                       </time>
@@ -621,48 +681,7 @@ export function ArticleLibrary({
                 ))}
               </ul>
             )}
-            <nav aria-label="文章分页">
-              <button
-                disabled={
-                  declarations.frozen ||
-                  deletion.frozen ||
-                  listLoading ||
-                  listError ||
-                  cursors.length === 1
-                }
-                onClick={() => {
-                  const next = cursors.slice(0, -1);
-                  setCursors(next);
-                  void load(next.at(-1));
-                }}
-              >
-                上一页
-              </button>
-              <span>
-                {listError
-                  ? '页码暂时无法读取'
-                  : listLoading
-                    ? '正在读取页码…'
-                    : `第 ${page?.pageNumber ?? 1} 页 / 共 ${page?.totalPages ?? 1} 页`}
-              </span>
-              <button
-                disabled={
-                  declarations.frozen ||
-                  deletion.frozen ||
-                  listLoading ||
-                  listError ||
-                  !page?.nextCursor
-                }
-                onClick={() => {
-                  if (page?.nextCursor) {
-                    setCursors([...cursors, page.nextCursor]);
-                    void load(page.nextCursor);
-                  }
-                }}
-              >
-                下一页
-              </button>
-            </nav>
+            {renderPager('文章分页')}
           </section>
           <section
             className={
@@ -684,19 +703,6 @@ export function ArticleLibrary({
                 >
                   返回列表
                 </button>
-                {editorItem && (
-                  <DeclarationEditor
-                    key={`${editorItem.articleKey}:${declarations.editorRevision}`}
-                    item={editorItem}
-                    disabled={
-                      busy ||
-                      listLoading ||
-                      declarations.frozen ||
-                      deletion.frozen
-                    }
-                    onSave={declarations.save}
-                  />
-                )}
                 {previewError ? (
                   <p role="alert">文章素材无法读取，请检查本地存储。</p>
                 ) : article ? (
@@ -712,7 +718,7 @@ export function ArticleLibrary({
             ) : (
               <div className="empty">
                 <h3>选择一篇文章</h3>
-                <p>在这里检查正文、图片顺序和原创声明。</p>
+                <p>在这里检查正文和图片顺序。</p>
               </div>
             )}
           </section>

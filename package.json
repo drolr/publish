@@ -22,7 +22,7 @@
     "test:integration": "vitest run tests/integration",
     "test:contract": "vitest run tests/contracts",
     "test:fixture": "playwright test fixture.spec.ts",
-    "test:renderer": "playwright test batch-renderer.spec.ts library-renderer.spec.ts article-library-management.spec.ts continuous-editor-renderer.spec.ts article-edit-workspace.spec.ts draft-renderer.spec.ts article-cover-renderer.spec.ts manual-stop-settlement.spec.ts",
+    "test:renderer": "playwright test batch-renderer.spec.ts library-renderer.spec.ts article-library-management.spec.ts continuous-editor-renderer.spec.ts rich-text-editor-renderer.spec.ts article-edit-workspace.spec.ts draft-renderer.spec.ts article-cover-renderer.spec.ts manual-stop-settlement.spec.ts",
     "test:dev": "playwright test dev.spec.ts",
     "test:desktop": "playwright test desktop.spec.ts",
     "test:package": "playwright test package.spec.ts",
@@ -47,7 +47,7 @@
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "sharp": "0.35.5",
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   },
   "overrides": {
     "@electron/packager": "20.3.0",
@@ -56,7 +56,9 @@
     "tmp": "0.2.7",
     "webpack-dev-server": "6.0.0",
     "http-cache-semantics": "4.3.0",
-    "shell-quote": "1.11.0"
+    "shell-quote": "1.11.0",
+    "vite": "8.3.3",
+    "launch-editor": "2.14.2"
   },
   "devDependencies": {
     "@electron-forge/cli": "8.0.1",
@@ -72,7 +74,7 @@
     "@types/react-dom": "19.3.0",
     "@vercel/webpack-asset-relocator-loader": "1.7.3",
     "css-loader": "7.1.5",
-    "electron": "44.3.0",
+    "electron": "44.5.0",
     "eslint": "10.10.0",
     "mini-css-extract-plugin": "2.10.2",
     "node-loader": "2.1.0",
@@ -82,7 +84,7 @@
     "tsx": "4.23.13",
     "typescript": "5.9.3",
     "typescript-eslint": "8.70.0",
-    "vitest": "5.0.1",
+    "vitest": "5.0.3",
     "webpack": "5.111.0"
   },
   "allowScripts": {

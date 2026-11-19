@@ -1,3 +1,4 @@
+import { upgradeEditorBody } from '../../src/domain/rich-text-body';
 import { afterEach, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
@@ -36,8 +37,6 @@ afterEach(() => {
   for (const path of roots.splice(0))
     rmSync(path, { recursive: true, force: true });
 });
-
-// Private schema2 backup acceptance is intentionally excluded from publication.
 
 it('representative schema5 upgrade preserves complete task JSON, stable identities, assets and durable hold without replay', async () => {
   const seeded = await revisionRuntime(root());
@@ -270,15 +269,18 @@ it.each(['prepare', 'finalize', 'before', 'after', 'cleanup'])(
       );
       expect(loaded.editorBody).toEqual(
         committed
-          ? {
-              version: 1,
-              blocks: [
-                { type: 'paragraph', text: '' },
-                { type: 'paragraph', text: ' 原文😀\n ' },
-                { type: 'image', imageId: 'i' },
-                { type: 'image', imageId: 'new' },
-              ],
-            }
+          ? upgradeEditorBody(
+              {
+                version: 1,
+                blocks: [
+                  { type: 'paragraph', text: '' },
+                  { type: 'paragraph', text: ' 原文😀\n ' },
+                  { type: 'image', imageId: 'i' },
+                  { type: 'image', imageId: 'new' },
+                ],
+              },
+              [],
+            )
           : null,
       );
       expect(loaded.article.articleKey).toBe(article.articleKey);
@@ -308,3 +310,60 @@ it.each(['prepare', 'finalize', 'before', 'after', 'cleanup'])(
   },
   30000,
 );
+
+it('schema14 to 15 adds only migration history and an old14 program refuses the upgraded database', async () => {
+  const seeded = await revisionRuntime(root());
+  const article = seeded.article;
+  seeded.repository.close();
+  const clone = root();
+  const path = join(clone, 'app.sqlite');
+  const initial = new Database(path);
+  try {
+    migrate(initial, readMigrations(migrations).slice(0, 14));
+  } finally {
+    initial.close();
+  }
+  seedLegacyStoredArticle(path, article);
+  cpSync(join(seeded.root, 'assets'), join(clone, 'assets'), {
+    recursive: true,
+  });
+  const read = () => {
+    const db = new Database(path, { readonly: true });
+    try {
+      return Object.fromEntries(
+        (
+          db
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE type='table' AND name!='schema_migrations' ORDER BY name",
+            )
+            .all() as { name: string }[]
+        ).map(({ name }) => [
+          name,
+          db.prepare('SELECT * FROM "' + name + '" ORDER BY rowid').all(),
+        ]),
+      );
+    } finally {
+      db.close();
+    }
+  };
+  const before = read();
+  const upgraded = openArticleRepository(path, migrations);
+  try {
+    expect(upgraded.getSchemaVersion()).toBe(15);
+  } finally {
+    upgraded.close();
+  }
+  expect(read()).toEqual(before);
+  integrity(path);
+  expect(
+    readFileSync(join(clone, 'assets', article.assets[0].relativePath)),
+  ).toEqual(png);
+  const db = new Database(path);
+  try {
+    expect(() => migrate(db, readMigrations(migrations).slice(0, 14))).toThrow(
+      /newer/i,
+    );
+  } finally {
+    db.close();
+  }
+});

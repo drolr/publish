@@ -1,3 +1,5 @@
+import { revisionDigest } from '../../src/infrastructure/persistence/article-revision-repository';
+import { upgradeEditorBody } from '../../src/domain/rich-text-body';
 import { randomUUID } from 'node:crypto';
 import {
   mkdtempSync,
@@ -135,7 +137,7 @@ it.each([2, 5])(
     const value = seed(pre, path);
     pre.close();
     const store = open();
-    expect(store.getSchemaVersion()).toBe(14);
+    expect(store.getSchemaVersion()).toBe(15);
     expect(store.loadEditableArticle(value.articleKey)).toEqual({
       article: value,
       articleRevision: 1,
@@ -615,4 +617,76 @@ it('rejects matching-key intent and receipt with wrong external identity before 
     attempts: s.attempts(),
     db: inspectImportDb(path),
   }).toEqual(before);
+});
+
+it('revision digest preserves NULL and V1 golden bytes and separates normalized V2 format', () => {
+  const article: StoredArticle = {
+    articleKey: '11111111-1111-4111-8111-111111111111',
+    externalId: 'golden',
+    importId: '22222222-2222-4222-8222-222222222222',
+    title: '旧正文',
+    body: [{ type: 'paragraph', text: '甲\n乙' }],
+    contentDeclaration: 'repost',
+    createdAt: '2026-10-01T00:00:00.000Z',
+    assets: [],
+  };
+  const v1 = {
+    version: 1 as const,
+    blocks: [{ type: 'paragraph' as const, text: '甲\n乙' }],
+  };
+  expect(revisionDigest(article, null)).toBe(
+    '36a8fdecc1a8a76a6af6222dc67a883123257d4d3ff21661d0848cedf1ad0dec',
+  );
+  expect(revisionDigest(article, v1)).toBe(
+    '1642bd02cf0c86ed8fb195652f9627d4bf8eebaf3c0f624f03b98d1cdd6a917e',
+  );
+  const v2 = upgradeEditorBody(v1, article.body);
+  const digest = revisionDigest(article, v2);
+  expect(digest).not.toBe(revisionDigest(article, v1));
+  const first = v2.blocks[0];
+  if (first.type !== 'paragraph') throw Error('fixture');
+  first.content = [
+    { type: 'text', text: '甲', marks: [] },
+    { type: 'text', text: '\n乙', marks: [] },
+  ];
+  expect(revisionDigest(article, v2)).toBe(digest);
+  first.content[0].marks = ['bold'];
+  expect(revisionDigest(article, v2)).not.toBe(digest);
+});
+it('rich repository rejects mismatched compatibility projection and preserves tombstone body', () => {
+  const s = setup().open(),
+    article = seed(s);
+  const { p, receipt } = proposal(article);
+  const rich = upgradeEditorBody(p.editorBody, p.nextArticle.body);
+  const first = rich.blocks[0];
+  if (first.type !== 'paragraph') throw Error('fixture');
+  first.content = [{ type: 'text', text: 'different', marks: ['bold'] }];
+  s.beginRevision(p.intent);
+  expect(s.commitRevision(1, { ...p, editorBody: rich }, receipt).status).toBe(
+    'invalid',
+  );
+  const valid = upgradeEditorBody(p.editorBody, p.nextArticle.body);
+  const paragraph = valid.blocks.find(
+    (b) => b.type === 'paragraph' && b.content.length > 0,
+  );
+  if (paragraph?.type !== 'paragraph') throw Error('fixture');
+  expect(paragraph.content[0]).toBeDefined();
+  paragraph.content[0].marks = ['bold'];
+  expect(s.commitRevision(1, { ...p, editorBody: valid }, receipt).status).toBe(
+    'committed',
+  );
+  expect(
+    s.deleteArticle(
+      {
+        operationId: randomUUID(),
+        articleKey: article.articleKey,
+        expectedArticleRevision: 2,
+      },
+      new Date().toISOString(),
+    ).status,
+  ).toBe('deleted');
+  expect(s.loadEditableArticle(article.articleKey)).toBeUndefined();
+  expect(s.loadArchivedEditableArticle(article.articleKey)?.editorBody).toEqual(
+    valid,
+  );
 });

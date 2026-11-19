@@ -35,6 +35,7 @@ it('guards all draft capabilities before invocation and sanitizes invalid output
   };
   const methods = Object.keys(draftChannels) as (keyof DraftApi)[];
   const payloads: Record<keyof DraftApi, unknown[]> = {
+    finishHandledTask: [{ taskId: id, expectedRevision: 0 }],
     openDraftSession: [],
     checkDraftSession: [],
     closeDraftSession: [],
@@ -64,7 +65,7 @@ it('guards all draft capabilities before invocation and sanitizes invalid output
     frame.url,
     api as unknown as DraftApi,
   );
-  expect(harness.handlers.size).toBe(11);
+  expect(harness.handlers.size).toBe(12);
   for (const method of methods) {
     const handler = harness.handlers.get(draftChannels[method])!;
     const event = { sender: contents, senderFrame: frame };

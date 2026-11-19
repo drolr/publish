@@ -375,7 +375,7 @@ async function main() {
         tasks.close();
       }
       emit({
-        schemaVersion: 14,
+        schemaVersion: 15,
         orderedCoverBytesExact: true,
         coverReceiptsExact: true,
         oldRowsExact: true,

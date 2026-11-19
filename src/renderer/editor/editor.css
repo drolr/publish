@@ -68,3 +68,215 @@
     align-items: flex-start;
   }
 }
+
+.rich-text-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+  align-items: center;
+}
+.rich-text-tool-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.rich-text-tool-group + .rich-text-tool-group {
+  padding-left: 9px;
+  border-left: 1px solid var(--line);
+}
+.rich-text-tools button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0;
+  border-color: transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+}
+.rich-text-tools button:hover:not(:disabled) {
+  background: var(--page);
+  border-color: var(--line);
+  color: var(--ink);
+}
+.rich-text-tools button[aria-pressed='true'] {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
+}
+.rich-text-tools button[aria-pressed='true']:hover:not(:disabled) {
+  background: var(--ink);
+  color: var(--surface);
+}
+.rich-text-tools button[aria-pressed='mixed'] {
+  border-style: dashed;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* Mixed state also needs a mark that survives the dashed border alone. */
+.rich-text-tools button[aria-pressed='mixed']::after {
+  content: '';
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.rich-text-tools button:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+.rich-text-tools .hint {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+}
+.ProseMirror .editor-ordered-list {
+  padding-inline-start: 0;
+  list-style: none;
+}
+.ProseMirror .editor-ordered-list > li {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+  column-gap: 0.5em;
+}
+.ProseMirror .editor-ordered-list > li::before {
+  content: attr(data-editor-ordinal) '.';
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+.ProseMirror .editor-ordered-list > li > p {
+  min-width: 0;
+}
+
+/* Focused article view; standalone fixture/default editor keeps its bounded shell. */
+.editor-view .manual-editor {
+  max-width: 1040px;
+  padding: 0;
+  border-radius: 12px;
+}
+.editor-view .focused-editor-header {
+  margin: 0;
+  padding: 14px 20px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.editor-view .focused-editor-header h2 {
+  font-size: 18px;
+  margin: 0;
+}
+.editor-view .editor-save-status {
+  margin: 0 0 0 auto;
+  font-size: 13px;
+}
+.editor-view .editor-task-status {
+  margin: 0;
+  padding: 8px 20px;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+.editor-view .manual-editor > [role='alert'],
+.editor-view .manual-editor > [role='status'] {
+  margin-inline: 20px;
+}
+.editor-view .rich-text-tools {
+  position: sticky;
+  top: -1px;
+  z-index: 10;
+  width: min(860px, 100%);
+  background: var(--surface);
+  padding: 10px 20px;
+  border-block: 1px solid var(--line);
+  margin: 0 auto;
+}
+/* 820px text column (860px box minus 20px gutters) to match the platform. */
+.editor-view .article-writing-surface {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px 20px 28px;
+  background: var(--surface);
+}
+.article-title-field {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+}
+.article-title-field input {
+  display: block;
+  width: 100%;
+  font-size: 28px;
+  font-weight: 700;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  padding: 12px 0 20px;
+  margin-bottom: 16px;
+  color: var(--ink);
+}
+.editor-view .continuous-body-shell {
+  max-height: none;
+  min-height: 260px;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+}
+.editor-view .continuous-body-shell .ProseMirror {
+  padding: 0;
+  font-size: 18px;
+  line-height: 1.8;
+  min-height: 260px;
+}
+.editor-view .ProseMirror p {
+  margin: 14px 0;
+}
+.editor-view .ProseMirror h2 {
+  font-size: 22px;
+  line-height: 1.8;
+  font-weight: 700;
+  margin: 24px 0 12px;
+}
+.editor-view .editor-footer {
+  padding: 16px 20px;
+  border-top: 1px solid var(--line);
+}
+.article-declaration {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+}
+.article-declaration select {
+  width: auto;
+  min-width: 120px;
+}
+.editor-view .editor-footer .hint {
+  margin-bottom: 0;
+}
+@media (max-width: 959px) {
+  .editor-view .manual-editor {
+    padding: 0;
+  }
+  .editor-view .focused-editor-header,
+  .editor-view .rich-text-tools {
+    padding: 10px 12px;
+    gap: 8px;
+  }
+  .editor-view .article-writing-surface,
+  .editor-view .editor-footer {
+    padding: 16px;
+  }
+  .editor-view .continuous-body-shell .ProseMirror {
+    font-size: 16px;
+  }
+  .editor-view .editor-save-status {
+    font-size: 12px;
+  }
+}

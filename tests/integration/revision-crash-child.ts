@@ -1,3 +1,4 @@
+import { upgradeEditorBody } from '../../src/domain/rich-text-body';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { openArticleRepository } from '../../src/infrastructure/persistence/article-repository';
@@ -98,14 +99,17 @@ export async function updateInput(
     },
     title: 'Updated',
     contentDeclaration: 'original',
-    editorBody: {
-      version: 1,
-      blocks: [
-        { type: 'paragraph', text: '' },
-        { type: 'paragraph', text: ' 原文😀\n ' },
-        { type: 'image', imageId: 'i' },
-      ],
-    },
+    editorBody: upgradeEditorBody(
+      {
+        version: 1,
+        blocks: [
+          { type: 'paragraph', text: '' },
+          { type: 'paragraph', text: ' 原文😀\n ' },
+          { type: 'image', imageId: 'i' },
+        ],
+      },
+      [],
+    ),
     images: [{ kind: 'stored', imageId: 'i', lease: authorized.lease }],
   };
 }

@@ -86,6 +86,7 @@ export async function createDraftHarness(
     cover: { resourceKey: 'a'.repeat(64), source: 'store-material-first' },
   };
   const control = {
+    healthInvalidations: 0,
     controlledPilot: undefined as
       | {
           reviewedTitle?: string;
@@ -103,6 +104,10 @@ export async function createDraftHarness(
           storeIdentity: string;
         }
       | undefined,
+    capabilities: {
+      revision: 'fixture-v1',
+      features: {},
+    } as import('../../src/contracts/draft-content').DraftContentCapabilities,
     now: '2026-09-23T00:00:00.000Z',
     gate: 'ready' as 'ready' | 'busy' | 'unavailable',
     probe: { status: 'ready', store, generation: randomUUID() } as SessionProbe,
@@ -127,6 +132,7 @@ export async function createDraftHarness(
     },
   };
   const platform: DraftPlatform = {
+    contentCapabilities: () => structuredClone(control.capabilities),
     checkAbsence: async () => ({
       status: 'blocked',
       reason: 'RESULT_AMBIGUOUS',
@@ -142,6 +148,12 @@ export async function createDraftHarness(
     },
     closeSession: async () => {
       calls.push('close');
+    },
+    returnHomeAfterHandledTask: async (_task, cancelled) => {
+      calls.push('handoff');
+      return cancelled()
+        ? { status: 'blocked', reason: 'STOP_REQUESTED' }
+        : control.probe;
     },
     openVerified: async () => {
       calls.push('open-verified');
@@ -180,12 +192,16 @@ export async function createDraftHarness(
   function controller() {
     preparation = createDraftPreparation({
       repository: articles,
+      contentCapabilities: () => platform.contentCapabilities(),
       covers: articles,
       snapshots,
       tasks,
       newId: randomUUID,
     });
     return createDraftController({
+      invalidateBrowserHealth: () => {
+        control.healthInvalidations++;
+      },
       tasks,
       preparation,
       snapshots,

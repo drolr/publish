@@ -1,3 +1,5 @@
+import { HelpTip } from '../HelpTip';
+import { CoverModeControls } from './CoverModeControls';
 import { useEffect, useRef, useState } from 'react';
 import type { CoverMode } from '../../contracts/article-cover';
 import { CoverImage } from './CoverImage';
@@ -109,10 +111,12 @@ export function CoverEditor({
   }
   return (
     <section className="cover-panel" aria-label="封面图片">
-      <h2>封面图片</h2>
-      <p>
-        封面与正文图片独立。请先在本机保存文章，再配置封面；单图封面会在正文填写后、存草稿前上传。三图封面暂不支持自动存稿。
-      </p>
+      <div className="heading-with-help">
+        <h2>封面图片</h2>
+        <HelpTip label="封面配置帮助">
+          封面与正文图片独立。单图封面会在正文填写后、存草稿前上传。三图封面暂不支持自动存稿。
+        </HelpTip>
+      </div>
       {!articleKey ? (
         <p>请先将文章保存到本机，再配置封面</p>
       ) : c.readStatus === 'loading' && !config ? (
@@ -162,20 +166,11 @@ export function CoverEditor({
         </button>
       ) : (
         <>
-          <fieldset disabled={!ready}>
-            <legend>封面模式</legend>
-            {(['none', 'single', 'triple'] as const).map((m) => (
-              <label key={m}>
-                <input
-                  type="radio"
-                  name="cover-mode"
-                  checked={mode === m}
-                  onChange={() => changeMode(m)}
-                />
-                {m === 'none' ? '无封面' : m === 'single' ? '单图' : '三图'}
-              </label>
-            ))}
-          </fieldset>
+          <CoverModeControls
+            mode={mode}
+            disabled={!ready}
+            onChange={changeMode}
+          />
           {mode !== 'none' && (
             <>
               <p>

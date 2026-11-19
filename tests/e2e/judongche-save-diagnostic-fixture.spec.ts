@@ -78,3 +78,59 @@ for (const fault of ['http', 'business', 'invalid', 'missing'] as const) {
     expect(requests).toBe(1);
   });
 }
+
+test('T1 rejected operator submission remains an execution first error after the subsequent probe', async ({
+  context,
+  page,
+}) => {
+  await denyExternalNetwork(context);
+  const fixture = await installProductionFixture(context, {
+    observedTrailingParagraphs: true,
+  });
+  await context.route('**/motor/dealer_admin/go_api/article/create', (route) =>
+    route.fulfill({ json: { status: 5000, message: 'private response' } }),
+  );
+  await page.goto(fixture.home);
+  const diagnostics: import('../../src/infrastructure/platforms/judongche/production-pages').ProbeDiagnostic[] =
+    [];
+  const pages = createJudongchePages(
+    {
+      open: async () => context,
+      current: () => context,
+      generation: () => 'fixture',
+      close: async () => {},
+    },
+    (event) => diagnostics.push(event),
+    {
+      manualReview: true,
+      batchSubmissionReview: 'operator',
+      ownerConfirmedPilot: { dealerId: '123456', storeName: '合成门店' },
+    },
+  );
+  expect((await pages.probe()).status).toBe('ready');
+  await pages.enterNewEditor('private title', () => false, randomUUID());
+  await pages.fillTitle('private title');
+  await pages.appendParagraph('private body');
+  await pages.inspectEditor();
+  expect(await pages.saveForOperatorReview!(() => false)).toMatchObject({
+    observation: 'rejected',
+  });
+  const first = diagnostics.find((e) => e.failure)!;
+  expect(first).toMatchObject({
+    operation: 'saveForOperatorReview',
+    phase: 'save-response',
+    check: 'save-business-rejected',
+    reason: 'RESULT_AMBIGUOUS',
+    saveObservation: {
+      responseReceived: true,
+      httpStatus: 200,
+      businessStatus: 5000,
+    },
+  });
+  const frozen = JSON.stringify(first);
+  await pages.probe();
+  expect(JSON.stringify(first)).toBe(frozen);
+  expect(JSON.stringify(diagnostics)).not.toMatch(
+    /private|https:|assetKey|bytes|stack/,
+  );
+});

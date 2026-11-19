@@ -122,6 +122,12 @@ export const PasteProgressSchema = z
   })
   .refine((progress) => progress.current <= progress.total);
 export type PasteProgress = z.infer<typeof PasteProgressSchema>;
+export const RichPasteWarningSchema = z.enum([
+  'HEADING_NORMALIZED',
+  'STYLE_NORMALIZED',
+  'PLAIN_ONLY',
+]);
+export type RichPasteWarning = z.output<typeof RichPasteWarningSchema>;
 export const PasteSummarySchema = z
   .strictObject({
     jobId: StorageIdSchema,
@@ -133,6 +139,7 @@ export const PasteSummarySchema = z
     unresolved: imageCount,
     plainOnly: z.boolean(),
     reason: PasteErrorCodeSchema.optional(),
+    warnings: z.array(RichPasteWarningSchema).max(3),
   })
   .refine(
     (summary) =>

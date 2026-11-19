@@ -4,12 +4,24 @@ import {
   type useOperationControl,
 } from './OperationControls';
 
+export type WorkspaceTaskStatus = {
+  message: string;
+  needsAttention: boolean;
+  active: boolean;
+};
+
 export function WorkspaceFooter({
   control,
   issue,
+  taskStatus,
+  onReturn,
+  returnBlocked = false,
 }: {
   control: ReturnType<typeof useOperationControl>;
   issue: string;
+  taskStatus?: WorkspaceTaskStatus | null;
+  onReturn?: () => void;
+  returnBlocked?: boolean;
 }) {
   const footer = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -39,7 +51,10 @@ export function WorkspaceFooter({
       <div className="workspace-footer-message" aria-live="polite">
         {issue &&
         !['stopping', 'needs_review'].includes(control.view?.phase ?? '') ? (
-          <p className="workspace-error">{issue}</p>
+          <p className="workspace-error">
+            {taskStatus?.message && <span>{taskStatus.message} · </span>}
+            {issue}
+          </p>
         ) : (
           <p>
             {control.pending || control.view?.phase === 'stopping'
@@ -70,10 +85,15 @@ export function WorkspaceFooter({
                     )
                       ? '；本地编辑内容已保留，请保存或放弃后再停止。'
                       : '；请保留现场并核对结果，然后再次停止。')
-                  : '准备就绪'}
+                  : taskStatus?.message || '准备就绪'}
           </p>
         )}
       </div>
+      {onReturn && taskStatus && (
+        <button disabled={returnBlocked} onClick={onReturn}>
+          返回工作区处理
+        </button>
+      )}
       <OperationControls control={control} compact />
     </section>
   );

@@ -182,7 +182,7 @@ export function verifyHistoricalUpgrade(
           .prepare('SELECT version FROM schema_migrations ORDER BY version')
           .all() as { version: number }[]
       ).map((r) => r.version),
-      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     );
     assert.equal(
       (
@@ -205,7 +205,7 @@ export function verifyHistoricalUpgrade(
     assetFilesExact: expected.assets.length,
     integrity: 'ok',
     foreignKeyViolations: 0,
-    schemaVersion: 14,
+    schemaVersion: 15,
     historicalArticleCount: expected.logical.articles.rows.length,
     historicalTaskCount: expected.logical.judongche_draft_tasks.rows.length,
     historicalSaveOperations:

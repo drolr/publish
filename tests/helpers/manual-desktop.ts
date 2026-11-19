@@ -50,7 +50,14 @@ export function manualFixture(
     save: async () => imported,
     converter: {
       convert: async () => ({
-        blocks: [{ type: 'paragraph', text: 'Body' }],
+        version: 2 as const,
+        warnings: [],
+        blocks: [
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+          },
+        ],
         plainOnly: false,
       }),
     },
@@ -69,9 +76,16 @@ export function manualFixture(
     return session(
       (
         await manual.updateManualDraft(first.sessionId, first.revision, {
+          bodyVersion: 2 as const,
           title: 'Saved article',
           contentDeclaration: 'repost',
-          blocks: [{ type: 'paragraph', blockKey: id(70), text: 'Body' }],
+          blocks: [
+            {
+              type: 'paragraph',
+              blockKey: id(70),
+              content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+            },
+          ],
         })
       ).snapshot,
     );

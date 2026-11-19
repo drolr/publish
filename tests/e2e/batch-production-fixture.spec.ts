@@ -1,3 +1,4 @@
+import { legacyFixtureSnapshotCapture } from '../fixtures/legacy-snapshot-capture';
 import { test, expect } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
@@ -63,7 +64,10 @@ for (const fault of ['none', 'second-save', 'stop-after-save'] as const)
         }
       },
     };
+    // evidenceV1: preserve legacy production-page regression; V2 remains closed.
+    legacyFixtureSnapshotCapture(h.snapshots);
     const preparation = createDraftPreparation({
+      contentCapabilities: () => adapter.contentCapabilities(),
       repository: h.articles,
       covers: h.articles,
       tasks: h.tasks,
@@ -71,6 +75,7 @@ for (const fault of ['none', 'second-save', 'stop-after-save'] as const)
       newId: randomUUID,
     });
     const draft = createDraftController({
+      invalidateBrowserHealth: () => {},
       tasks: h.tasks,
       snapshots: h.snapshots,
       preparation,

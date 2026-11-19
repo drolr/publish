@@ -96,3 +96,8 @@ it('empty paragraphs count as blocks and snapshot rejects oversized untrusted in
     }).success,
   ).toBe(false);
 });
+
+it('V1 schema extraction preserves the public reexport identity', async () => {
+  const leaf = await import('../../src/contracts/editor-body-v1');
+  expect(leaf.PersistedEditorBodyV1Schema).toBe(PersistedEditorBodyV1Schema);
+});

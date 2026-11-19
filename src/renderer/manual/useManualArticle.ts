@@ -230,7 +230,7 @@ export function useManualArticle() {
       const key = crypto.randomUUID();
       core.change({
         ...core.draft,
-        blocks: [{ type: 'paragraph', blockKey: key, text: '' }],
+        blocks: [{ type: 'paragraph', blockKey: key, content: [] }],
       });
       if (!(await core.flush())) return;
       range = {
@@ -243,6 +243,10 @@ export function useManualArticle() {
   }
   async function command(
     action:
+      | 'cover-pick'
+      | 'cover-single'
+      | 'cover-none'
+      | 'cover-reconcile'
       | 'open'
       | 'begin'
       | 'pick'
@@ -286,6 +290,7 @@ export function useManualArticle() {
       setPending(true);
       if (
         action !== 'cancel' &&
+        action !== 'cover-reconcile' &&
         action !== 'discard' &&
         action !== 'begin' &&
         action !== 'open' &&
@@ -333,6 +338,7 @@ export function useManualArticle() {
           reply = await window.desktopApi.commitManualDocument({
             sessionId: state.sessionId,
             expectedDocumentRevision: state.documentRevision,
+            expectedCoverDraftRevision: state.cover?.draftRevision,
             operationId: state.nextSaveOperationId,
           });
           if (
@@ -351,7 +357,24 @@ export function useManualArticle() {
             };
             await reconcile();
           } else saveLookup.current = undefined;
-        } else if (action === 'discard')
+        } else if (action === 'cover-reconcile')
+          reply = await window.desktopApi.reconcileManualCoverSave(
+            state.sessionId,
+          );
+        else if (action === 'cover-pick')
+          reply = await window.desktopApi.pickManualCoverImage({
+            sessionId: state.sessionId,
+            expectedCoverDraftRevision: state.cover?.draftRevision ?? 0,
+          });
+        else if (action === 'cover-single' || action === 'cover-none')
+          reply = await window.desktopApi.setManualCoverMode(
+            {
+              sessionId: state.sessionId,
+              expectedCoverDraftRevision: state.cover?.draftRevision ?? 0,
+            },
+            action === 'cover-single' ? 'single' : 'none',
+          );
+        else if (action === 'discard')
           reply = await window.desktopApi.closeManualEditor(ticket, 'discard');
         else if (action === 'retry')
           reply = await window.desktopApi.retryManualPasteImage(
@@ -434,7 +457,11 @@ export function useManualArticle() {
               active(state)
             )
               return;
-            if (restartRequested.current && flushed && !state.dirty) {
+            if (
+              restartRequested.current &&
+              flushed &&
+              !(state.dirty || state.cover?.dirty)
+            ) {
               // The clean proof authorizes main to release this session. Freeze
               // both the local input lane and its DOM before sending that proof;
               // keep it frozen until a different/idle session is read back.
@@ -488,6 +515,7 @@ export function useManualArticle() {
       if (
         !isSession(core.snapshot) ||
         core.snapshot.dirty ||
+        core.snapshot.cover?.dirty ||
         core.unsynced ||
         core.unknown ||
         core.snapshot.issues?.length
@@ -507,6 +535,11 @@ export function useManualArticle() {
     operationUnknown ||
     core.unknown ||
     active(snapshot) ||
+    (isSession(snapshot) &&
+      !!snapshot.cover?.outcome &&
+      ['pending', 'needs_review', 'unavailable', 'not_started'].includes(
+        snapshot.cover.outcome.status,
+      )) ||
     snapshot?.state === 'unavailable' ||
     (isSession(snapshot) &&
       ((snapshot.result?.status === 'failed' &&
@@ -543,6 +576,11 @@ export function useManualArticle() {
           core.unknown ||
           lock.current ||
           active(core.snapshot) ||
+          (isSession(core.snapshot) &&
+            !!core.snapshot.cover?.outcome &&
+            ['pending', 'needs_review', 'unavailable', 'not_started'].includes(
+              core.snapshot.cover.outcome.status,
+            )) ||
           core.snapshot?.state === 'unavailable',
       };
     },

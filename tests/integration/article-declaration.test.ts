@@ -114,7 +114,7 @@ it('atomically changes a mixed selection, counts no-ops, preserves all other fie
     ...first,
     contentDeclaration: 'original',
   });
-  expect(reopened.getSchemaVersion()).toBe(14);
+  expect(reopened.getSchemaVersion()).toBe(15);
 });
 it('rejects any missing target before writes and reads never return partial success', () => {
   const { repo, add } = setup();

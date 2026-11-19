@@ -1,3 +1,4 @@
+import { returnToArticlePool } from './focused-editor-navigation';
 import {
   _electron as electron,
   expect,
@@ -13,15 +14,19 @@ export async function checkWebPasteDesktop(
   application: ElectronApplication,
 ): Promise<void> {
   const page = await application.firstWindow();
+  if (
+    await page
+      .getByRole('button', { name: '返回文章池', exact: true })
+      .isVisible()
+  )
+    await returnToArticlePool(page);
   await page.getByRole('button', { name: '新建文章', exact: true }).click();
+  await expect(page.getByRole('toolbar', { name: '正文格式' })).toBeVisible();
   await expect(
-    page.getByRole('button', { name: '富文本粘贴', exact: true }),
-  ).toHaveAttribute('aria-pressed', 'true');
-  await expect(
-    page.getByRole('button', { name: '添加图片', exact: true }),
-  ).toHaveCount(0);
+    page.getByRole('button', { name: '插入图片', exact: true }),
+  ).toBeVisible();
   // Controlled synthetic event exercises the real renderer command synchronization.
-  // Private browser-native acceptance evidence is excluded from publication.
+  // Browser-native evidence is exclusively continuous-editor-native.spec.ts.
   await page.getByRole('textbox', { name: '文章正文', exact: true }).click();
   await page
     .getByRole('textbox', { name: '文章正文', exact: true })
@@ -65,17 +70,23 @@ export async function checkWebPasteDesktop(
     'paragraph',
   ]);
   await expect(
-    page.getByRole('button', { name: '保存到文章池', exact: true }),
+    page.getByRole('button', { name: '保存到本机', exact: true }),
   ).toBeDisabled();
   await page.reload();
   expect(
     await page.evaluate(() => window.desktopApi.getManualArticleState()),
   ).toEqual(before);
-  await page.getByRole('button', { name: '手动录入', exact: true }).click();
+  await expect(
+    page.getByRole('textbox', { name: '文章正文', exact: true }),
+  ).toBeEditable();
   await expect(
     page.getByRole('textbox', { name: '文章正文', exact: true }),
   ).toContainText('Worker 前文');
-  await page.getByRole('button', { name: '富文本粘贴', exact: true }).click();
+  await page.getByRole('button', { name: '返回文章池', exact: true }).click();
+  await page
+    .getByRole('dialog', { name: '离开当前编辑？' })
+    .getByRole('button', { name: '继续编辑', exact: true })
+    .click();
   expect(
     await page.evaluate(() => window.desktopApi.getManualArticleState()),
   ).toEqual(before);
@@ -85,9 +96,9 @@ export async function checkWebPasteDesktop(
   await page.keyboard.press('Enter');
   await page.keyboard.insertText('Worker 后文');
   await page.getByLabel('文章标题', { exact: true }).fill('Worker offline');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
+  await page.getByRole('button', { name: '保存到本机', exact: true }).click();
   await expect(
-    page.getByRole('status').filter({ hasText: '文章已保存到本机' }),
+    page.getByRole('status').filter({ hasText: '已保存到本机' }),
   ).toBeVisible();
 }
 export async function checkWebPasteRuntime(executablePath?: string) {

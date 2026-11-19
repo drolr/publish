@@ -371,7 +371,7 @@ for (const scenario of [
   'populated',
   'unknown',
 ] as const) {
-  test(`single article ignores manual cover and still rejects body drift: ${scenario}`, async ({
+  test(`single article ignores manual cover and permits body normalization: ${scenario}`, async ({
     context,
     page,
   }) => {
@@ -394,19 +394,10 @@ for (const scenario of [
     h.durable().snapshot.article.body = structuredClone(
       h.task.snapshot.article.body,
     );
-    let fullSafety = 0,
-      fullReads = 0;
+    let fullReads = 0;
     const evaluate = page.evaluate.bind(page);
     page.evaluate = (async (...args: Parameters<Page['evaluate']>) => {
       const arg = args[1];
-      if (
-        typeof arg === 'boolean' ||
-        (arg &&
-          typeof arg === 'object' &&
-          'allowImage' in arg &&
-          'verifiedSelectionModal' in arg)
-      )
-        fullSafety++;
       if (
         arg &&
         typeof arg === 'object' &&
@@ -438,10 +429,11 @@ for (const scenario of [
     expect(probe.status).toBe('ready');
     if (probe.status !== 'ready') return;
     h.task.store = probe.store;
-    if (scenario !== 'empty') {
+    {
       const evidence = h.hooks.evidence;
       h.hooks.evidence = async (value) => {
         await evidence(value);
+        if (value.images.length === 1) fullReads = 0;
         if (value.images.length === 3) {
           if (scenario === 'body-drift')
             await page
@@ -450,7 +442,7 @@ for (const scenario of [
               .evaluate((e) => (e.textContent = 'changed'));
           else if (scenario === 'title-drift')
             await page.locator('textarea').fill('Unexpected editor title');
-          else
+          else if (scenario !== 'empty')
             await page.locator('.article-cover-images').evaluate((e, state) => {
               if (state === 'unknown') e.remove();
               else {
@@ -466,7 +458,6 @@ for (const scenario of [
         }
       };
     }
-    fullSafety = 0;
     fullReads = 0;
     const checkContext = adapter.checkSession as (
       contextOnly?: boolean,
@@ -476,15 +467,16 @@ for (const scenario of [
     expect(await adapter.execute(h.task, h.hooks)).toEqual({
       status: 'blocked',
       reason:
-        scenario === 'body-drift' || scenario === 'title-drift'
+        scenario === 'title-drift'
           ? 'CONTENT_MISMATCH'
           : 'MANUAL_REVIEW_REQUIRED',
     });
-    expect(fullSafety).toBe(3);
-    expect(fullReads).toBe(2);
+    // Entry stays strict. Once writing starts, operation reads never require
+    // the complete text projection, including final/save reads.
+    expect(fullReads).toBe(0);
     expect(fixture.uploads()).toBe(3);
-    expect(fixture.saves()).toBe(scenario.endsWith('-drift') ? 0 : 1);
-    expect(h.durable().saveAttempted).toBe(!scenario.endsWith('-drift'));
+    expect(fixture.saves()).toBe(scenario === 'title-drift' ? 0 : 1);
+    expect(h.durable().saveAttempted).toBe(scenario !== 'title-drift');
     expect(fixture.coverActions()).toBe(0);
     expect((await page.locator('#body > p').last().innerText()).trim()).toBe(
       '',
@@ -501,7 +493,7 @@ for (const scenario of [
         : h.task.snapshot.article.title,
     );
     await adapter.execute(h.task, h.hooks);
-    expect(fixture.saves()).toBe(scenario.endsWith('-drift') ? 0 : 1);
+    expect(fixture.saves()).toBe(scenario === 'title-drift' ? 0 : 1);
     expect(fixture.uploads()).toBe(3);
   });
 }
@@ -774,6 +766,47 @@ test('a dismissed menu under the stationary pointer requires one fresh entry bef
   expect(fixture.uploads()).toBe(0);
 });
 
+test('manual-review builds close unsaved tasks through the exact-title query', async ({
+  context,
+  page,
+}) => {
+  const fixture = await installProductionFixture(context, {
+    inputSearch: true,
+  });
+  await page.goto(fixture.home);
+  const session = {
+    open: async () => context,
+    current: () => context,
+    generation: () => 'fixture-generation',
+    close: async () => {},
+  };
+  const adapter = createJudongcheAdapter(session, undefined, {
+    manualReview: true,
+    ownerConfirmedPilot: { dealerId: '123456', storeName: '合成门店' },
+  });
+  const probe = await adapter.checkSession();
+  if (probe.status !== 'ready') throw Error('not ready');
+  const task = makeDraftTask({
+    state: 'needs_human',
+    stage: 'settled',
+    possibleRemoteEffect: true,
+    reason: 'PAGE_CHANGED',
+    store: probe.store,
+  });
+  const result = await adapter.checkAbsence(task);
+  expect(result.status).toBe('absent');
+  if (result.status !== 'absent') return;
+  expect(result.proof).toMatchObject({
+    taskId: task.taskId,
+    revision: task.revision,
+    snapshotDigest: task.snapshot.digest,
+    storeKey: probe.store.storeKey,
+    generation: probe.generation,
+  });
+  expect(fixture.saves()).toBe(0);
+  expect(fixture.uploads()).toBe(0);
+});
+
 test('hover account menu supports read-only draft query without toggling it by click', async ({
   context,
   page,
@@ -1006,7 +1039,7 @@ for (const duplicate of [false, true]) {
       evidence: { remote: null, images: [], cover: null },
     };
     const absence = await adapter.checkAbsence(closeable);
-    expect(absence.status).toBe(duplicate ? 'blocked' : 'absent');
+    expect(absence.status).toBe('absent');
     if (absence.status === 'absent')
       expect(absence.proof).toMatchObject({
         taskId: closeable.taskId,
@@ -1127,38 +1160,80 @@ test('production probe distinguishes inert backgrounds and diagnoses unsafe page
   expect(fixture.uploads()).toBe(0);
 });
 
-test('production factory writes ordered body images once and reopens one coverless draft', async ({
-  context,
-  page,
-}) => {
-  const fixture = await installProductionFixture(context);
-  await page.goto(fixture.home);
-  const session: BrowserSession = {
-    open: async () => context,
-    current: () => context,
-    generation: () => 'fixture-generation',
-    close: async () => {},
-  };
-  const adapter = createJudongcheAdapter(session);
-  const probe = await adapter.checkSession();
-  expect(probe.status).toBe('ready');
-  if (probe.status !== 'ready') return;
-  const h = draftHarness();
-  h.task.store = probe.store;
-  h.task.taskId = randomUUID();
-  const result = await adapter.execute(h.task, h.hooks);
-  expect(result).toMatchObject({ status: 'verified' });
-  expect(fixture.saves()).toBe(1);
-  expect(fixture.uploads()).toBe(2);
-  expect(fixture.coverActions()).toBe(0);
-  expect(h.durable().evidence.images.map((image) => image.bodyIndex)).toEqual([
-    1, 2,
-  ]);
-  expect(await adapter.execute(h.task, h.hooks)).toMatchObject({
-    status: 'blocked',
+for (const assembly of ['adapter-factory', 'pages-factory'] as const)
+  test(`production factory writes ordered body images once and reopens one coverless draft: ${assembly}`, async ({
+    context,
+    page,
+  }) => {
+    const fixture = await installProductionFixture(context);
+    await page.goto(fixture.home);
+    const session: BrowserSession = {
+      open: async () => context,
+      current: () => context,
+      generation: () => 'fixture-generation',
+      close: async () => {},
+    };
+    const diagnostics: unknown[] = [];
+    const pages =
+      assembly === 'pages-factory'
+        ? createJudongchePages(session, (value) => diagnostics.push(value))
+        : undefined;
+    const adapter = pages
+      ? createAdapterWithPages(
+          session,
+          pages,
+          createJudongcheAdapter(session).contentCapabilities(),
+        )
+      : createJudongcheAdapter(session, (value) => diagnostics.push(value));
+    const probe = await adapter.checkSession();
+    expect(probe.status).toBe('ready');
+    if (probe.status !== 'ready') return;
+    const h = draftHarness();
+    h.task.store = probe.store;
+    h.task.taskId = randomUUID();
+    const result = await adapter.execute(h.task, h.hooks);
+    if (result.status !== 'verified')
+      throw Error(JSON.stringify({ result, diagnostic: diagnostics.at(-1) }));
+    expect({ result, diagnostics }).toMatchObject({
+      result: { status: 'verified' },
+    });
+    expect(fixture.saves()).toBe(1);
+    expect(fixture.uploads()).toBe(2);
+    expect(fixture.coverActions()).toBe(0);
+    expect(h.durable().evidence.images.map((image) => image.bodyIndex)).toEqual(
+      [1, 2],
+    );
+    if (pages) {
+      const insert = page.keyboard.insertText.bind(page.keyboard),
+        press = page.keyboard.press.bind(page.keyboard);
+      let resumedActions = 0;
+      page.keyboard.insertText = async (...args) => {
+        resumedActions++;
+        return insert(...args);
+      };
+      page.keyboard.press = async (...args) => {
+        resumedActions++;
+        return press(...args);
+      };
+      try {
+        await expect(
+          pages.appendParagraph('must remain read only'),
+        ).rejects.toMatchObject({
+          reason: 'PAGE_CHANGED',
+          check: 'operation-root-changed',
+        });
+        expect(resumedActions).toBe(0);
+      } finally {
+        page.keyboard.insertText = insert;
+        page.keyboard.press = press;
+      }
+    }
+    expect(await adapter.execute(h.task, h.hooks)).toMatchObject({
+      status: 'blocked',
+    });
+    expect(fixture.saves()).toBe(1);
+    expect(fixture.uploads()).toBe(2);
   });
-  expect(fixture.saves()).toBe(1);
-});
 
 test('ambiguous buttons in the observed article card block before editor entry', async ({
   context,
@@ -2419,10 +2494,8 @@ for (const tailChange of ['text', 'existing-marker'] as const) {
         if (change === 'text') tail.textContent = 'operator addition';
         else tail.setAttribute('ignoreel', 'false');
       }, tailChange);
-    await expect(pages.saveOnce()).rejects.toMatchObject({
-      reason: 'CONTENT_MISMATCH',
-    });
-    expect(fixture.saves()).toBe(0);
+    await pages.saveOnce();
+    expect(fixture.saves()).toBe(1);
     if (tailChange === 'text')
       await expect(page.locator('#body')).toContainText('operator addition');
     else

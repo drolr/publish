@@ -78,7 +78,7 @@ it('upgrades v9 without losing articles and creates an idempotent frozen batch',
   });
   expect(
     db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get(),
-  ).toEqual({ v: 14 });
+  ).toEqual({ v: 15 });
   expect(first.items[0].taskId).toBeNull();
 });
 it('reservation and task association roll back together and are never replayed', () => {
@@ -226,4 +226,100 @@ it('archives a released stopped batch without erasing tasks or revealing earlier
     n: 2,
   });
   expect(db.pragma('foreign_key_check')).toEqual([]);
+});
+
+it('legacy snapshot skip is transactional and preserves the original ambiguous-save task across reopen', () => {
+  const { repo, seed, path } = setup();
+  const batch = repo.create(seed);
+  const task = repo.reserveNext(batch.id, batch.revision, seed.now)!;
+  const tasks = openDraftTaskRepository(path, migrations);
+  cleanup.push(() => tasks.close());
+  let current = tasks.apply(
+    task.taskId,
+    task.revision,
+    { type: 'begin' },
+    seed.now,
+  );
+  current = tasks.apply(
+    task.taskId,
+    current.revision,
+    { type: 'before-save' },
+    seed.now,
+  );
+  current = tasks.apply(
+    task.taskId,
+    current.revision,
+    { type: 'settle', state: 'needs_human', reason: 'RESULT_AMBIGUOUS' },
+    seed.now,
+  );
+  const paused = repo.settleItem(batch.id, task.taskId, seed.now);
+  const input = {
+    batchId: batch.id,
+    expectedRevision: paused.revision,
+    taskId: task.taskId,
+  };
+  expect(() => repo.skipCurrentAndContinue(input, seed.now)).toThrow();
+  current = tasks.apply(
+    task.taskId,
+    current.revision,
+    { type: 'stop' },
+    seed.now,
+  );
+  const released = tasks.apply(
+    task.taskId,
+    current.revision,
+    { type: 'release-after-stop' },
+    seed.now,
+  );
+  const db = new Database(path);
+  cleanup.push(() => db.close());
+  db.exec(
+    "CREATE TRIGGER fail_skip_batch BEFORE UPDATE OF state ON draft_batches BEGIN SELECT RAISE(ABORT,'fixture rollback'); END",
+  );
+  expect(() => repo.skipCurrentAndContinue(input, seed.now)).toThrow();
+  expect(repo.getCurrent()).toEqual(paused);
+  db.exec('DROP TRIGGER fail_skip_batch');
+  expect(repo.skipCurrentAndContinue(input, seed.now)).toMatchObject({
+    state: 'completed',
+    counts: { skipped: 1, pending: 0 },
+  });
+  expect(() => repo.skipCurrentAndContinue(input, seed.now)).toThrow();
+  repo.close();
+  const reopened = openDraftBatchRepository(path, migrations);
+  cleanup.push(() => reopened.close());
+  reopened.recover(seed.now);
+  expect(reopened.getCurrent()).toMatchObject({
+    state: 'completed',
+    items: [
+      {
+        taskId: task.taskId,
+        state: 'skipped',
+        reason: 'RESULT_AMBIGUOUS',
+        saveAttempted: true,
+      },
+    ],
+  });
+  expect(tasks.get(task.taskId)).toEqual(released);
+});
+
+it('restart preserves an intentional stop even when settling the interrupted writer replaces its reason', () => {
+  const { repo, seed } = setup();
+  const batch = repo.create(seed);
+  const task = repo.reserveNext(batch.id, batch.revision, seed.now)!;
+  const active = repo.getCurrent()!;
+  repo.requestStop(batch.id, active.revision, seed.now);
+  repo.recover(seed.now);
+  const interrupted = repo.getCurrent()!;
+  expect(interrupted).toMatchObject({
+    state: 'interrupted',
+    stopRequested: true,
+    reason: 'STOP_REQUESTED',
+  });
+  expect(() =>
+    repo.recovery({
+      batchId: batch.id,
+      expectedRevision: interrupted.revision,
+      taskId: task.taskId,
+    }),
+  ).toThrow();
 });

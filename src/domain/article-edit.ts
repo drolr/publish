@@ -1,3 +1,5 @@
+import type { PersistedEditorBody } from '../contracts/rich-text-body';
+import { projectRichBody } from './rich-text-body';
 import type { PersistedEditorBodyV1 } from '../contracts/manual-edit';
 import { PersistedEditorBodyV1Schema } from '../contracts/manual-edit';
 import type { StoredArticle } from '../contracts/stored-article';
@@ -7,8 +9,9 @@ export function normalizeEditorBody(
   return PersistedEditorBodyV1Schema.parse(body);
 }
 export function projectEditorBody(
-  body: PersistedEditorBodyV1,
+  body: PersistedEditorBody,
 ): StoredArticle['body'] {
+  if (body.version === 2) return projectRichBody(body);
   return normalizeEditorBody(body).blocks.flatMap(
     (block): StoredArticle['body'] =>
       block.type === 'image'
@@ -30,7 +33,7 @@ export function deriveEditorBody(
 }
 export function editorProjectionMatches(
   article: StoredArticle,
-  body: PersistedEditorBodyV1,
+  body: PersistedEditorBody,
 ): boolean {
   return (
     JSON.stringify(projectEditorBody(body)) === JSON.stringify(article.body)

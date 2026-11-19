@@ -1,3 +1,4 @@
+import { returnToArticlePool } from './focused-editor-navigation';
 import {
   expect,
   _electron as electron,
@@ -17,12 +18,31 @@ import { makeDraftTask } from '../fixtures/draft-task';
 // Public bridge only: never open the merchant entry or manufacture readiness.
 export async function exerciseDraftBridge(
   app: ElectronApplication,
+  options: { occupied?: boolean } = {},
 ): Promise<void> {
   const page = await app.firstWindow();
   const root = await app.evaluate(({ app }) => app.getPath('userData'));
   const before = await page.evaluate(() => window.desktopApi.getDraftState());
   expect(before.session.status).toBe('closed');
   expect(before.preparation).toBeNull();
+  expect(
+    await page.evaluate(() => window.desktopApi.getBrowserHealth()),
+  ).toEqual(
+    options.occupied
+      ? { status: 'busy', version: null, stage: null, reason: 'task_busy' }
+      : { status: 'unchecked', version: null, stage: null, reason: null },
+  );
+  for (const method of ['checkBrowserHealth', 'openBrowserUpdate'] as const) {
+    await expect(
+      page.evaluate(
+        (method) =>
+          window.desktopApi[method].apply(null, [
+            'edge://settings/help',
+          ] as never),
+        method,
+      ),
+    ).rejects.toThrow();
+  }
   for (let n = 0; n < 3; n++)
     expect(
       await page.evaluate(() => window.desktopApi.getDraftState()),
@@ -114,7 +134,7 @@ export async function checkDraftRecovery(
         ).toBeVisible();
         expect(
           await page.evaluate(() => window.desktopApi.getAppStatus()),
-        ).toMatchObject({ state: 'ready', schemaVersion: 14 });
+        ).toMatchObject({ state: 'ready', schemaVersion: 15 });
         expect(
           await page.evaluate(() => window.desktopApi.listArticles()),
         ).toMatchObject({
@@ -123,7 +143,9 @@ export async function checkDraftRecovery(
             items: [{ articleKey: article.articleKey, title: article.title }],
           },
         });
-        await exerciseDraftBridge(app);
+        // Run 1 restarts onto an interrupted task; AC5 keeps the check disabled
+        // until that occupancy settles.
+        await exerciseDraftBridge(app, { occupied: run === 1 });
         const state = await page.evaluate(() =>
           window.desktopApi.getDraftState(),
         );
@@ -165,12 +187,18 @@ export async function checkDraftRecovery(
               { exact: true },
             ),
           ).toBeVisible();
+          if (
+            await page
+              .getByRole('button', { name: '返回文章池', exact: true })
+              .isVisible()
+          )
+            await returnToArticlePool(page);
           await page
             .getByRole('button', { name: '新建文章', exact: true })
             .click();
           await expect(
-            page.getByRole('button', { name: '手动录入', exact: true }),
-          ).toBeVisible();
+            page.getByRole('textbox', { name: '文章正文', exact: true }),
+          ).toBeEditable();
         }
       } finally {
         await app.close();

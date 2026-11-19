@@ -1,6 +1,6 @@
 import type { ArticleDeletionRepository } from './article-delete';
 import type { SaveReceipt } from '../../contracts/article-revision';
-import type { PersistedEditorBodyV1 } from '../../contracts/manual-edit';
+import type { PersistedEditorBody } from '../../contracts/rich-text-body';
 import type { ArticlePackageV1 } from '../../contracts/article-package';
 import type { ManualImageCapability } from './manual-images';
 import type {
@@ -45,7 +45,7 @@ export interface ArticleRepository extends Pick<
   commit(
     attempt: ImportAttempt,
     article: StoredArticle,
-    context?: { receipt: SaveReceipt; editorBody: PersistedEditorBodyV1 },
+    context?: { receipt: SaveReceipt; editorBody: PersistedEditorBody },
   ): void;
   markAttempt(importId: string, status: ImportAttempt['status']): void;
   forgetAttempt(importId: string): void;

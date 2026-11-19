@@ -1,4 +1,12 @@
 import {
+  createManualCoverState,
+  type ManualCoverServices,
+} from './manual-cover';
+import type { ManualArticleApi } from '../contracts/manual-article';
+import { isManualImageBlock } from '../contracts/manual-rich-draft';
+import type { PasteSummary } from '../contracts/web-paste';
+import type { ManualFragmentV2 } from '../contracts/manual-rich-draft';
+import {
   ManualDraftSchema,
   ManualImageSchema,
   manualRequests,
@@ -30,13 +38,13 @@ import {
   manualSessionFromEditable,
   type ManualSession,
 } from './manual-article-mapper';
-import { deriveEditorBody } from '../domain/article-edit';
+import { richBodyEquals, upgradeEditorBody } from '../domain/rich-text-body';
 import {
   selectManualRange,
   spliceManualRange,
 } from '../domain/manual-draft-range';
 import { WebPasteFailure } from '../domain/web-paste-error';
-import { admitManualPaste } from './manual-paste-admission';
+import { admitRichManualPaste } from './manual-paste-admission';
 import {
   runManualPasteImages,
   isPasteSource,
@@ -45,6 +53,7 @@ import {
 import type { ManualPasteControllerPorts } from '../domain/ports/web-paste';
 
 export interface ManualDocumentServices {
+  covers?: ManualCoverServices;
   createEditorCompatibilityLease(
     articleKey: string,
     sessionId: string,
@@ -93,7 +102,7 @@ export interface ManualDocumentCommandPorts extends ManualPasteControllerPorts {
     signal: AbortSignal,
   ): Promise<ManualImage | undefined>;
   rememberPasteItems(items: readonly PasteRunItem[]): void;
-  onSessionRelease(listener: (sessionId: string) => void): void;
+  onSessionRelease(listener: (sessionId: string) => void | Promise<void>): void;
   services?: ManualDocumentServices;
 }
 type KnownCommand = DocumentCommand & { digest: string };
@@ -126,7 +135,22 @@ export interface ManualLegacyDocumentCommands {
 }
 export function createManualDocumentCommands(
   ports: ManualDocumentCommandPorts,
-): ContinuousManualArticleApi & ManualLegacyDocumentCommands {
+): ContinuousManualArticleApi &
+  ManualLegacyDocumentCommands &
+  Pick<
+    ManualArticleApi,
+    | 'pickManualCoverImage'
+    | 'setManualCoverMode'
+    | 'getManualCoverImage'
+    | 'reconcileManualCoverSave'
+  > {
+  const covers = createManualCoverState({
+    services: ports.services?.covers,
+    newId: ports.newId,
+    digest: (value) => ports.services!.digest(value),
+    loadEditableArticle: (key) => ports.services!.loadEditableArticle(key),
+    gate: ports.gate,
+  });
   let boundSession: string | undefined;
   let compatibilityLease: EditorCompatibilityLease | undefined;
   let compatibilitySession: string | undefined;
@@ -163,6 +187,7 @@ export function createManualDocumentCommands(
       imageKeys.clear();
       pendingKeys.clear();
     }
+    covers.initialize(value);
     for (const block of value.draft.blocks) {
       if (block.type === 'image')
         imageKeys.set(block.blockKey, block.imageToken);
@@ -205,6 +230,7 @@ export function createManualDocumentCommands(
       command.clientSequence >= Number.MAX_SAFE_INTEGER
     )
       return ports.reply('conflict');
+    if (covers.unknown(s)) return ports.reply('unavailable');
     const ready =
       Array.isArray(payload) && payload[0] === 'edit'
         ? ports.editGate()
@@ -241,7 +267,9 @@ export function createManualDocumentCommands(
     s.revision++;
   }
   function confirm(s: ManualSession, draft: ManualDraft) {
-    if (JSON.stringify(s.draft) !== JSON.stringify(draft)) {
+    if (
+      JSON.stringify(ManualDraftSchema.parse(s.draft)) !== JSON.stringify(draft)
+    ) {
       s.draft = draft;
       s.documentRevision++;
       s.dirty = true;
@@ -263,15 +291,16 @@ export function createManualDocumentCommands(
   }
   function authorized(s: ManualSession, draft: ManualDraft): boolean {
     const positions = (d: ManualDraft) =>
-      d.blocks.filter((b) => b.type !== 'paragraph').length;
+      d.blocks.filter(isManualImageBlock).length;
     if (positions(draft) > compatibilityCeiling) return false;
     return draft.blocks.every(
       (b) =>
-        b.type === 'paragraph' ||
+        !isManualImageBlock(b) ||
         (b.type === 'image'
           ? imageKeys.get(b.blockKey) === b.imageToken &&
             s.images.some((i) => i.imageToken === b.imageToken)
-          : pendingKeys.get(b.blockKey) === b.candidateId),
+          : b.type === 'image-pending' &&
+            pendingKeys.get(b.blockKey) === b.candidateId),
     );
   }
   function rangeValid(s: ManualSession, range: DraftRange): boolean {
@@ -282,10 +311,18 @@ export function createManualDocumentCommands(
       return false;
     }
   }
-  async function acceptDraft(s: ManualSession, draft: ManualDraft) {
-    const next = { ...s, draft };
+  async function acceptDraft(
+    s: ManualSession,
+    draft: ManualDraft,
+    images = s.images,
+    signal?: AbortSignal,
+  ) {
+    const next = { ...s, draft, images };
     if (!(await ports.retain(next)))
       throw new WebPasteFailure('RECOVERY_REQUIRED');
+    if (signal?.aborted) throw new WebPasteFailure('CANCELLED');
+    if (ports.current() !== s) throw new WebPasteFailure('RECOVERY_REQUIRED');
+    s.images = images;
     confirm(s, draft);
   }
   async function bindSavedImages(s: ManualSession, editable: EditableArticle) {
@@ -311,11 +348,24 @@ export function createManualDocumentCommands(
   }
   async function save(
     s: ManualSession,
-    input: RevisionSaveInput,
+    input: RevisionSaveInput | undefined,
     operationId: string,
     close: boolean,
     signal: AbortSignal,
   ) {
+    if (!input) {
+      if (!s.dirty && s.target.kind === 'existing') {
+        await covers.save(s, signal);
+        const known = saves.get(operationId);
+        if (known) known.status = 'unchanged';
+        if (close && !s.cover?.dirty && !covers.unknown(s)) {
+          if (ports.gate() !== 'ready' || !(await ports.release(s)))
+            throw new WebPasteFailure('RECOVERY_REQUIRED');
+          ports.replace({ state: 'idle', revision: s.revision + 1 });
+        }
+      }
+      return;
+    }
     const result = await ports.services!.saveRevision(input, signal);
     const known = saves.get(operationId);
     if (known)
@@ -351,9 +401,10 @@ export function createManualDocumentCommands(
         editable.articleRevision !== articleRevision ||
         editable.article.title !== input.title ||
         editable.article.contentDeclaration !== input.contentDeclaration ||
-        JSON.stringify(
-          editable.editorBody ?? deriveEditorBody(editable.article.body),
-        ) !== JSON.stringify(input.editorBody)
+        !richBodyEquals(
+          upgradeEditorBody(editable.editorBody, editable.article.body),
+          input.editorBody,
+        )
       )
         throw new WebPasteFailure('RECOVERY_REQUIRED');
       // A receipt is commit evidence, never a source of an old document projection.
@@ -370,7 +421,8 @@ export function createManualDocumentCommands(
         throw new ManualVersionConflict();
       if (!afterBinding || afterBinding.articleRevision !== articleRevision)
         throw new WebPasteFailure('RECOVERY_REQUIRED');
-      if (close) {
+      await covers.save(s, signal);
+      if (close && !s.cover?.dirty && !covers.unknown(s)) {
         if (ports.gate() !== 'ready')
           throw new WebPasteFailure('RECOVERY_REQUIRED');
         if (!(await ports.release(s)))
@@ -386,6 +438,13 @@ export function createManualDocumentCommands(
       return invalid();
     const s = session();
     if (!s || s.sessionId !== command.sessionId) return ports.reply('conflict');
+    if (covers.unknown(s)) return ports.reply('unavailable');
+    if (
+      (s.cover?.dirty && command.expectedCoverDraftRevision === undefined) ||
+      (command.expectedCoverDraftRevision !== undefined &&
+        command.expectedCoverDraftRevision !== s.cover?.draftRevision)
+    )
+      return ports.reply('conflict');
     const rejected = rejectedSaves.get(command.operationId);
     if (rejected)
       return rejected.expectedDocumentRevision ===
@@ -394,7 +453,10 @@ export function createManualDocumentCommands(
         : ports.reply('conflict');
     const old = saves.get(command.operationId);
     if (old) {
-      if (old.expectedDocumentRevision !== command.expectedDocumentRevision)
+      if (
+        old.expectedCoverDraftRevision !== command.expectedCoverDraftRevision ||
+        old.expectedDocumentRevision !== command.expectedDocumentRevision
+      )
         return ports.reply('conflict');
       if (old.status !== 'failed') return ports.reply('ok');
       if (s.documentRevision !== command.expectedDocumentRevision)
@@ -460,9 +522,11 @@ export function createManualDocumentCommands(
       ];
       return ports.reply('invalid');
     }
+    if (s.cover?.dirty && s.cover.mode === 'single' && !s.cover.image)
+      return invalid('请选择一张封面图片后再保存。');
     if (s.draft.blocks.some((b) => b.type === 'image-pending'))
       return invalid();
-    let input: RevisionSaveInput;
+    let input: RevisionSaveInput | undefined;
     try {
       const editable =
         s.target.kind === 'existing'
@@ -484,16 +548,19 @@ export function createManualDocumentCommands(
         ports.versionConflict();
         return ports.reply('conflict');
       }
-      input = manualRevisionInput(
-        s,
-        command,
-        imageSources,
-        editable,
-        digest,
-        new Date().toISOString(),
-        compatibilityLease,
-      );
-      for (const source of input.images)
+      input =
+        !s.dirty && s.target.kind === 'existing' && s.cover?.dirty
+          ? undefined
+          : manualRevisionInput(
+              s,
+              command,
+              imageSources,
+              editable,
+              digest,
+              new Date().toISOString(),
+              compatibilityLease,
+            );
+      for (const source of input?.images ?? [])
         if (source.kind === 'temporary')
           imageSources.set(source.imageToken, source);
     } catch {
@@ -505,12 +572,13 @@ export function createManualDocumentCommands(
     saves.set(command.operationId, {
       ...command,
       input,
-      payloadDigest:
-        input.kind === 'created'
+      payloadDigest: input
+        ? input.kind === 'created'
           ? input.command.payloadDigest
-          : input.intent.payloadDigest,
+          : input.intent.payloadDigest
+        : digest(s.target),
       target: structuredClone(s.target),
-      ...(input.kind === 'updated'
+      ...(input?.kind === 'updated'
         ? { startedAt: input.intent.startedAt }
         : {}),
       status: 'pending',
@@ -520,12 +588,75 @@ export function createManualDocumentCommands(
       save(s, input, command.operationId, close, signal),
     );
   }
-  ports.onSessionRelease((sessionId) => {
+  ports.onSessionRelease(async (sessionId) => {
+    const current = ports.current();
+    if (
+      'sessionId' in current &&
+      current.sessionId === sessionId &&
+      covers.unknown(current)
+    )
+      throw Error('Cover outcome unknown');
+    await covers.release(sessionId);
     releaseCompatibility(sessionId);
     for (const prior of saves.values())
       if (prior.sessionId === sessionId) delete prior.input;
   });
+  function coverCheck(
+    command: import('../contracts/manual-article').ManualCoverEditCommand,
+  ) {
+    const s = session();
+    if (
+      !s ||
+      command.sessionId !== s.sessionId ||
+      command.expectedCoverDraftRevision !== s.cover?.draftRevision
+    )
+      return ports.reply('conflict');
+    if (ports.busy()) return ports.reply('busy');
+    const gate = ports.gate();
+    if (gate !== 'ready') return ports.reply(gate);
+    if (s.state !== 'editing' || covers.unknown(s))
+      return ports.reply('unavailable');
+    return undefined;
+  }
   return {
+    async pickManualCoverImage(command) {
+      if (!manualRequests.pickManualCoverImage.safeParse([command]).success)
+        return invalid();
+      const denied = coverCheck(command);
+      if (denied) return denied;
+      if (!ports.services?.covers) return ports.reply('unavailable');
+      const s = session()!;
+      return ports.run(s, 'image', (signal) => covers.pick(s, signal));
+    },
+    async setManualCoverMode(command, mode) {
+      if (!manualRequests.setManualCoverMode.safeParse([command, mode]).success)
+        return invalid();
+      const denied = coverCheck(command);
+      if (denied) return denied;
+      covers.mode(session()!, mode);
+      return ports.reply('ok');
+    },
+    async getManualCoverImage(sessionId, token) {
+      if (
+        !manualRequests.getManualCoverImage.safeParse([sessionId, token])
+          .success
+      )
+        return { status: 'not_found' };
+      const s = session();
+      if (!s || s.sessionId !== sessionId) return { status: 'not_found' };
+      return covers.read(s, token);
+    },
+    async reconcileManualCoverSave(sessionId) {
+      if (
+        !manualRequests.reconcileManualCoverSave.safeParse([sessionId]).success
+      )
+        return invalid();
+      const s = session();
+      if (!s || s.sessionId !== sessionId || ports.busy())
+        return ports.reply('busy');
+      if (ports.gate() !== 'ready') return ports.reply('unavailable');
+      return ports.run(s, 'save', () => covers.reconcile(s));
+    },
     invalidateLegacyTicket,
     confirmLegacyDocument(
       s,
@@ -537,7 +668,7 @@ export function createManualDocumentCommands(
       session();
       const parsed = ManualDraftSchema.safeParse(draft);
       const positions = (d: ManualDraft) =>
-        d.blocks.filter((b) => b.type !== 'paragraph').length;
+        d.blocks.filter(isManualImageBlock).length;
       if (
         !parsed.success ||
         images.length + candidates.length > 200 ||
@@ -554,7 +685,9 @@ export function createManualDocumentCommands(
         )
       )
         throw new WebPasteFailure('RECOVERY_REQUIRED');
-      const changed = JSON.stringify(s.draft) !== JSON.stringify(parsed.data);
+      const changed =
+        JSON.stringify(ManualDraftSchema.parse(s.draft)) !==
+        JSON.stringify(parsed.data);
       s.images = images;
       s.candidates = candidates;
       confirm(s, parsed.data);
@@ -578,7 +711,9 @@ export function createManualDocumentCommands(
               : b,
           ),
         };
-        const changed = JSON.stringify(s.draft) !== JSON.stringify(normalized);
+        const changed =
+          JSON.stringify(ManualDraftSchema.parse(s.draft)) !==
+          JSON.stringify(ManualDraftSchema.parse(normalized));
         await acceptDraft(s, normalized);
         if (changed) invalidateLegacyTicket(s);
         s.revision++;
@@ -613,7 +748,8 @@ export function createManualDocumentCommands(
       if (ready !== 'ready') return ports.reply(ready);
       if (ports.busy()) return ports.reply('busy');
       const old = session();
-      if (old?.dirty) return ports.reply('conflict');
+      if (old && (old.dirty || old.cover?.dirty || covers.unknown(old)))
+        return ports.reply('conflict');
       if (!ports.services) return ports.reply('unavailable');
       let editable: EditableArticle | undefined;
       try {
@@ -633,11 +769,12 @@ export function createManualDocumentCommands(
         ports.current().revision + 1,
         ports.newId,
       );
+      covers.initialize(s);
       ports.replace(s);
       session();
       compatibilityCeiling = Math.max(
         200,
-        s.draft.blocks.filter((b) => b.type !== 'paragraph').length,
+        s.draft.blocks.filter(isManualImageBlock).length,
       );
       if (compatibilityCeiling > 200) {
         compatibilityLease = ports.services.createEditorCompatibilityLease(
@@ -721,6 +858,18 @@ export function createManualDocumentCommands(
       if ('kind' in input && !ports.services) return invalid();
       return ports.run(s, 'paste', async (signal) => {
         let items: PasteRunItem[] = [];
+        const summary: PasteSummary = {
+          jobId: s.jobId!,
+          kind: 'paste',
+          outcome: 'rejected',
+          admitted: false,
+          paragraphs: 0,
+          imagePositions: 0,
+          unresolved: 0,
+          plainOnly: false,
+          warnings: [],
+        };
+        s.pasteSummary = summary;
         if ('kind' in input) {
           const pasted = await ports.services!.clipboard.paste(
             input.grantId,
@@ -733,15 +882,12 @@ export function createManualDocumentCommands(
           const proposal = spliceManualRange(
             s.draft,
             range,
-            pasted.blocks,
+            pasted.fragment,
             ports.newId,
           );
           if (
-            proposal.blocks.filter((b) => b.type !== 'paragraph').length >
-            Math.max(
-              200,
-              s.draft.blocks.filter((b) => b.type !== 'paragraph').length,
-            )
+            proposal.blocks.filter(isManualImageBlock).length >
+            Math.max(200, s.draft.blocks.filter(isManualImageBlock).length)
           )
             throw new WebPasteFailure('INPUT_LIMIT');
           const known = new Set(s.images.map((i) => i.imageToken));
@@ -759,23 +905,44 @@ export function createManualDocumentCommands(
               200 * 1024 * 1024
           )
             throw new WebPasteFailure('IMAGE_LIMIT');
-          s.images.push(...fresh);
-          await acceptDraft(s, proposal);
+          await acceptDraft(s, proposal, [...s.images, ...fresh], signal);
+          summary.paragraphs = pasted.fragment.blocks.reduce(
+            (n, b) =>
+              n +
+              (b.type === 'list'
+                ? b.items.length
+                : b.type === 'blockquote'
+                  ? b.paragraphs.length
+                  : isManualImageBlock(b)
+                    ? 0
+                    : 1),
+            0,
+          );
+          summary.imagePositions =
+            pasted.fragment.blocks.filter(isManualImageBlock).length;
         } else {
           const converted = await ports.converter.convert(input, signal);
           signal.throwIfAborted();
-          const admitted = admitManualPaste(
+          const admitted = admitRichManualPaste(
             s,
             converted,
-            undefined,
             ports.newId,
             range,
           );
-          await acceptDraft(s, admitted.draft);
+          await acceptDraft(s, admitted.draft, s.images, signal);
+          Object.assign(summary, {
+            paragraphs: admitted.paragraphs,
+            plainOnly: admitted.plainOnly,
+            warnings: admitted.warnings,
+            imagePositions: admitted.items.length,
+          });
           s.candidates.push(...admitted.candidates);
           items = admitted.items;
           ports.rememberPasteItems(items);
         }
+        summary.admitted = true;
+        summary.unresolved = items.length;
+        summary.outcome = items.length ? 'partial' : 'completed';
         s.pasteProgress = {
           jobId: s.jobId!,
           kind: 'paste',
@@ -862,6 +1029,14 @@ export function createManualDocumentCommands(
             s.revision++;
           },
         );
+        summary.unresolved = items.filter((i) =>
+          s.candidates.some((c) => c.candidateId === i.candidateId),
+        ).length;
+        summary.outcome = signal.aborted
+          ? 'cancelled'
+          : summary.unresolved
+            ? 'partial'
+            : 'completed';
       });
     },
     async insertManualImage(command, range) {
@@ -892,25 +1067,26 @@ export function createManualDocumentCommands(
         const proposal = spliceManualRange(
           s.draft,
           range,
-          [
-            {
-              type: 'image',
-              blockKey: ports.newId(),
-              imageToken: image.imageToken,
-            },
-          ],
+          {
+            version: 2,
+            openStart: false,
+            openEnd: false,
+            blocks: [
+              {
+                type: 'image',
+                blockKey: ports.newId(),
+                imageToken: image.imageToken,
+              },
+            ],
+          },
           ports.newId,
         );
         if (
-          proposal.blocks.filter((b) => b.type !== 'paragraph').length >
-          Math.max(
-            200,
-            s.draft.blocks.filter((b) => b.type !== 'paragraph').length,
-          )
+          proposal.blocks.filter(isManualImageBlock).length >
+          Math.max(200, s.draft.blocks.filter(isManualImageBlock).length)
         )
           throw new WebPasteFailure('INPUT_LIMIT');
-        s.images.push(image);
-        await acceptDraft(s, proposal);
+        await acceptDraft(s, proposal, [...s.images, image], signal);
         accept(s, command, payload);
       });
     },
@@ -935,6 +1111,7 @@ export function createManualDocumentCommands(
           {
             sessionId: s.sessionId,
             expectedDocumentRevision: s.documentRevision,
+            expectedCoverDraftRevision: s.cover?.draftRevision,
             operationId: s.nextSaveOperationId,
           },
           true,
@@ -963,11 +1140,16 @@ export function createManualDocumentCommands(
       const s = session()!;
       if (!ports.services) return ports.reply('unavailable');
       reserve(s, command, payload);
-      let selected: ManualDraft['blocks'], proposal: ManualDraft;
+      let selected: ManualFragmentV2, proposal: ManualDraft;
       try {
         selected = selectManualRange(s.draft, range);
         proposal = cut
-          ? spliceManualRange(s.draft, range, [], ports.newId)
+          ? spliceManualRange(
+              s.draft,
+              range,
+              { version: 2, blocks: [], openStart: false, openEnd: false },
+              ports.newId,
+            )
           : s.draft;
       } catch {
         return invalid();
@@ -983,7 +1165,7 @@ export function createManualDocumentCommands(
         signal.throwIfAborted();
         if (ports.current() !== s || s.documentRevision !== revision)
           throw new WebPasteFailure('RECOVERY_REQUIRED');
-        if (cut) await acceptDraft(s, proposal);
+        if (cut) await acceptDraft(s, proposal, s.images, signal);
         accept(s, command, payload);
       });
     },

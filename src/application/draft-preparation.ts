@@ -1,3 +1,13 @@
+import {
+  DraftContentCapabilitiesSchema,
+  type DraftContentCapabilities,
+} from '../contracts/draft-content';
+import { snapshotImageCount } from '../contracts/draft-task';
+import {
+  checkContentSupport,
+  submissionContentEquivalent,
+} from '../domain/draft-content';
+import { upgradeEditorBody } from '../domain/rich-text-body';
 import type {
   AttemptIntent,
   DraftSnapshot,
@@ -82,6 +92,7 @@ export interface DraftPreparation {
         snapshot: DraftSnapshot;
         store: StoreBinding;
         generation: string;
+        capabilityRevision: string;
         articleRevision: number;
         coverSnapshot: CoverTaskSnapshot;
       }
@@ -90,6 +101,7 @@ export interface DraftPreparation {
 }
 
 export function createDraftPreparation(deps: {
+  contentCapabilities(): DraftContentCapabilities;
   repository: Pick<ArticleRevisionRepository, 'loadEditableArticle'>;
   covers: Pick<ArticleCoverRepository, 'loadCover'>;
   snapshots: SnapshotPort;
@@ -104,6 +116,7 @@ export function createDraftPreparation(deps: {
       snapshot: DraftSnapshot;
       store: StoreBinding;
       generation: string;
+      capabilityRevision: string;
       articleRevision: number;
       coverSnapshot: CoverTaskSnapshot;
     }
@@ -173,6 +186,21 @@ export function createDraftPreparation(deps: {
         if (length < 5 || length > 30)
           return { status: 'blocked', reason: 'TITLE_UNSUPPORTED' };
       }
+      let capabilities: DraftContentCapabilities;
+      try {
+        capabilities = DraftContentCapabilitiesSchema.parse(
+          deps.contentCapabilities(),
+        );
+        if (
+          !checkContentSupport(
+            upgradeEditorBody(editable.editorBody, article.body),
+            capabilities,
+          ).ok
+        )
+          return { status: 'blocked', reason: 'FORMAT_UNSUPPORTED' };
+      } catch {
+        return { status: 'blocked', reason: 'PAGE_CHANGED' };
+      }
       let coverSnapshot: CoverTaskSnapshot;
       try {
         const config = deps.covers.loadCover(articleKey);
@@ -183,46 +211,75 @@ export function createDraftPreparation(deps: {
       }
       let snapshot: DraftSnapshot;
       try {
-        snapshot = await deps.snapshots.capture(article);
+        snapshot = await deps.snapshots.capture(editable);
       } catch (error) {
         return { status: 'blocked', reason: mappedReason(error) };
       }
-      let currentCover;
-      try {
-        currentCover = deps.covers.loadCover(articleKey);
-      } catch {
-        return { status: 'blocked', reason: 'STORAGE_UNAVAILABLE' };
-      }
-      if (
-        !currentCover ||
-        currentCover.coverRevision !== coverSnapshot.coverRevision ||
-        currentCover.configurationDigest !== coverSnapshot.digest ||
-        deps.repository.loadEditableArticle(articleKey)?.articleRevision !==
-          articleRevision ||
-        session !== offered ||
-        session.generation !== offered.generation ||
-        session.token !== bindingToken
-      )
-        return { status: 'blocked', reason: 'STALE_PREPARATION' };
+      const currentReason = (): ReasonCode | undefined => {
+        try {
+          if (
+            DraftContentCapabilitiesSchema.parse(deps.contentCapabilities())
+              .revision !== capabilities.revision
+          )
+            return 'STALE_PREPARATION';
+        } catch {
+          return 'PAGE_CHANGED';
+        }
+        try {
+          const currentCover = deps.covers.loadCover(articleKey);
+          if (
+            !currentCover ||
+            currentCover.coverRevision !== coverSnapshot.coverRevision ||
+            currentCover.configurationDigest !== coverSnapshot.digest ||
+            deps.repository.loadEditableArticle(articleKey)?.articleRevision !==
+              articleRevision ||
+            session !== offered ||
+            session.generation !== offered.generation ||
+            session.token !== bindingToken
+          )
+            return 'STALE_PREPARATION';
+        } catch {
+          return 'STORAGE_UNAVAILABLE';
+        }
+        return undefined;
+      };
+      const stale = currentReason();
+      if (stale) return { status: 'blocked', reason: stale };
       const submitted =
         existing &&
         ['draft_saved', 'submission_recorded'].includes(existing.state);
       if (submitted && intent === 'default') {
         if (existing.articleRevision == null || !existing.coverPlan)
           return { status: 'blocked', reason: 'NEW_ATTEMPT_REQUIRED' };
+        try {
+          await deps.snapshots.verify(existing.snapshot);
+        } catch {
+          return { status: 'blocked', reason: 'NEW_ATTEMPT_REQUIRED' };
+        }
+        const afterHistory = currentReason();
+        if (afterHistory) return { status: 'blocked', reason: afterHistory };
+        const equivalent = submissionContentEquivalent(
+          existing.snapshot,
+          snapshot,
+        );
+        if (equivalent === 'unknown')
+          return { status: 'blocked', reason: 'NEW_ATTEMPT_REQUIRED' };
         if (
-          existing.snapshot.digest === snapshot.digest &&
+          equivalent === 'equal' &&
           existing.articleRevision === articleRevision &&
           existing.coverPlan.snapshot.digest === coverSnapshot.digest &&
           existing.coverPlan.snapshot.coverRevision ===
             coverSnapshot.coverRevision &&
-          existing.store.storeKey === offered.store.storeKey
+          existing.store.storeKey === offered.store.storeKey &&
+          JSON.stringify(existing.store.identity) ===
+            JSON.stringify(offered.store.identity)
         )
           return { status: 'existing', task: taskView(existing) };
       }
       const preparationId = StorageIdSchema.parse(deps.newId());
       preparations.set(preparationId, {
         articleRevision,
+        capabilityRevision: capabilities.revision,
         coverSnapshot: structuredClone(coverSnapshot),
         snapshot: structuredClone(snapshot),
         store: structuredClone(offered.store),
@@ -237,9 +294,7 @@ export function createDraftPreparation(deps: {
           articleKey: snapshot.article.articleKey,
           title: snapshot.article.title,
           storeName: offered.store.displayName,
-          bodyImageCount: snapshot.article.body.filter(
-            (block) => block.type === 'image',
-          ).length,
+          bodyImageCount: snapshotImageCount(snapshot),
           contentDeclaration: snapshot.article.contentDeclaration,
           mode: 'draft',
           coverPolicy: 'local-upload-v1',
@@ -248,7 +303,17 @@ export function createDraftPreparation(deps: {
     },
     take(preparationId) {
       const value = preparations.get(preparationId);
-      return value === undefined ? undefined : structuredClone(value);
+      if (!value) return undefined;
+      try {
+        if (
+          DraftContentCapabilitiesSchema.parse(deps.contentCapabilities())
+            .revision !== value.capabilityRevision
+        )
+          return undefined;
+      } catch {
+        return undefined;
+      }
+      return structuredClone(value);
     },
     invalidate,
   };

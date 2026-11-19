@@ -1,3 +1,4 @@
+import { upgradeManualFragment } from '../../src/domain/manual-draft-version';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
   createManualClipboard,
@@ -58,7 +59,12 @@ it('cross_article_grant creates independent ownership that survives source close
       expect(text).toBe('A<&\n[图片]');
     },
   });
-  await store.copy(id(1), blocks, [image], new AbortController().signal);
+  await store.copy(
+    id(1),
+    upgradeManualFragment(blocks),
+    [image],
+    new AbortController().signal,
+  );
   await source.release(id(1));
   const copied = await store.paste(
     grant,
@@ -67,7 +73,7 @@ it('cross_article_grant creates independent ownership that survives source close
     [],
   );
   expect(copied.images[0].imageToken).not.toBe(image.imageToken);
-  expect(copied.blocks[1]).toMatchObject({
+  expect(copied.fragment.blocks[1]).toMatchObject({
     imageToken: copied.images[0].imageToken,
   });
   expect(owned.has(id(1))).toBe(false);
@@ -87,11 +93,21 @@ it('failed replacement preserves the old valid grant and retires prepared owners
       grant = g;
     },
   });
-  await store.copy(id(1), blocks, [image], new AbortController().signal);
+  await store.copy(
+    id(1),
+    upgradeManualFragment(blocks),
+    [image],
+    new AbortController().signal,
+  );
   const before = grant;
   fail = true;
   await expect(
-    store.copy(id(1), blocks, [image], new AbortController().signal),
+    store.copy(
+      id(1),
+      upgradeManualFragment(blocks),
+      [image],
+      new AbortController().signal,
+    ),
   ).rejects.toMatchObject({ code: 'INPUT_LIMIT' });
   expect(grant).toBe(before);
   expect(owned.size).toBe(2);
@@ -120,12 +136,17 @@ it('reserves the old plus replacement image budget before preparing or writing',
   });
   await store.copy(
     id(1),
-    manyBlocks,
+    upgradeManualFragment(manyBlocks),
     sourceImages,
     new AbortController().signal,
   );
   await expect(
-    store.copy(id(1), manyBlocks, sourceImages, new AbortController().signal),
+    store.copy(
+      id(1),
+      upgradeManualFragment(manyBlocks),
+      sourceImages,
+      new AbortController().signal,
+    ),
   ).rejects.toMatchObject({ code: 'IMAGE_LIMIT' });
   expect(writes).toBe(1);
   await store.drain();
@@ -140,7 +161,12 @@ it('expiry waits for an owned read, then revokes the grant without dropping retu
       grant = g;
     },
   });
-  await store.copy(id(1), blocks, [image], new AbortController().signal);
+  await store.copy(
+    id(1),
+    upgradeManualFragment(blocks),
+    [image],
+    new AbortController().signal,
+  );
   const original = source.read;
   source.read = async (...args) => {
     await new Promise<void>((r) => {
@@ -166,7 +192,12 @@ it('timer cleanup failure closes readiness immediately, even without another Cop
   vi.useFakeTimers();
   const { source, image } = registry();
   const store = createManualClipboard(source, { write: async () => {} });
-  await store.copy(id(1), blocks, [image], new AbortController().signal);
+  await store.copy(
+    id(1),
+    upgradeManualFragment(blocks),
+    [image],
+    new AbortController().signal,
+  );
   source.release = async () => {
     throw Error('Owned cleanup unknown');
   };
@@ -216,4 +247,181 @@ it('native fragment port writes one escaped owned batch and accepts exact readba
         encodeManualClipboardFragment(id(11), 'y'),
     ),
   ).toBeUndefined();
+});
+
+it('versioned rich grant retains open ends, actual list start, deep copies and rekeys nested leaves', async () => {
+  const { source } = registry();
+  let grant = '';
+  let selectedText = '';
+  const store = createManualClipboard(source, {
+    write: async (g, text) => {
+      grant = g;
+      selectedText = text;
+    },
+  });
+  const fragment = {
+    version: 2 as const,
+    openStart: true,
+    openEnd: true,
+    blocks: [
+      {
+        type: 'list' as const,
+        kind: 'ordered' as const,
+        start: 8,
+        blockKey: id(70),
+        items: [
+          {
+            type: 'paragraph' as const,
+            blockKey: id(71),
+            content: [
+              {
+                type: 'text' as const,
+                text: '😀\nX',
+                marks: ['bold' as const],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  await store.copy(id(1), fragment, [], new AbortController().signal);
+  fragment.blocks[0].items[0].content[0].text = 'mutated';
+  const pasted = await store.paste(
+    grant,
+    id(5),
+    new AbortController().signal,
+    [],
+  );
+  expect(pasted.fragment).toMatchObject({
+    version: 2,
+    openStart: true,
+    openEnd: true,
+    blocks: [
+      {
+        type: 'list',
+        kind: 'ordered',
+        start: 8,
+        items: [{ content: [{ text: '😀\nX', marks: ['bold'] }] }],
+      },
+    ],
+  });
+  expect(selectedText).toBe('😀\nX');
+  const list = pasted.fragment.blocks[0];
+  expect(list.blockKey).not.toBe(id(70));
+  if (list.type !== 'list') throw Error('Expected list');
+  expect(list.items[0].blockKey).not.toBe(id(71));
+  list.items[0].content[0].marks = [];
+  const second = await store.paste(
+    grant,
+    id(6),
+    new AbortController().signal,
+    [],
+  );
+  expect(second.fragment.blocks[0]).toMatchObject({
+    items: [{ content: [{ marks: ['bold'] }] }],
+  });
+  await store.drain();
+});
+it('versioned grant preserves closed whole paragraph boundaries', async () => {
+  const { source } = registry();
+  let grant = '';
+  const store = createManualClipboard(source, {
+    write: async (g) => {
+      grant = g;
+    },
+  });
+  const fragment = {
+    version: 2 as const,
+    openStart: false,
+    openEnd: false,
+    blocks: [
+      {
+        type: 'paragraph' as const,
+        blockKey: id(50),
+        content: [{ type: 'text' as const, text: 'whole', marks: [] }],
+      },
+    ],
+  };
+  await store.copy(id(1), fragment, [], new AbortController().signal);
+  expect(
+    (await store.paste(grant, id(5), new AbortController().signal, []))
+      .fragment,
+  ).toMatchObject({ openStart: false, openEnd: false });
+  await store.drain();
+});
+
+it('cancelled late native copy cannot replace the active grant or authorize a later paste', async () => {
+  const { source, image } = registry();
+  let grant = '';
+  let release!: () => void;
+  let delay = false;
+  const store = createManualClipboard(source, {
+    write: async (g) => {
+      if (delay)
+        await new Promise<void>((r) => {
+          release = r;
+        });
+      grant = g;
+    },
+  });
+  await store.copy(
+    id(1),
+    upgradeManualFragment(blocks),
+    [image],
+    new AbortController().signal,
+  );
+  const previous = grant;
+  delay = true;
+  const abort = new AbortController();
+  const copying = store.copy(
+    id(1),
+    upgradeManualFragment(blocks),
+    [image],
+    abort.signal,
+  );
+  for (let i = 0; i < 10 && !release; i++) await Promise.resolve();
+  abort.abort();
+  release();
+  await expect(copying).rejects.toMatchObject({ code: 'CANCELLED' });
+  await expect(
+    store.paste(grant, id(5), new AbortController().signal, []),
+  ).rejects.toMatchObject({ code: 'INPUT_LIMIT' });
+  expect(
+    (await store.paste(previous, id(5), new AbortController().signal, []))
+      .fragment.blocks,
+  ).toHaveLength(2);
+  await store.drain();
+});
+it('aborted late image authorization is retained out of the destination and never returned', async () => {
+  const { source, image, owned } = registry();
+  let grant = '';
+  const store = createManualClipboard(source, {
+    write: async (g) => {
+      grant = g;
+    },
+  });
+  await store.copy(
+    id(1),
+    upgradeManualFragment(blocks),
+    [image],
+    new AbortController().signal,
+  );
+  const authorize = source.authorizeBytes;
+  let release!: () => void;
+  source.authorizeBytes = async (...args) => {
+    const value = await authorize(...args);
+    await new Promise<void>((r) => {
+      release = r;
+    });
+    return value;
+  };
+  const abort = new AbortController();
+  const pasting = store.paste(grant, id(5), abort.signal, []);
+  for (let i = 0; i < 10 && !release; i++) await Promise.resolve();
+  abort.abort();
+  release();
+  await expect(pasting).rejects.toThrow();
+  expect(owned.get(id(5))?.size ?? 0).toBe(0);
+  await store.drain();
 });

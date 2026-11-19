@@ -58,19 +58,20 @@ test('unreadable_library_option: never confirm; safe cancellation', async ({
   expect(await f.actions()).not.toContain('confirm:false');
   expect(await f.actions()).toContain('cancel');
 });
-test('partial_triple: two items retain positions, no conversion/retry', async ({
+test('partial_triple: one retry then a closed, unchanged blocked proof', async ({
   page,
 }) => {
   const f = await installCoverFixture(page, { partial: true });
   const result = await f.upload(coverInput('triple'), () => false);
-  expect(result.status).toBe('recoverable_failure');
-  if (result.status === 'recoverable_failure') {
-    expect(result.reason).toBe('UPLOAD_INCOMPLETE');
-    expect(result.items.map((i) => i.position)).toEqual([0, 1]);
-  }
+  expect(result).toMatchObject({
+    status: 'blocked',
+    reason: 'COVER_UPLOAD_FAILED',
+    safeEditorProof: { modalClosed: true, uploadsSettled: true },
+  });
   expect(
     (await f.actions()).filter((a) => a.startsWith('upload:')),
-  ).toHaveLength(1);
+  ).toHaveLength(2);
+  expect((await f.actions()).filter((a) => a === 'cancel')).toHaveLength(2);
   expect(await f.actions()).not.toContain('confirm:false');
 });
 test('late_upload_after_cancel: closed modal is not settlement', async ({
@@ -97,7 +98,9 @@ for (const drift of [
     async ({ page }) => {
       const f = await installCoverFixture(page, { rejected: true, drift });
       const result = await f.upload(coverInput('single'), () => false);
-      expect(result.status).toBe(drift ? 'blocked' : 'recoverable_failure');
+      expect(result.status).toBe(
+        drift && drift !== 'body' ? 'blocked' : 'recoverable_failure',
+      );
       if (result.status === 'recoverable_failure') {
         expect(result.reason).toBe('UPLOAD_REJECTED');
         expect(result.safeEditorProof).toMatchObject({
@@ -182,10 +185,22 @@ for (const fault of [
         return o;
       };
       const result = await f.upload(coverInput('triple'), () => false);
-      expect(result).toEqual({ status: 'blocked', reason: 'PAGE_CHANGED' });
-      expect((await f.actions()).some((a) => a.startsWith('confirm:'))).toBe(
-        false,
-      );
+      if (['association', 'order', 'loaded'].includes(fault)) {
+        expect(result).toMatchObject({
+          status: 'recoverable_failure',
+          reason: 'UPLOAD_INCOMPLETE',
+          items: [],
+          safeEditorProof: { modalClosed: true, uploadsSettled: true },
+        });
+        const actions = await f.actions();
+        expect(actions.filter((a) => a === 'cancel')).toHaveLength(1);
+        expect(actions.some((a) => a.startsWith('confirm:'))).toBe(false);
+      } else {
+        expect(result).toEqual({ status: 'blocked', reason: 'PAGE_CHANGED' });
+        expect((await f.actions()).some((a) => a.startsWith('confirm:'))).toBe(
+          false,
+        );
+      }
     },
   );
 }
@@ -358,7 +373,7 @@ test('overlapping calls never start another upload', async ({ page }) => {
   f.driver.waitForUpload = async () => {
     reached();
     await hold;
-    await original();
+    return await original();
   };
   const first = f.upload(coverInput('single'), () => false);
   await atWait;
@@ -429,20 +444,20 @@ for (const scenario of ['complete', 'partial', 'late'] as const) {
       calls: h.calls,
       report: h.durable().coverPlan?.report,
     }).toMatchObject({
-      result: { status: scenario === 'late' ? 'blocked' : 'verified' },
+      result: { status: scenario === 'complete' ? 'verified' : 'blocked' },
     });
     expect(h.calls.filter((c) => c === 'save')).toHaveLength(
-      scenario === 'late' ? 0 : 1,
+      scenario === 'complete' ? 1 : 0,
     );
     expect(
       (await f.actions()).filter((a) => a.startsWith('upload:')),
-    ).toHaveLength(1);
+    ).toHaveLength(scenario === 'partial' ? 2 : 1);
     if (scenario === 'complete')
       expect(h.durable().coverPlan?.report.phase).toBe('confirmed');
     if (scenario === 'partial')
       expect(h.durable().coverPlan?.report).toMatchObject({
         phase: 'failed',
-        reason: 'UPLOAD_INCOMPLETE',
+        reason: 'COVER_UPLOAD_FAILED',
         requestedMode: 'triple',
         expectedCount: 3,
       });

@@ -1,4 +1,16 @@
 import {
+  OPEN_UPLOAD_SETTINGS,
+  UploadWaitSettingsSchema,
+  waitSettingsChannels,
+  waitSettingsRequests,
+} from '../../contracts/upload-wait-settings';
+import {
+  browserHealthChannels,
+  browserHealthRequestSchemas,
+  browserHealthResponseSchemas,
+  type BrowserHealthApi,
+} from '../../contracts/browser-health';
+import {
   batchChannels,
   batchRequests,
   batchResponses,
@@ -146,8 +158,52 @@ async function invokeBatch<K extends keyof BatchApi>(
     throw new Error('Request unavailable');
   }
 }
+async function invokeBrowserHealth<K extends keyof BrowserHealthApi>(
+  method: K,
+  args: unknown[],
+): Promise<Awaited<ReturnType<BrowserHealthApi[K]>>> {
+  if (!browserHealthRequestSchemas[method].safeParse(args).success)
+    throw Error('Request rejected');
+  try {
+    return browserHealthResponseSchemas[method].parse(
+      await ipcRenderer.invoke(browserHealthChannels[method], ...args),
+    ) as Awaited<ReturnType<BrowserHealthApi[K]>>;
+  } catch {
+    throw Error('Request unavailable');
+  }
+}
+async function invokeWaitSettings(
+  method: keyof typeof waitSettingsChannels,
+  args: unknown[],
+) {
+  if (!waitSettingsRequests[method].safeParse(args).success)
+    throw Error('Request rejected');
+  return UploadWaitSettingsSchema.parse(
+    await ipcRenderer.invoke(waitSettingsChannels[method], ...args),
+  );
+}
 const api: DesktopApi = Object.freeze({
+  onOpenUploadSettings(listener: () => void) {
+    if (typeof listener !== 'function') throw Error('Request rejected');
+    const callback = (event: { sender: unknown }, ...args: unknown[]) => {
+      if (event.sender === ipcRenderer && args.length === 0) listener();
+    };
+    ipcRenderer.on(OPEN_UPLOAD_SETTINGS, callback);
+    return () => ipcRenderer.removeListener(OPEN_UPLOAD_SETTINGS, callback);
+  },
+  getUploadWaitSettings: (...args: unknown[]) =>
+    invokeWaitSettings('getUploadWaitSettings', args),
+  saveUploadWaitSettings: (...args: unknown[]) =>
+    invokeWaitSettings('saveUploadWaitSettings', args),
+  getBrowserHealth: (...args: unknown[]) =>
+    invokeBrowserHealth('getBrowserHealth', args),
+  checkBrowserHealth: (...args: unknown[]) =>
+    invokeBrowserHealth('checkBrowserHealth', args),
+  openBrowserUpdate: (...args: unknown[]) =>
+    invokeBrowserHealth('openBrowserUpdate', args),
   batch: Object.freeze({
+    skipCurrentAndContinue: (...args: unknown[]) =>
+      invokeBatch('skipCurrentAndContinue', args),
     prepare: (...args: unknown[]) => invokeBatch('prepare', args),
     start: (...args: unknown[]) => invokeBatch('start', args),
     stop: (...args: unknown[]) => invokeBatch('stop', args),
@@ -175,6 +231,14 @@ const api: DesktopApi = Object.freeze({
   deleteArticle: (...args: unknown[]) => invokeDeletion('deleteArticle', args),
   getArticleDeletionResult: (...args: unknown[]) =>
     invokeDeletion('getArticleDeletionResult', args),
+  pickManualCoverImage: (...args: unknown[]) =>
+    invokeManual('pickManualCoverImage', args),
+  setManualCoverMode: (...args: unknown[]) =>
+    invokeManual('setManualCoverMode', args),
+  getManualCoverImage: (...args: unknown[]) =>
+    invokeManual('getManualCoverImage', args),
+  reconcileManualCoverSave: (...args: unknown[]) =>
+    invokeManual('reconcileManualCoverSave', args),
   openManualArticle: (...args: unknown[]) =>
     invokeManual('openManualArticle', args),
   applyManualEdit: (...args: unknown[]) =>
@@ -223,6 +287,8 @@ const api: DesktopApi = Object.freeze({
   getDraftState: (...args: unknown[]) => invokeDraft('getDraftState', args),
   stopDraft: (...args: unknown[]) => invokeDraft('stopDraft', args),
   reconcileDraft: (...args: unknown[]) => invokeDraft('reconcileDraft', args),
+  finishHandledTask: (...args: unknown[]) =>
+    invokeDraft('finishHandledTask', args),
   prepareTaskClosure: (...args: unknown[]) =>
     invokeDraft('prepareTaskClosure', args),
   confirmTaskClosure: (...args: unknown[]) =>

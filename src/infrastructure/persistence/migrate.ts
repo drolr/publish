@@ -8,6 +8,23 @@ export interface Migration {
   sql: string;
   checksum: string;
 }
+const CR = String.fromCharCode(13);
+const LF = String.fromCharCode(10);
+const CRLF = CR + LF;
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+function normalizeLineEndings(sql: string): string {
+  return sql.split(CRLF).join(LF).split(CR).join(LF);
+}
+function matchesChecksum(stored: string, migration: Migration): boolean {
+  // History may hold the checksum of the original CRLF bytes; comparison only.
+  return (
+    stored === migration.checksum ||
+    stored === sha256(migration.sql) ||
+    stored === sha256(normalizeLineEndings(migration.sql).split(LF).join(CRLF))
+  );
+}
 export function readMigrations(directory: string): Migration[] {
   const names = readdirSync(directory)
     .filter((name) => name.endsWith('.sql'))
@@ -22,7 +39,7 @@ export function readMigrations(directory: string): Migration[] {
       version: index + 1,
       name,
       sql,
-      checksum: createHash('sha256').update(sql).digest('hex'),
+      checksum: sha256(normalizeLineEndings(sql)),
     };
   });
 }
@@ -43,7 +60,7 @@ export function migrate(db: Database.Database, migrations: Migration[]): void {
       if (
         row.version !== index + 1 ||
         row.name !== expected.name ||
-        row.checksum !== expected.checksum
+        !matchesChecksum(row.checksum, expected)
       )
         throw new Error('Migration history mismatch');
     }

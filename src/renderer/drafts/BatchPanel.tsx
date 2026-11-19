@@ -1,3 +1,5 @@
+import { HelpTip } from '../HelpTip';
+import type { WorkspaceTaskStatus } from '../WorkspaceFooter';
 import { CoverTaskResult } from './CoverTaskResult';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -8,7 +10,7 @@ import {
 } from '../../contracts/draft-batch';
 import { DraftViewSchema } from '../../contracts/draft-task';
 import { useBatch } from './useBatch';
-import { reasons } from './reasons';
+import { manualUploadMessage, reasons } from './reasons';
 const labels: Record<BatchItemView['state'], string> = {
   queued: '待上传',
   running: '正在上传',
@@ -17,7 +19,7 @@ const labels: Record<BatchItemView['state'], string> = {
   failed: '文章失败',
   needs_human: '需人工处理',
   stopped: '未执行',
-  skipped: '已保存，跳过',
+  skipped: '已跳过',
 };
 export function BatchPanel({
   articleKeys,
@@ -30,9 +32,11 @@ export function BatchPanel({
   contentEpoch = 0,
   configurationBlocked = false,
   onIssueChange,
+  onTaskStatusChange,
 }: {
   articleKeys: string[];
   onIssueChange?: (issue: string) => void;
+  onTaskStatusChange?: (status: WorkspaceTaskStatus | null) => void;
   coverPanel?: React.ReactNode;
   stopControl?: React.ReactNode;
   contentEpoch?: number;
@@ -184,7 +188,13 @@ export function BatchPanel({
       );
       if (!valid()) return;
       if (!state.session.bindingToken || state.session.status !== 'ready') {
-        setNotice('请先打开专用浏览器并登录，由运营人员确认门店。');
+        setNotice(
+          state.session.status === 'closed'
+            ? '请先打开专用浏览器并登录。'
+            : state.session.status === 'opening'
+              ? '专用浏览器正在打开，请稍候。'
+              : '请在现有专用浏览器中确认登录，再点“检查登录状态”。',
+        );
         return;
       }
       const result = BatchPrepareResultSchema.parse(
@@ -209,7 +219,12 @@ export function BatchPanel({
     }
   }
   async function command(
-    kind: 'start' | 'stop' | 'finish' | 'archiveFinishedBatch',
+    kind:
+      | 'start'
+      | 'stop'
+      | 'finish'
+      | 'archiveFinishedBatch'
+      | 'skipCurrentAndContinue',
   ) {
     if (kind !== 'stop' && lock.current) return;
     if (
@@ -253,12 +268,26 @@ export function BatchPanel({
               preparationId: selected!.preparationId,
               requestId: crypto.randomUUID(),
             })
-          : window.desktopApi.batch[kind]({ batchId: batch.view!.id })),
+          : kind === 'skipCurrentAndContinue'
+            ? window.desktopApi.batch.skipCurrentAndContinue({
+                batchId: batch.view!.id,
+                expectedRevision: batch.view!.revision,
+                taskId:
+                  batch.view!.items.find((i) =>
+                    ['running', 'needs_human'].includes(i.state),
+                  )?.taskId ?? null,
+              })
+            : window.desktopApi.batch[kind]({ batchId: batch.view!.id })),
       );
       if (!valid()) return;
       if (kind === 'start') setUncertainStart(null);
       batch.update(reply.view);
-      if (reply.status === 'blocked') setNotice(reasons[reply.reason]);
+      if (reply.status === 'blocked')
+        setNotice(
+          reply.view?.state === 'paused' || reply.view?.state === 'interrupted'
+            ? manualUploadMessage
+            : reasons[reply.reason],
+        );
     } catch {
       if (valid()) {
         setNotice('操作回复未确认，正在核对批次记录；请勿重复开始。');
@@ -279,16 +308,57 @@ export function BatchPanel({
     )
       setUncertainStart(null);
   }, [batch.view, uncertainStart]);
-  const issue =
-    notice ||
-    (batch.unknown
-      ? '批次状态暂时无法读取，请停止并初始化。'
-      : held && batch.view?.reason
-        ? reasons[batch.view.reason]
-        : '');
+  const uploadBlocked =
+    batch.view?.state === 'paused' || batch.view?.state === 'interrupted';
+  const issue = uploadBlocked
+    ? manualUploadMessage
+    : notice ||
+      (batch.unknown
+        ? '批次状态暂时无法读取，请停止并初始化。'
+        : held && batch.view?.reason
+          ? reasons[batch.view.reason]
+          : '');
   useEffect(() => {
     onIssueChange?.(issue);
   }, [issue, onIssueChange]);
+  const batchMessage = uploadBlocked
+    ? manualUploadMessage
+    : batch.unknown
+      ? '批次状态待核对'
+      : !batch.view
+        ? ''
+        : batch.view.stopRequested && held
+          ? '批次正在停止'
+          : batch.view.state === 'completed'
+            ? '本批次尝试已结束，保存结果待人工核对'
+            : batch.view.state === 'stopped'
+              ? '批次已停止'
+              : batch.view.state === 'paused'
+                ? '批次已暂停，请返回工作区处理'
+                : batch.view.state === 'interrupted'
+                  ? '上次批次已中断，需人工处理'
+                  : '批次执行中';
+  const batchDetail =
+    batch.view && (batch.view.counts.failed || batch.view.counts.needsHuman)
+      ? `；失败 ${batch.view.counts.failed} 篇，需人工处理 ${batch.view.counts.needsHuman} 篇`
+      : '';
+  const batchAttention =
+    batch.unknown ||
+    (!!batch.view &&
+      (['paused', 'interrupted'].includes(batch.view.state) ||
+        batch.view.counts.failed > 0 ||
+        batch.view.counts.needsHuman > 0));
+  useEffect(() => {
+    onTaskStatusChange?.(
+      batchMessage
+        ? {
+            message: batchMessage + batchDetail,
+            needsAttention: batchAttention,
+            active: held,
+          }
+        : null,
+    );
+  }, [batchMessage, batchDetail, batchAttention, held, onTaskStatusChange]);
   const batchRecord = batch.view && (
     <>
       <p role="status">
@@ -309,7 +379,11 @@ export function BatchPanel({
         需人工处理 {batch.view.counts.needsHuman} · 未执行{' '}
         {batch.view.counts.stopped}
       </p>
-      {batch.view.reason && <p role="alert">{reasons[batch.view.reason]}</p>}
+      {batch.view.reason && (
+        <p role="alert">
+          {uploadBlocked ? manualUploadMessage : reasons[batch.view.reason]}
+        </p>
+      )}
       {held && !stopControl && (
         <button
           disabled={batch.view.stopRequested}
@@ -330,6 +404,23 @@ export function BatchPanel({
       ) : null}
       {['paused', 'interrupted'].includes(batch.view.state) && (
         <>
+          <p>人工处理当前文章后，可跳过并继续；保存结果仍需人工核对。</p>
+          {(!batch.view.stopRequested ||
+            (batch.view.state === 'interrupted' &&
+              batch.view.reason === 'RESULT_AMBIGUOUS')) && (
+            <button
+              disabled={busy || batch.unknown}
+              onClick={() => void command('skipCurrentAndContinue')}
+            >
+              {busy
+                ? '正在接续…'
+                : batch.view.items.some((i) =>
+                      ['running', 'needs_human'].includes(i.state),
+                    )
+                  ? '跳过这篇，继续上传'
+                  : '继续上传'}
+            </button>
+          )}
           <p>结束后剩余文章不会上传；未确认的草稿仍需人工核对。</p>
           <button disabled={busy} onClick={() => void command('finish')}>
             结束本批次
@@ -344,7 +435,12 @@ export function BatchPanel({
     '本次无可执行文章。此前同版本提交已跳过，或文章需处理；可逐项勾选“作为新尝试”后重新检查摘要。';
   return (
     <section className="draft-panel" aria-labelledby="batch-heading">
-      <h2 id="batch-heading">批量存草稿</h2>
+      <div className="heading-with-help">
+        <h2 id="batch-heading">批量存草稿</h2>
+        <HelpTip label="批量草稿帮助">
+          按勾选顺序逐篇上传巨懂车。开始前检查摘要并确认文章顺序、封面及后台门店。
+        </HelpTip>
+      </div>
       <p>已选择 {articleKeys.length} 篇，按勾选顺序逐篇上传巨懂车。</p>
       {coverPanel}
       <fieldset disabled={attemptsBlocked}>
@@ -417,7 +513,7 @@ export function BatchPanel({
         {preparation && (
           <>
             <p>
-              请确认文章顺序、声明、封面及后台门店。保存结果由运营人员核对，可能漏存或重复；旧内容残留或安全异常将停止。
+              请确认文章顺序、封面及后台门店。保存结果由运营人员核对，可能漏存或重复；旧内容残留或安全异常将停止。
             </p>
           </>
         )}
@@ -516,7 +612,6 @@ function BatchItems({ items }: { items: BatchItemView[] }) {
         <li key={item.articleKey}>
           <strong>{item.title}</strong>
           <p>
-            {item.contentDeclaration === 'original' ? '原创' : '转载'} ·{' '}
             {item.coverSummary?.mode === 'single'
               ? '单图封面'
               : item.coverSummary?.mode === 'triple'
@@ -527,8 +622,7 @@ function BatchItems({ items }: { items: BatchItemView[] }) {
               ? '此前已提交，本次跳过'
               : labels[item.state]}
           </p>
-          {item.state === 'submission_recorded' ||
-          (item.state === 'skipped' && item.submission) ? (
+          {item.state === 'submission_recorded' || item.submission ? (
             <p>
               {item.submission?.observation === 'rejected'
                 ? '保存返回失败，待人工核对'
@@ -537,9 +631,29 @@ function BatchItems({ items }: { items: BatchItemView[] }) {
                   : '保存结果未知，待人工核对'}
             </p>
           ) : (
-            item.reason && <p role="alert">{reasons[item.reason]}</p>
+            item.reason && (
+              <p role="alert">
+                {['needs_human', 'failed'].includes(item.state)
+                  ? manualUploadMessage
+                  : reasons[item.reason]}
+              </p>
+            )
+          )}
+          {item.submission &&
+            item.state !== 'submission_recorded' &&
+            item.state !== 'skipped' &&
+            item.reason && (
+              <p role="alert">
+                {['needs_human', 'failed'].includes(item.state)
+                  ? manualUploadMessage
+                  : reasons[item.reason]}
+              </p>
+            )}
+          {item.state === 'skipped' && item.taskId && item.saveAttempted && (
+            <p>曾尝试保存，原保存结果仍需人工核对；不会重传这篇。</p>
           )}
           {item.coverReport &&
+            !['needs_human', 'failed'].includes(item.state) &&
             item.state !== 'submission_recorded' &&
             !item.submission && (
               <CoverTaskResult

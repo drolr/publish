@@ -16,6 +16,7 @@ export const CoverReportReasonSchema = z.enum([
   'LIBRARY_OPTION_UNVERIFIED',
   'COVER_MISMATCH',
   'COVER_REQUIRED',
+  'COVER_UPLOAD_FAILED',
   'PAGE_UNVERIFIED',
 ]);
 export const CoverReportSchema = z

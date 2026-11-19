@@ -1,3 +1,5 @@
+import { ImportFailure } from '../domain/import-error';
+import { createCoverSaveService } from './cover-save';
 import { CoverPickFailure } from '../domain/cover-pick-error';
 import { StorageIdSchema } from '../contracts/stored-article';
 import {
@@ -29,7 +31,6 @@ import type {
 } from '../domain/ports/article-cover';
 import type { ArticleRevisionRepository } from '../domain/ports/article-revision';
 import { createCoverRecovery } from './cover-recovery';
-import { ImportFailure } from '../domain/import-error';
 interface Ports {
   repository: ArticleCoverRepository &
     Pick<ArticleRevisionRepository, 'loadEditableArticle'>;
@@ -81,6 +82,7 @@ export function createArticleCoverController(ports: Ports): ArticleCoverApi & {
   recover(): Promise<boolean>;
 } {
   const recovery = createCoverRecovery(ports.repository, ports.assets);
+  const writer = createCoverSaveService(ports.repository, ports.assets);
   let ready = false,
     blocked = false,
     storageUncertain = false,
@@ -263,15 +265,6 @@ export function createArticleCoverController(ports: Ports): ArticleCoverApi & {
       s.notice = null;
       blocked = false;
     }
-  }
-  async function cleanup(intent: CoverSaveIntent) {
-    const op = ports.repository.readCoverOperation(intent.operationId);
-    if (!op) throw Error('Missing intent');
-    await ports.assets.cleanupOwnedUnreferenced(op);
-    ports.repository.markCoverOperation(intent.operationId, {
-      status: 'failed',
-      cleanupComplete: true,
-    });
   }
   const api = {
     async recover() {
@@ -766,94 +759,33 @@ export function createArticleCoverController(ports: Ports): ArticleCoverApi & {
       const currentAbort = new AbortController();
       abort = currentAbort;
       const saving = (async (): Promise<CoverSaveResult> => {
-        let begun = false;
         try {
-          const admitted = ports.repository.beginCoverSave(intent);
-          // T1 returns not_started only for a freshly persisted preparing intent.
-          // Pending is an existing/unknown operation and never authorizes replay.
-          if (admitted.status !== 'not_started') {
-            if (
-              admitted.status === 'pending' ||
-              admitted.status === 'needs_review'
-            ) {
-              blocked = true;
-              valid.unknownOperation = intent.operationId;
-              valid.notice = 'needs_review';
-            }
-            return admitted;
-          }
-          const persisted = ports.repository.readCoverOperation(
-            intent.operationId,
+          const saved = await writer.save(
+            intent,
+            async () => {
+              const images = [];
+              for (const token of valid.draft.imageTokens) {
+                currentAbort.signal.throwIfAborted();
+                images.push({
+                  bytes: await readCandidate(valid.images.get(token)!),
+                });
+              }
+              return images;
+            },
+            currentAbort.signal,
+            () => gate() === 'ready' && validBase(valid),
+            (r) => settleKnown(valid, r),
           );
           if (
-            !persisted ||
-            persisted.status !== 'preparing' ||
-            persisted.ownedFiles.length !== 0 ||
-            persisted.cleanupComplete ||
-            persisted.committedCoverRevision !== null ||
-            Object.keys(intent).some(
-              (k) =>
-                persisted[k as keyof CoverSaveIntent] !==
-                intent[k as keyof CoverSaveIntent],
+            !['committed', 'failed', 'conflict', 'blocked'].includes(
+              saved.status,
             )
-          )
-            throw Error('Intent mismatch');
-          begun = true;
-          const images = [];
-          for (const token of valid.draft.imageTokens) {
-            currentAbort.signal.throwIfAborted();
-            images.push({
-              bytes: await readCandidate(valid.images.get(token)!),
-            });
-          }
-          const files = await ports.assets.prepareCoverFiles(
-            intent,
-            images,
-            currentAbort.signal,
-          );
-          currentAbort.signal.throwIfAborted();
-          if (gate() !== 'ready' || !validBase(valid)) {
-            await cleanup(intent);
-            return result('conflict', intent.operationId);
-          }
-          const committed = ports.repository.commitCoverVersion(intent, files);
-          if (committed.status === 'committed')
-            await settleKnown(valid, committed);
-          else if (
-            committed.status === 'conflict' ||
-            committed.status === 'blocked'
-          )
-            await cleanup(intent);
-          else {
+          ) {
             blocked = true;
             valid.unknownOperation = intent.operationId;
+            valid.notice = 'needs_review';
           }
-          return committed;
-        } catch (error) {
-          try {
-            const known = ports.repository.readCoverSaveResult(
-              intent.operationId,
-            );
-            if (known.status === 'committed') {
-              await settleKnown(valid, known);
-              return known;
-            }
-            if (
-              begun &&
-              (currentAbort.signal.aborted ||
-                (error instanceof ImportFailure &&
-                  error.code === 'IMAGE_UNAVAILABLE'))
-            ) {
-              await cleanup(intent);
-              return result('failed', intent.operationId);
-            }
-          } catch {
-            /* Preserve intent/receipt when proof or cleanup cannot be established. */
-          }
-          blocked = true;
-          valid.unknownOperation = intent.operationId;
-          valid.notice = 'needs_review';
-          return result('needs_review', intent.operationId);
+          return saved;
         } finally {
           if (valid.status !== 'closing') valid.status = 'open';
         }

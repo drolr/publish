@@ -1,3 +1,7 @@
+import { HelpTip } from '../HelpTip';
+import { ManualCoverEditor } from './ManualCoverEditor';
+import type { WorkspaceTaskStatus } from '../WorkspaceFooter';
+import { isManualImageBlock } from '../../contracts/manual-article';
 import { useEffect, useRef, useState } from 'react';
 import { ContinuousBodyEditor } from '../editor/ContinuousBodyEditor';
 import type { ImageProjection } from '../editor/InlineArticleImage';
@@ -6,12 +10,13 @@ import { pasteErrorMessages } from './PendingImage';
 export function ManualEditor({
   controller: c,
   onFinish,
+  taskStatus,
 }: {
   controller: ReturnType<typeof useManualArticle>;
   onFinish?: () => void;
+  taskStatus?: WorkspaceTaskStatus | null;
 }) {
-  const [mode, setMode] = useState<'rich-paste' | 'manual'>('rich-paste'),
-    [confirm, setConfirm] = useState(false);
+  const [confirm, setConfirm] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null),
     discard = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -31,7 +36,7 @@ export function ManualEditor({
     state.issues ??
     (state.result?.status === 'invalid' ? state.result.issues : []);
   const projections: ImageProjection[] = draft.blocks.flatMap((block) =>
-    block.type === 'paragraph'
+    !isManualImageBlock(block)
       ? []
       : [
           {
@@ -55,6 +60,12 @@ export function ManualEditor({
         ],
   );
   const existing = state.target.kind === 'existing';
+  const confirmedLocalSave =
+    !c.unknown &&
+    !!state.saveOutcome &&
+    !state.dirty &&
+    !state.cover?.dirty &&
+    !c.unsynced;
   const busy = [
     'saving',
     'selecting',
@@ -77,17 +88,7 @@ export function ManualEditor({
         }
       }}
     >
-      <div className="toolbar">
-        <div>
-          <h2>{existing ? '修改文章' : '新建文章'}</h2>
-          <p>
-            {state.dirty || c.unsynced
-              ? '有尚未保存到本机的修改'
-              : existing
-                ? '当前文章已保存到本机'
-                : '尚未保存到文章池'}
-          </p>
-        </div>
+      <div className="focused-editor-header toolbar">
         <button
           ref={discard}
           disabled={c.blocked && !c.canDiscardConflict}
@@ -96,38 +97,57 @@ export function ManualEditor({
               onFinish();
               return;
             }
-            if (state.dirty || c.unsynced) setConfirm(true);
+            if (state.dirty || state.cover?.dirty || c.unsynced)
+              setConfirm(true);
             else void c.command('discard');
           }}
         >
-          {existing ? '结束编辑' : '放弃录入'}
+          {onFinish ? '返回文章池' : existing ? '结束编辑' : '放弃录入'}
         </button>
-      </div>
-      <p className="hint">
-        输入同步只在本次运行期间保留。请明确保存到本机；未保存修改在关闭后丢失。
-      </p>
-      <div className="operation" role="status" aria-live="polite">
-        {c.unknown
-          ? '状态暂时无法确认，正在核对…'
-          : state.state === 'saving'
-            ? '正在保存文章…'
-            : state.state === 'pasting' || state.state === 'retrying'
-              ? state.pasteProgress?.phase === 'images'
-                ? `正在取得第${state.pasteProgress.current}/${state.pasteProgress.total}张图片…`
-                : '正在整理粘贴内容…'
-              : state.state === 'selecting'
-                ? state.operationKind === 'open'
-                  ? '正在加载文章…'
-                  : '正在检查图片…'
-                : state.state === 'stopping'
-                  ? '正在停止…'
-                  : c.syncing
-                    ? '正在同步输入…'
-                    : c.unsynced
-                      ? '输入尚未同步，请检查提示'
-                      : c.pending
-                        ? '正在处理…'
-                        : '输入已同步'}
+        <h2>{existing ? '修改文章' : '新建文章'}</h2>
+        <p
+          className="editor-save-status"
+          role="status"
+          aria-live="polite"
+          data-input-pending={c.syncing || c.unsynced}
+        >
+          {c.unknown
+            ? '状态暂时无法确认，正在核对…'
+            : state.state === 'saving'
+              ? '正在保存到本机…'
+              : state.state === 'pasting' || state.state === 'retrying'
+                ? state.pasteProgress?.phase === 'images'
+                  ? `正在取得第${state.pasteProgress.current}/${state.pasteProgress.total}张图片…`
+                  : '正在整理粘贴内容…'
+                : state.state === 'selecting'
+                  ? state.operationKind === 'open'
+                    ? '正在加载文章…'
+                    : '正在检查图片…'
+                  : state.state === 'stopping'
+                    ? '正在停止…'
+                    : !state.dirty &&
+                        !c.unsynced &&
+                        state.cover?.dirty &&
+                        existing
+                      ? '文章已保存，封面未保存'
+                      : state.dirty || state.cover?.dirty || c.unsynced
+                        ? '有未保存修改'
+                        : existing || confirmedLocalSave
+                          ? '已保存到本机'
+                          : '尚未保存到本机'}
+        </p>
+        <button
+          className="primary"
+          disabled={
+            c.blocked ||
+            unresolved > 0 ||
+            (!state.dirty && !state.cover?.dirty && !c.unsynced)
+          }
+          aria-describedby={unresolved ? 'pending-save-help' : undefined}
+          onClick={() => void c.command('save')}
+        >
+          {existing ? '保存修改' : '保存到本机'}
+        </button>
         {busy && (
           <button
             disabled={c.pending || c.unknown || state.state === 'stopping'}
@@ -141,7 +161,16 @@ export function ManualEditor({
           </button>
         )}
       </div>
-      {c.notice && <p role="alert">{c.notice}</p>}
+      {taskStatus && <p className="editor-task-status">{taskStatus.message}</p>}
+      {c.notice && (
+        <p
+          role={
+            c.notice === '已核对当前内容；请检查操作结果。' ? 'status' : 'alert'
+          }
+        >
+          {c.notice}
+        </p>
+      )}
       {!!issues.length && (
         <div role="alert">
           <ul>
@@ -160,15 +189,6 @@ export function ManualEditor({
       {state.result?.status === 'cancelled' && (
         <p role="status">已取消，正文内容已保留。</p>
       )}
-      {state.saveOutcome && !state.dirty && !c.unsynced && (
-        <p role="status">
-          {state.saveOutcome.kind === 'updated'
-            ? '修改已保存到本机'
-            : state.saveOutcome.kind === 'unchanged'
-              ? '文章没有变化'
-              : '文章已保存到本机'}
-        </p>
-      )}
       {summary && state.state === 'editing' && (
         <div role={summary.outcome === 'rejected' ? 'alert' : 'status'}>
           <p>
@@ -180,76 +200,43 @@ export function ManualEditor({
                   ? `还有${summary.unresolved}张图片需要处理`
                   : '粘贴内容已加入正文'}
           </p>
-          {summary.plainOnly && summary.admitted && (
-            <p>本次剪贴板只提供文字，未取得网页图片信息</p>
-          )}
+          {summary.admitted &&
+            [...new Set(summary.warnings ?? [])].map((warning) => (
+              <p key={warning}>
+                {warning === 'HEADING_NORMALIZED'
+                  ? '标题层级已统一为小标题'
+                  : warning === 'STYLE_NORMALIZED'
+                    ? '已移除不支持的样式，保留可用的文字格式'
+                    : '本次按纯文本粘贴，未包含文字格式或网页图片信息'}
+              </p>
+            ))}
+          {summary.admitted &&
+            summary.plainOnly &&
+            !summary.warnings?.includes('PLAIN_ONLY') && (
+              <p>本次按纯文本粘贴，未包含文字格式或网页图片信息</p>
+            )}
         </div>
       )}
-      <div
-        role="group"
-        aria-label="录入方式"
-        className="manual-actions entry-mode"
-      >
-        <button
-          aria-pressed={mode === 'rich-paste'}
-          disabled={c.blocked}
-          onClick={() => {
-            void c.flushDraft().then((ok) => {
-              if (ok) setMode('rich-paste');
-            });
-          }}
-        >
-          富文本粘贴
-        </button>
-        <button
-          aria-pressed={mode === 'manual'}
-          disabled={c.blocked}
-          onClick={() => {
-            void c.flushDraft().then((ok) => {
-              if (ok) setMode('manual');
-            });
-          }}
-        >
-          手动录入
-        </button>
-      </div>
-      <fieldset disabled={c.blocked} className="manual-fields">
-        <label>
-          文章标题
-          <input
-            value={draft.title}
-            onCompositionStart={() => c.setComposition('title', true)}
-            onCompositionEnd={(event) => {
-              c.change({ ...draft, title: event.currentTarget.value });
-              c.setComposition('title', false);
-            }}
-            onChange={(event) =>
-              c.change({ ...draft, title: event.target.value })
-            }
-          />
-        </label>
-        <label>
-          文章声明
-          <select
-            aria-label="文章声明"
-            value={draft.contentDeclaration}
-            onChange={(event) =>
-              c.change({
-                ...draft,
-                contentDeclaration: event.target.value as 'original' | 'repost',
-              })
-            }
-          >
-            <option value="repost">转载</option>
-            <option value="original">原创</option>
-          </select>
-        </label>
-      </fieldset>
-      <p id="continuous-body-help" className="hint">
-        在正文光标处按 Ctrl+V
-        插入图文；选中文字或图片可替换、删除。只保留基本段落、图片及顺序。
-      </p>
       <ContinuousBodyEditor
+        onInsertImage={() => void c.command('pick')}
+        beforeBody={
+          <label className="article-title-field">
+            文章标题
+            <input
+              placeholder="输入文章标题"
+              disabled={c.blocked}
+              value={draft.title}
+              onCompositionStart={() => c.setComposition('title', true)}
+              onCompositionEnd={(event) => {
+                c.change({ ...draft, title: event.currentTarget.value });
+                c.setComposition('title', false);
+              }}
+              onChange={(event) =>
+                c.change({ ...draft, title: event.target.value })
+              }
+            />
+          </label>
+        }
         session={state.sessionId}
         draft={draft}
         imageProjection={projections}
@@ -262,24 +249,12 @@ export function ManualEditor({
         onCopyCut={(cut) => void c.command(cut ? 'cut' : 'copy')}
         onRangeChange={c.rangeChange}
       />
+      <ManualCoverEditor controller={c} />
       <div className="editor-footer">
-        <div className="manual-actions">
-          {mode === 'manual' && (
-            <button disabled={c.blocked} onClick={() => void c.command('pick')}>
-              添加图片
-            </button>
-          )}
-          <button
-            className="primary"
-            disabled={
-              c.blocked || unresolved > 0 || (!state.dirty && !c.unsynced)
-            }
-            aria-describedby={unresolved ? 'pending-save-help' : undefined}
-            onClick={() => void c.command('save')}
-          >
-            {existing ? '保存修改' : '保存到文章池'}
-          </button>
-        </div>
+        <HelpTip label="正文编辑帮助">
+          在正文光标处按 Ctrl+V 插入图文，Ctrl+Shift+V
+          仅粘贴文字。请明确保存到本机，未保存修改在关闭后丢失。
+        </HelpTip>
         {unresolved > 0 && (
           <p id="pending-save-help" className="hint">
             还有 {unresolved} 张图片需要处理，可重试或通过正文选区移除后保存。

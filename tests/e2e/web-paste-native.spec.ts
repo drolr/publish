@@ -1,3 +1,4 @@
+import { returnToArticlePool } from './focused-editor-navigation';
 import {
   test,
   expect,
@@ -173,15 +174,21 @@ for (const target of ['desktop', 'package'] as const)
             ),
           )
           .toBe('ready');
+        if (
+          await page
+            .getByRole('button', { name: '返回文章池', exact: true })
+            .isVisible()
+        )
+          await returnToArticlePool(page);
         await page
           .getByRole('button', { name: '新建文章', exact: true })
           .click();
         await expect(
-          page.getByRole('button', { name: '富文本粘贴', exact: true }),
-        ).toHaveAttribute('aria-pressed', 'true');
+          page.getByRole('toolbar', { name: '正文格式' }),
+        ).toBeVisible();
         await expect(
-          page.getByRole('button', { name: '添加图片', exact: true }),
-        ).toHaveCount(0);
+          page.getByRole('button', { name: '插入图片', exact: true }),
+        ).toBeVisible();
         const clipboardEvidence: unknown[] = [];
         report.clipboard = clipboardEvidence;
         async function copyPaste(plain = false) {
@@ -271,7 +278,11 @@ for (const target of ['desktop', 'package'] as const)
         let s = await copyPaste();
         expect(s.pasteSummary?.outcome).toBe('completed');
         expect(
-          s.draft.blocks.map((b) => (b.type === 'paragraph' ? b.text : b.type)),
+          s.draft.blocks.map((b) =>
+            b.type === 'paragraph'
+              ? b.content.map((run) => run.text).join('')
+              : b.type,
+          ),
         ).toEqual([
           '整篇前文 😀',
           'image',
@@ -334,28 +345,26 @@ for (const target of ['desktop', 'package'] as const)
         s = await copyPaste();
         expect(s.draft.blocks.at(-1)).toMatchObject({
           type: 'paragraph',
-          text: '第二次追加',
+          content: [{ type: 'text', text: '第二次追加', marks: [] }],
         });
         expect(s.draft.blocks).toHaveLength(7);
         await page
           .getByLabel('文章标题', { exact: true })
           .fill(`Native ${channel} ${target}`);
-        await page
-          .getByLabel('文章声明', { exact: true })
-          .selectOption('original');
-        await expect(
-          page.getByRole('status').filter({ hasText: '输入已同步' }),
-        ).toBeVisible();
+        await expect(page.getByLabel('文章声明', { exact: true })).toHaveCount(
+          0,
+        );
+        await expect(page.locator('.editor-save-status')).toHaveAttribute(
+          'data-input-pending',
+          'false',
+        );
         await offline(application);
         await page
-          .getByRole('button', { name: '保存到文章池', exact: true })
+          .getByRole('button', { name: '保存到本机', exact: true })
           .click();
-        await expect(
-          page.getByRole('heading', {
-            name: `Native ${channel} ${target}`,
-            exact: true,
-          }),
-        ).toBeVisible();
+        await expect(page.locator('.editor-save-status')).toHaveText(
+          '已保存到本机',
+        );
         const repository = openArticleRepository(
           join(userData, 'data/app.sqlite'),
           resolve('src/infrastructure/persistence/migrations'),
@@ -387,7 +396,7 @@ for (const target of ['desktop', 'package'] as const)
             { type: 'paragraph', text: '行内后' },
             { type: 'paragraph', text: '第二次追加' },
           ]);
-          expect(article.contentDeclaration).toBe('original');
+          expect(article.contentDeclaration).toBe('repost');
           expect(article.assets).toHaveLength(2);
           expect(
             article.body
@@ -521,20 +530,27 @@ for (const target of ['desktop', 'package'] as const)
             name: new RegExp(`Native ${channel} ${target}`),
           })
           .click();
-        await expect(
-          page.getByRole('img', { name: '第 1 张图片', exact: true }),
-        ).toBeVisible();
-        await page
-          .getByRole('button', { name: '查看第 2 张图片', exact: true })
-          .click();
-        await expect(
-          page.getByRole('img', { name: '第 2 张图片', exact: true }),
-        ).toBeVisible();
-        expect(
-          await page
-            .getByRole('img')
-            .evaluate((img) => (img as HTMLImageElement).naturalWidth),
-        ).toBeGreaterThan(0);
+        const body = page.getByRole('textbox', {
+          name: '文章正文',
+          exact: true,
+        });
+        for (let i = 0; i < 2; i++) {
+          await body
+            .locator('.inline-article-image')
+            .nth(i)
+            .scrollIntoViewIfNeeded();
+          const image = body
+            .getByRole('img', { name: '正文图片', exact: true })
+            .nth(i);
+          await expect(image).toBeVisible();
+          await expect
+            .poll(() =>
+              image.evaluate(
+                (img: HTMLImageElement) => img.complete && img.naturalWidth > 0,
+              ),
+            )
+            .toBe(true);
+        }
         await page.screenshot({
           path: join(root, 'offline-reopen.png'),
           fullPage: true,
@@ -551,6 +567,12 @@ for (const target of ['desktop', 'package'] as const)
           imageIds: readyTokens,
           visiblePreview: true,
         };
+        if (
+          await page
+            .getByRole('button', { name: '返回文章池', exact: true })
+            .isVisible()
+        )
+          await returnToArticlePool(page);
         await page
           .getByRole('button', { name: '新建文章', exact: true })
           .click();
@@ -558,7 +580,11 @@ for (const target of ['desktop', 'package'] as const)
         s = await copyPaste(true);
         expect(s.pasteSummary?.plainOnly).toBe(true);
         expect(
-          s.draft.blocks.map((b) => (b.type === 'paragraph' ? b.text : b.type)),
+          s.draft.blocks.map((b) =>
+            b.type === 'paragraph'
+              ? b.content.map((run) => run.text).join('')
+              : b.type,
+          ),
         ).toEqual(['纯文原生复制', '第二段']);
         // App transport is offline; browser still copies an actually loaded public image.
         fragment = `<p>失败前</p><img src="${publicImage}"><p>失败后</p>`;
@@ -566,7 +592,7 @@ for (const target of ['desktop', 'package'] as const)
         expect(s.pasteSummary?.outcome).toBe('partial');
         expect(s.candidates).toHaveLength(1);
         await expect(
-          page.getByRole('button', { name: '保存到文章池', exact: true }),
+          page.getByRole('button', { name: '保存到本机', exact: true }),
         ).toBeDisabled();
         expect(s.draft.blocks.map((b) => b.type)).toEqual([
           'paragraph',
@@ -576,11 +602,15 @@ for (const target of ['desktop', 'package'] as const)
           'paragraph',
         ]);
         const beforeSwitch = await snapshot(page);
+        await expect(
+          page.getByRole('textbox', { name: '文章正文', exact: true }),
+        ).toBeEditable();
         await page
-          .getByRole('button', { name: '手动录入', exact: true })
+          .getByRole('button', { name: '返回文章池', exact: true })
           .click();
         await page
-          .getByRole('button', { name: '富文本粘贴', exact: true })
+          .getByRole('dialog', { name: '离开当前编辑？' })
+          .getByRole('button', { name: '继续编辑', exact: true })
           .click();
         expect(await snapshot(page)).toEqual(beforeSwitch);
         report.failure = {

@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import type { Page, Request } from 'playwright-core';
+import { observeLiveSaves } from '../../src/infrastructure/platforms/judongche/production-editor-entry';
 import { resolve } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createBatchController } from '../../src/application/batch-controller';
@@ -689,4 +692,771 @@ it('a skipped article changed during final session validation invalidates the en
     }),
   ).toMatchObject({ status: 'blocked', reason: 'STALE_PREPARATION' });
   expect(h.calls.filter((call) => call === 'save')).toHaveLength(1);
+});
+
+it('capability changes after summary reject start without reserving a batch', async () => {
+  const { h, api, repo, prepare } = await setup();
+  const offered = await prepare();
+  h.control.capabilities.revision = 'fixture-v2';
+  expect(
+    await api.start({
+      preparationId: offered.preparationId,
+      requestId: randomUUID(),
+    }),
+  ).toMatchObject({ status: 'blocked', reason: 'STALE_PREPARATION' });
+  expect(repo.getCurrent()).toBeNull();
+  expect(h.calls).not.toContain('execute');
+});
+it('capability changes between articles pause the batch before the second writer', async () => {
+  const { h, api, prepare } = await setup();
+  const offered = await prepare();
+  h.control.pauseAt = 'none';
+  h.control.afterCheckpoint = async (stage) => {
+    if (stage === 'save') h.control.capabilities.revision = 'fixture-v2';
+  };
+  await api.start({
+    preparationId: offered.preparationId,
+    requestId: randomUUID(),
+  });
+  await api.waitForIdle();
+  expect(h.calls.filter((x) => x === 'execute')).toHaveLength(1);
+  expect(await api.getCurrent()).toMatchObject({ state: 'paused' });
+});
+it('one unsupported format blocks batch preparation instead of silently degrading the item', async () => {
+  const { h, api, keys } = await setup();
+  const load = h.articles.loadEditableArticle.bind(h.articles);
+  vi.spyOn(h.articles, 'loadEditableArticle').mockImplementation((key) => {
+    const a = load(key);
+    if (a && key === keys[1])
+      a.editorBody = {
+        version: 2,
+        blocks: [
+          {
+            type: 'paragraph',
+            content: [{ type: 'text', text: 'Other body', marks: ['italic'] }],
+          },
+        ],
+      };
+    return a;
+  });
+  const session = await h.api.getDraftState();
+  const prepared = await api.prepare({
+    articleKeys: keys,
+    bindingToken: session.session.bindingToken!,
+  });
+  expect(prepared).toMatchObject({
+    status: 'blocked',
+    reason: 'FORMAT_UNSUPPORTED',
+  });
+  expect(h.calls).not.toContain('execute');
+});
+
+it('manually skips the paused middle item once and continues only frozen queued work', async () => {
+  const { h, api, prepare } = await setup();
+  h.control.pauseAt = 'none';
+  let executions = 0;
+  const original = h.platform.execute;
+  const verified = h.control.outcome;
+  h.platform.execute = async (task, hooks) => {
+    executions++;
+    h.control.outcome =
+      executions === 2
+        ? { status: 'blocked', reason: 'RESULT_AMBIGUOUS' }
+        : verified;
+    return original(task, hooks);
+  };
+  const offered = await prepare();
+  await api.start({
+    preparationId: offered.preparationId,
+    requestId: randomUUID(),
+  });
+  await api.waitForIdle();
+  const paused = (await api.getCurrent())!;
+  expect(paused.items.map((i) => i.state)).toEqual([
+    'draft_saved',
+    'needs_human',
+    'queued',
+  ]);
+  const taskId = paused.items[1].taskId!;
+  const prior = h.tasks.get(taskId)!;
+  expect(prior.saveAttempted).toBe(true);
+  const request = {
+    batchId: paused.id,
+    expectedRevision: paused.revision,
+    taskId,
+  };
+  expect((await api.skipCurrentAndContinue(request)).status).toBe('ok');
+  await api.waitForIdle();
+  expect((await api.getCurrent())!.items.map((i) => i.state)).toEqual([
+    'draft_saved',
+    'skipped',
+    'draft_saved',
+  ]);
+  expect(h.tasks.get(taskId)).toMatchObject({
+    state: 'stopped_by_user',
+    saveAttempted: true,
+    reason: prior.reason,
+    evidence: prior.evidence,
+  });
+  expect((await api.skipCurrentAndContinue(request)).status).toBe('blocked');
+  expect(executions).toBe(3);
+});
+
+it('keeps the paused identity retryable after a recovery browser open failure', async () => {
+  const { h, api, prepare } = await setup();
+  h.control.pauseAt = 'none';
+  h.control.outcome = { status: 'blocked', reason: 'PAGE_CHANGED' };
+  const offered = await prepare();
+  await api.start({
+    preparationId: offered.preparationId,
+    requestId: randomUUID(),
+  });
+  await api.waitForIdle();
+  const paused = (await api.getCurrent())!;
+  const request = {
+    batchId: paused.id,
+    expectedRevision: paused.revision,
+    taskId: paused.items[0].taskId!,
+  };
+  const probe = h.control.probe;
+  h.control.probe = { status: 'blocked', reason: 'LOGIN_REQUIRED' };
+  expect(await api.skipCurrentAndContinue(request)).toMatchObject({
+    status: 'blocked',
+    reason: 'LOGIN_REQUIRED',
+  });
+  expect(await api.getCurrent()).toEqual(paused);
+  h.control.probe = probe;
+  h.control.outcome = {
+    status: 'verified',
+    evidence: {
+      cover: null,
+      images: [],
+      remote: {
+        recordKey: 'offline-record',
+        editUrl: 'https://example.test/edit/offline-record',
+      },
+    },
+  };
+  expect((await api.skipCurrentAndContinue(request)).status).toBe('ok');
+  await api.waitForIdle();
+  expect((await api.getCurrent())!.counts).toMatchObject({
+    skipped: 1,
+    saved: 2,
+  });
+});
+
+async function pausedBatch(position = 0) {
+  const fixture = await setup();
+  const { h, api, prepare } = fixture;
+  h.control.pauseAt = 'none';
+  const verified = h.control.outcome;
+  const execute = h.platform.execute;
+  let count = 0;
+  h.platform.execute = async (task, hooks) => {
+    h.control.outcome =
+      count++ === position
+        ? { status: 'blocked', reason: 'RESULT_AMBIGUOUS' }
+        : verified;
+    return execute(task, hooks);
+  };
+  const offered = await prepare();
+  await api.start({
+    preparationId: offered.preparationId,
+    requestId: randomUUID(),
+  });
+  await api.waitForIdle();
+  const view = (await api.getCurrent())!;
+  return {
+    ...fixture,
+    request: {
+      batchId: view.id,
+      expectedRevision: view.revision,
+      taskId: view.items[position].taskId!,
+    },
+  };
+}
+it('live manual skip keeps browser health, generation and session without reopening', async () => {
+  const { api, h, request } = await pausedBatch();
+  const before = h.calls.slice();
+  const invalidations = h.control.healthInvalidations;
+  const handoff = vi.fn(async () => h.control.probe);
+  Object.assign(h.platform, { returnHomeAfterHandledTask: handoff });
+  expect(await api.skipCurrentAndContinue(request)).toMatchObject({
+    status: 'ok',
+  });
+  await api.waitForIdle();
+  expect(handoff).toHaveBeenCalledOnce();
+  expect(h.control.healthInvalidations).toBe(invalidations);
+  expect(h.calls.filter((c) => c === 'close')).toEqual(
+    before.filter((c) => c === 'close'),
+  );
+  expect(h.calls.filter((c) => c === 'open')).toEqual(
+    before.filter((c) => c === 'open'),
+  );
+  expect((await api.getCurrent())!.counts).toMatchObject({
+    skipped: 1,
+    saved: 2,
+  });
+});
+it('missing live handoff support fails closed without falling back to startup recovery', async () => {
+  const { api, h, request } = await pausedBatch();
+  delete h.platform.returnHomeAfterHandledTask;
+  const before = h.calls.slice();
+  expect(await api.skipCurrentAndContinue(request)).toMatchObject({
+    status: 'blocked',
+    reason: 'INPUT_UNSUPPORTED',
+  });
+  expect(h.calls).toEqual(before);
+  expect(h.tasks.get(request.taskId)?.holdsPlatform).toBe(true);
+});
+it('lost live page remains a live failure and never opens a replacement browser', async () => {
+  const { api, h, request } = await pausedBatch();
+  const opens = h.calls.filter((c) => c === 'open').length;
+  vi.spyOn(h.platform, 'returnHomeAfterHandledTask').mockResolvedValue({
+    status: 'blocked',
+    reason: 'BROWSER_UNAVAILABLE',
+  });
+  expect(await api.skipCurrentAndContinue(request)).toMatchObject({
+    status: 'blocked',
+    reason: 'BROWSER_UNAVAILABLE',
+  });
+  expect(h.calls.filter((c) => c === 'open')).toHaveLength(opens);
+});
+it('does not bind an unreserved task or a queued task with a forged generation', async () => {
+  const { h, api, prepare } = await setup();
+  const bind = vi.fn();
+  h.platform.bindTaskForContinuation = bind;
+  await expect(
+    h.api.executeBatchTask(randomUUID(), randomUUID(), 'fixture-v1'),
+  ).rejects.toThrow('Batch task is not newly reserved');
+  expect(bind).not.toHaveBeenCalled();
+  const executeReserved = h.api.executeBatchTask.bind(h.api);
+  h.api.executeBatchTask = (taskId, _generation, capability) =>
+    executeReserved(taskId, randomUUID(), capability);
+  const prepared = await prepare();
+  await api.start({
+    preparationId: prepared.preparationId,
+    requestId: randomUUID(),
+  });
+  await api.waitForIdle();
+  expect(bind).not.toHaveBeenCalled();
+  const task = h.tasks.latest()!;
+  expect(task).toMatchObject({
+    state: 'needs_human',
+    reason: 'STALE_PREPARATION',
+    possibleRemoteEffect: false,
+  });
+  expect(
+    await h.api.releaseHandledTaskForContinuation(task.taskId, () => false),
+  ).toMatchObject({ status: 'blocked', reason: 'INPUT_UNSUPPORTED' });
+  expect(h.calls).not.toContain('handoff');
+});
+it('shutdown waits for the entire continuation flight and prevents release after cancellation', async () => {
+  const { h, request } = await pausedBatch();
+  let entered!: () => void, release!: () => void;
+  const reached = new Promise<void>((done) => {
+    entered = done;
+  });
+  const hold = new Promise<void>((done) => {
+    release = done;
+  });
+  vi.spyOn(h.platform, 'returnHomeAfterHandledTask').mockImplementation(
+    async () => {
+      entered();
+      await hold;
+      return h.control.probe;
+    },
+  );
+  const handoff = h.api.releaseHandledTaskForContinuation(
+    request.taskId,
+    () => false,
+  );
+  await reached;
+  let drained = false;
+  const shutdown = h.api.stopAndWait().then(() => {
+    drained = true;
+  });
+  await Promise.resolve();
+  expect(drained).toBe(false);
+  release();
+  expect(await handoff).toMatchObject({
+    status: 'blocked',
+    reason: 'STOP_REQUESTED',
+  });
+  await shutdown;
+  expect(h.tasks.get(request.taskId)?.holdsPlatform).toBe(true);
+});
+it('an explicit restart during continuation still closes the browser after draining', async () => {
+  const { h, request } = await pausedBatch();
+  let entered!: () => void, release!: () => void;
+  const reached = new Promise<void>((done) => {
+    entered = done;
+  });
+  const hold = new Promise<void>((done) => {
+    release = done;
+  });
+  vi.spyOn(h.platform, 'returnHomeAfterHandledTask').mockImplementation(
+    async () => {
+      entered();
+      await hold;
+      return h.control.probe;
+    },
+  );
+  const handoff = h.api.releaseHandledTaskForContinuation(
+    request.taskId,
+    () => false,
+  );
+  await reached;
+  const stop = h.api.stopForRestart();
+  release();
+  await stop;
+  expect(await handoff).toMatchObject({
+    status: 'blocked',
+    reason: 'STOP_REQUESTED',
+  });
+  expect(h.calls.filter((c) => c === 'close')).toHaveLength(1);
+  expect(h.tasks.get(request.taskId)?.state).toBe('stopped_by_user');
+});
+for (const outcome of ['blocked', 'verified'] as const)
+  it(`task-local quiesce drains the old writer and its late ${outcome} evidence before handoff`, async () => {
+    const { h, api, repo, prepare } = await setup();
+    let entered!: () => void, release!: () => void;
+    const reached = new Promise<void>((done) => {
+      entered = done;
+    });
+    const hold = new Promise<void>((done) => {
+      release = done;
+    });
+    const evidence = {
+      remote: {
+        recordKey: 'late-old-record',
+        editUrl: 'https://example.test/edit/late-old-record',
+      },
+      images: [],
+      cover: null,
+    };
+    h.platform.execute = async (task, hooks) => {
+      await hooks.checkpoint('body');
+      const current = h.tasks.get(task.taskId)!;
+      h.tasks.apply(
+        task.taskId,
+        current.revision,
+        { type: 'settle', state: 'needs_human', reason: 'RESULT_AMBIGUOUS' },
+        h.control.now,
+      );
+      entered();
+      await hold;
+      await hooks.evidence(evidence);
+      return outcome === 'verified'
+        ? { status: 'verified', evidence }
+        : { status: 'blocked', reason: 'RESULT_AMBIGUOUS' };
+    };
+    const handoff = vi.spyOn(h.platform, 'returnHomeAfterHandledTask');
+    const reserve = repo.reserveNext.bind(repo);
+    let reserves = 0;
+    vi.spyOn(repo, 'reserveNext').mockImplementation((...args) =>
+      ++reserves === 1 ? reserve(...args) : null,
+    );
+    const offered = await prepare();
+    await api.start({
+      preparationId: offered.preparationId,
+      requestId: randomUUID(),
+    });
+    await reached;
+    const old = h.tasks.latest()!;
+    const invalidations = h.control.healthInvalidations;
+    const flight = h.api.releaseHandledTaskForContinuation(
+      old.taskId,
+      () => false,
+    );
+    await Promise.resolve();
+    expect(handoff).not.toHaveBeenCalled();
+    expect(h.tasks.get(old.taskId)?.stopRequested).toBe(true);
+    release();
+    expect(await flight).toMatchObject({
+      status: outcome === 'verified' ? 'blocked' : 'ready',
+      ...(outcome === 'verified' ? { reason: 'RESULT_AMBIGUOUS' } : {}),
+    });
+    await api.waitForIdle();
+    expect(h.tasks.get(old.taskId)).toMatchObject({
+      state: outcome === 'verified' ? 'draft_saved' : 'stopped_by_user',
+      evidence,
+    });
+    expect(handoff).toHaveBeenCalledTimes(outcome === 'verified' ? 0 : 1);
+    expect(h.control.healthInvalidations).toBe(invalidations);
+  });
+function restartedBatch(
+  h: Awaited<ReturnType<typeof createDraftHarness>>,
+  repo: ReturnType<typeof openDraftBatchRepository>,
+  draft = h.api,
+) {
+  return createBatchController({
+    repository: repo,
+    draft,
+    preparation: h.preparation,
+    articles: h.articles,
+    snapshots: h.snapshots,
+    newId: randomUUID,
+    now: () => h.control.now,
+    gate: () => 'ready',
+  });
+}
+for (const status of [401, 403] as const)
+  it(`captures the explicit skip boundary before writer drain delivers a new ${status}`, async () => {
+    const { h, api, prepare } = await setup();
+    const page = new EventEmitter();
+    const observer = observeLiveSaves(page as unknown as Page);
+    let entered!: () => void, release!: () => void;
+    const reached = new Promise<void>((done) => {
+      entered = done;
+    });
+    const hold = new Promise<void>((done) => {
+      release = done;
+    });
+    h.platform.execute = async (task, hooks) => {
+      await hooks.checkpoint('body');
+      h.tasks.apply(
+        task.taskId,
+        h.tasks.get(task.taskId)!.revision,
+        { type: 'settle', state: 'needs_human', reason: 'RESULT_AMBIGUOUS' },
+        h.control.now,
+      );
+      entered();
+      await hold;
+      return { status: 'blocked', reason: 'RESULT_AMBIGUOUS' };
+    };
+    const captures: boolean[] = [];
+    h.platform.captureHandledTaskContinuation = (task) => {
+      captures.push(task.stopRequested);
+      const boundary = observer.captureHandledDenials();
+      return async () => {
+        boundary.assertIdle();
+        boundary.retire();
+        return h.control.probe;
+      };
+    };
+    const prepared = await prepare();
+    await api.start({
+      preparationId: prepared.preparationId,
+      requestId: randomUUID(),
+    });
+    await reached;
+    const task = h.tasks.latest()!;
+    const continuing = h.api.releaseHandledTaskForContinuation(
+      task.taskId,
+      () => false,
+    );
+    expect(captures).toEqual([false]);
+    const request = {
+      url: () =>
+        'https://www.autoengine.com/motor/dealer_admin/go_api/article/create',
+      method: () => 'POST',
+      response: async () => ({ status: () => status }),
+    } as unknown as Request;
+    page.emit('request', request);
+    page.emit('requestfinished', request);
+    await Promise.resolve();
+    release();
+    expect(await continuing).toMatchObject({
+      status: 'blocked',
+      reason: status === 401 ? 'LOGIN_REQUIRED' : 'PERMISSION_DENIED',
+    });
+    await api.waitForIdle();
+    expect(h.tasks.get(task.taskId)).toMatchObject({
+      state: 'needs_human',
+      holdsPlatform: true,
+      reason: 'RESULT_AMBIGUOUS',
+    });
+    expect(
+      await h.api.releaseHandledTaskForContinuation(task.taskId, () => false),
+    ).toMatchObject({ status: 'ready' });
+    expect(captures).toEqual([false, true]);
+    expect(h.tasks.get(task.taskId)).toMatchObject({
+      state: 'stopped_by_user',
+      reason: 'RESULT_AMBIGUOUS',
+      evidence: task.evidence,
+    });
+    observer.dispose();
+  });
+it('finishes the last skipped item without reopening a browser or editor', async () => {
+  const { api, h, request } = await pausedBatch(2);
+  const opens = h.calls.filter((c) => c === 'open').length;
+  expect((await api.skipCurrentAndContinue(request)).status).toBe('ok');
+  await api.waitForIdle();
+  expect(await api.getCurrent()).toMatchObject({
+    state: 'completed',
+    counts: { saved: 2, skipped: 1 },
+  });
+  expect(h.calls.filter((c) => c === 'open')).toHaveLength(opens);
+  expect(h.calls.filter((c) => c === 'execute')).toHaveLength(3);
+});
+it('retains the item after handoff failure and permits explicit cleanup retry', async () => {
+  const { api, h, request } = await pausedBatch();
+  const close = vi
+    .spyOn(h.platform, 'returnHomeAfterHandledTask')
+    .mockResolvedValueOnce({
+      status: 'blocked',
+      reason: 'BROWSER_UNAVAILABLE',
+    });
+  expect(await api.skipCurrentAndContinue(request)).toMatchObject({
+    status: 'blocked',
+    reason: 'BROWSER_UNAVAILABLE',
+  });
+  expect((await api.getCurrent())!.items[0].state).toBe('needs_human');
+  expect(h.calls.filter((c) => c === 'execute')).toHaveLength(1);
+  close.mockRestore();
+  expect((await api.skipCurrentAndContinue(request)).status).toBe('ok');
+  await api.waitForIdle();
+  expect((await api.getCurrent())!.counts.skipped).toBe(1);
+});
+it('rejects concurrent clicks and gives a stop during recovery precedence', async () => {
+  const { api, h, request } = await pausedBatch();
+  let entered!: () => void, release!: () => void;
+  const reached = new Promise<void>((r) => (entered = r)),
+    wait = new Promise<void>((r) => (release = r));
+  vi.spyOn(h.platform, 'returnHomeAfterHandledTask').mockImplementation(
+    async () => {
+      entered();
+      await wait;
+      return h.control.probe;
+    },
+  );
+  const recovery = api.skipCurrentAndContinue(request);
+  await reached;
+  expect(await api.skipCurrentAndContinue(request)).toMatchObject({
+    status: 'blocked',
+    reason: 'PLATFORM_BUSY',
+  });
+  api.requestStop();
+  release();
+  expect(await recovery).toMatchObject({
+    status: 'blocked',
+    reason: 'STOP_REQUESTED',
+  });
+  expect(h.calls.filter((c) => c === 'execute')).toHaveLength(1);
+  expect((await api.getCurrent())!.items.slice(1).map((i) => i.state)).toEqual([
+    'stopped',
+    'stopped',
+  ]);
+});
+for (const boundary of ['before-commit', 'after-commit'] as const)
+  it(`stop ${boundary} of manual skip preserves history and reserves no next task`, async () => {
+    const { api, h, repo, request } = await pausedBatch();
+    const original = h.tasks.get(request.taskId)!;
+    const callsBefore = h.calls.filter((call) => call === 'execute').length;
+    if (boundary === 'before-commit') {
+      const release = h.api.releaseHandledTaskForContinuation.bind(h.api);
+      vi.spyOn(h.api, 'releaseHandledTaskForContinuation').mockImplementation(
+        async (taskId, cancelled) => {
+          const result = await release(taskId, cancelled);
+          api.requestStop();
+          return result;
+        },
+      );
+    } else {
+      const commit = repo.skipCurrentAndContinue.bind(repo);
+      vi.spyOn(repo, 'skipCurrentAndContinue').mockImplementation(
+        (input, now) => {
+          const result = commit(input, now);
+          api.requestStop();
+          return result;
+        },
+      );
+    }
+    await api.skipCurrentAndContinue(request);
+    await api.waitForIdle();
+    const after = (await api.getCurrent())!;
+    expect(after.stopRequested).toBe(true);
+    expect(after.items[0].state).toBe(
+      boundary === 'after-commit' ? 'skipped' : 'needs_human',
+    );
+    expect(after.items.slice(1).map((item) => item.taskId)).toEqual([
+      null,
+      null,
+    ]);
+    expect(h.calls.filter((call) => call === 'execute')).toHaveLength(
+      callsBefore,
+    );
+    expect(h.tasks.get(request.taskId)).toMatchObject({
+      state: 'stopped_by_user',
+      evidence: original.evidence,
+      reason: original.reason,
+      snapshot: original.snapshot,
+    });
+    await h.restart();
+    expect(repo.get(after.id)).toEqual(after);
+    expect(h.tasks.get(request.taskId)?.evidence).toEqual(original.evidence);
+  });
+it('rejects a mismatched task identity before closing any browser', async () => {
+  const { api, h, request } = await pausedBatch();
+  const closes = h.calls.filter((c) => c === 'close').length;
+  expect(
+    await api.skipCurrentAndContinue({ ...request, taskId: randomUUID() }),
+  ).toMatchObject({ status: 'blocked', reason: 'STALE_PREPARATION' });
+  expect(h.calls.filter((c) => c === 'close')).toHaveLength(closes);
+});
+for (const changed of ['article', 'cover', 'asset'] as const)
+  it(`refuses recovery for a stale frozen ${changed} without replacing snapshots`, async () => {
+    const { api, h, keys, request } = await pausedBatch();
+    if (changed === 'article') {
+      const load = h.articles.loadEditableArticle.bind(h.articles);
+      vi.spyOn(h.articles, 'loadEditableArticle').mockImplementation((key) => {
+        const article = load(key);
+        return article && key === keys[1]
+          ? { ...article, articleRevision: article.articleRevision + 1 }
+          : article;
+      });
+    } else if (changed === 'cover') await h.setSingleCover(keys[1]);
+    else
+      h.control.verify = async () => {
+        throw { code: 'ASSET_UNAVAILABLE' };
+      };
+    expect(await api.skipCurrentAndContinue(request)).toMatchObject({
+      status: 'blocked',
+      reason: changed === 'asset' ? 'ASSET_UNAVAILABLE' : 'STALE_PREPARATION',
+    });
+    expect((await api.getCurrent())!.items.map((i) => i.state)).toEqual([
+      'needs_human',
+      'queued',
+      'queued',
+    ]);
+    expect(h.calls.filter((c) => c === 'execute')).toHaveLength(1);
+  });
+it('does not reserve remaining work when the skip transaction fails', async () => {
+  const { api, h, repo, request } = await pausedBatch();
+  const fail = vi
+    .spyOn(repo, 'skipCurrentAndContinue')
+    .mockImplementationOnce(() => {
+      throw Error('fixture storage');
+    });
+  expect(await api.skipCurrentAndContinue(request)).toMatchObject({
+    status: 'blocked',
+    reason: 'STORAGE_UNAVAILABLE',
+  });
+  expect((await api.getCurrent())!.items.map((i) => i.state)).toEqual([
+    'needs_human',
+    'queued',
+    'queued',
+  ]);
+  expect(h.calls.filter((c) => c === 'execute')).toHaveLength(1);
+  fail.mockRestore();
+  expect((await api.skipCurrentAndContinue(request)).status).toBe('ok');
+  await api.waitForIdle();
+});
+it('restart requires explicit skip and never replays the paused task', async () => {
+  const { api, h, repo } = await pausedBatch();
+  const draft = await h.restart();
+  const next = restartedBatch(h, repo, draft);
+  const view = (await next.getCurrent())!;
+  expect(view.state).toBe('interrupted');
+  expect(h.calls.filter((c) => c === 'execute')).toHaveLength(1);
+  expect(
+    (
+      await next.skipCurrentAndContinue({
+        batchId: view.id,
+        expectedRevision: view.revision,
+        taskId: view.items[0].taskId!,
+      })
+    ).status,
+  ).toBe('ok');
+  await next.waitForIdle();
+  expect((await next.getCurrent())!.items.map((i) => i.state)).toEqual([
+    'skipped',
+    'draft_saved',
+    'draft_saved',
+  ]);
+  await api.waitForIdle();
+});
+it('recovers untouched queue after a crash between skip commit and next reservation', async () => {
+  const { api, h, repo, request } = await pausedBatch();
+  await h.api.releaseHandledTask(request.taskId);
+  repo.skipCurrentAndContinue(request, h.control.now);
+  const draft = await h.restart();
+  const next = restartedBatch(h, repo, draft);
+  const view = (await next.getCurrent())!;
+  expect(view.items.map((i) => i.state)).toEqual([
+    'skipped',
+    'queued',
+    'queued',
+  ]);
+  expect(
+    (
+      await next.skipCurrentAndContinue({
+        batchId: view.id,
+        expectedRevision: view.revision,
+        taskId: null,
+      })
+    ).status,
+  ).toBe('ok');
+  await next.waitForIdle();
+  expect((await next.getCurrent())!.counts).toMatchObject({
+    skipped: 1,
+    saved: 2,
+  });
+  expect(h.calls.filter((c) => c === 'execute')).toHaveLength(3);
+  await api.waitForIdle();
+});
+it('recovers an interrupted batch before its first task was reserved', async () => {
+  const { api, h, repo, prepare } = await setup();
+  const offered = await prepare();
+  vi.spyOn(repo, 'reserveNext').mockReturnValueOnce(null);
+  await api.start({
+    preparationId: offered.preparationId,
+    requestId: randomUUID(),
+  });
+  await api.waitForIdle();
+  const draft = await h.restart();
+  h.control.pauseAt = 'none';
+  const next = restartedBatch(h, repo, draft);
+  const view = (await next.getCurrent())!;
+  expect(view.items.every((i) => i.taskId === null)).toBe(true);
+  expect(
+    (
+      await next.skipCurrentAndContinue({
+        batchId: view.id,
+        expectedRevision: view.revision,
+        taskId: null,
+      })
+    ).status,
+  ).toBe('ok');
+  await next.waitForIdle();
+  expect((await next.getCurrent())!.counts.saved).toBe(3);
+});
+it('does not turn an intentional stop into restart permission', async () => {
+  const { api, h, repo, request } = await pausedBatch();
+  await api.stop({ batchId: request.batchId });
+  await h.restart();
+  const next = restartedBatch(h, repo);
+  const view = (await next.getCurrent())!;
+  expect(view.reason).toBe('STOP_REQUESTED');
+  expect(
+    (
+      await next.skipCurrentAndContinue({
+        ...request,
+        expectedRevision: view.revision,
+      })
+    ).status,
+  ).toBe('blocked');
+  expect(h.calls.filter((c) => c === 'execute')).toHaveLength(1);
+});
+it('does not recover while the original writer is still executing', async () => {
+  const { api, h, prepare } = await setup();
+  const offered = await prepare();
+  await api.start({
+    preparationId: offered.preparationId,
+    requestId: randomUUID(),
+  });
+  await vi.waitFor(() => expect(h.calls).toContain('execute'));
+  const view = (await api.getCurrent())!;
+  expect(
+    await api.skipCurrentAndContinue({
+      batchId: view.id,
+      expectedRevision: view.revision,
+      taskId: view.items[0].taskId!,
+    }),
+  ).toMatchObject({ status: 'blocked', reason: 'PLATFORM_BUSY' });
+  expect(h.calls.filter((c) => c === 'execute')).toHaveLength(1);
+  api.requestStop();
+  h.releaseExecute();
+  await api.waitForIdle();
 });

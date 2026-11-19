@@ -1,9 +1,13 @@
 import type { Page } from '@playwright/test';
 export async function installCoverBridge(
   page: Page,
-  options: { unknownSave?: boolean; blocked?: boolean } = {},
+  options: {
+    unknownSave?: boolean;
+    blocked?: boolean;
+    browserHealth?: import('../../src/contracts/browser-health').BrowserHealthView;
+  } = {},
 ) {
-  await page.addInitScript(({ unknownSave, blocked }) => {
+  await page.addInitScript(({ unknownSave, blocked, browserHealth }) => {
     const stored = new Map<
       string,
       {
@@ -121,7 +125,71 @@ export async function installCoverBridge(
         },
       },
     });
+    type Health =
+      import('../../src/contracts/browser-health').BrowserHealthView;
+    let health: Health = browserHealth ?? {
+      status: 'unchecked',
+      version: null,
+      reason: null,
+      stage: null,
+    };
+    let nextHealth: Health = {
+      status: 'passed',
+      version: '156.0.0.0',
+      reason: null,
+      stage: null,
+    };
+    let holdHealth = false,
+      releaseHealth: (() => void) | undefined;
+    const healthCommands: string[] = [];
+    Object.assign(window, {
+      healthFixture: {
+        commands: healthCommands,
+        set: (v: Health) => {
+          health = v;
+        },
+        next: (v: Health) => {
+          nextHealth = v;
+        },
+        hold: () => {
+          holdHealth = true;
+        },
+        release: () => {
+          holdHealth = false;
+          releaseHealth?.();
+        },
+      },
+    });
     Object.assign(window.desktopApi, {
+      getBrowserHealth: async () => structuredClone(health),
+      checkBrowserHealth: async () => {
+        healthCommands.push('check');
+        health = {
+          status: 'checking',
+          version: null,
+          stage: 'launch',
+          reason: null,
+        };
+        if (holdHealth)
+          await new Promise<void>((r) => {
+            releaseHealth = r;
+          });
+        health = nextHealth;
+        return {
+          status: health.status === 'passed' ? 'ok' : 'blocked',
+          view: structuredClone(health),
+        };
+      },
+      openBrowserUpdate: async () => {
+        healthCommands.push('update');
+        health = {
+          status: 'update_open',
+          version: null,
+          reason: null,
+          stage: null,
+        };
+        return { status: 'ok', view: structuredClone(health) };
+      },
       batch: {
         getCurrent: async () => null,
         prepare: async () => ({

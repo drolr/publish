@@ -1,3 +1,9 @@
+import { createCoverAssetStore } from '../../src/infrastructure/assets/cover-asset-store';
+import { createCoverSaveService } from '../../src/application/cover-save';
+import { ImportFailure } from '../../src/domain/import-error';
+import type { RichWebPasteConverter } from '../../src/domain/ports/rich-web-paste';
+import { manualSessionFromEditable } from '../../src/application/manual-article-mapper';
+import { upgradeEditorBody } from '../../src/domain/rich-text-body';
 import { afterEach, expect, it } from 'vitest';
 import sharp from 'sharp';
 import { createHash, randomUUID } from 'node:crypto';
@@ -15,10 +21,7 @@ import {
   ManualStateSchema,
   type ManualState,
 } from '../../src/contracts/manual-article';
-import type {
-  WebPasteConverter,
-  WebPasteImageReader,
-} from '../../src/domain/ports/web-paste';
+import type { WebPasteImageReader } from '../../src/domain/ports/web-paste';
 import type { DocumentCommand } from '../../src/contracts/manual-edit';
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -64,9 +67,16 @@ async function setup() {
       grant = id;
     },
   });
-  const converter: WebPasteConverter = {
+  const converter: RichWebPasteConverter = {
     convert: async () => ({
-      blocks: [{ type: 'paragraph', text: 'Paste' }],
+      version: 2 as const,
+      warnings: ['PLAIN_ONLY' as const],
+      blocks: [
+        {
+          type: 'paragraph',
+          content: [{ type: 'text' as const, text: 'Paste', marks: [] }],
+        },
+      ],
       plainOnly: true,
     }),
   };
@@ -75,6 +85,9 @@ async function setup() {
       throw Error('Network forbidden');
     },
   };
+  const coverAssets = createCoverAssetStore(root, r.repository);
+  const coverWriter = createCoverSaveService(r.repository, coverAssets);
+  let bodyWrites = 0;
   const manual = createManualArticleController({
     newId: randomUUID,
     externalExists: (id) => !!r.repository.findExternal(id),
@@ -95,13 +108,33 @@ async function setup() {
     converter,
     pasteImages,
     documents: {
+      covers: {
+        picker: {
+          pick: async () => [
+            {
+              bytes: png,
+              mime: 'image/png',
+              width: 1,
+              height: 1,
+              sha256: createHash('sha256').update(png).digest('hex'),
+            },
+          ],
+        },
+        loadCover: r.repository.loadCover,
+        readImage: coverAssets.readCoverAsset,
+        save: coverWriter.save,
+        getSaveResult: coverWriter.getSaveResult,
+      },
       createEditorCompatibilityLease:
         r.repository.createEditorCompatibilityLease,
       releaseEditorCompatibilityLease:
         r.repository.releaseEditorCompatibilityLease,
       loadEditableArticle: r.repository.loadEditableArticle,
       storedImages: r.images,
-      saveRevision: revision.saveRevision,
+      saveRevision: (...args) => {
+        bodyWrites++;
+        return revision.saveRevision(...args);
+      },
       getSaveResult: revision.getSaveResult,
       clipboard,
       digest: (value) =>
@@ -126,6 +159,9 @@ async function setup() {
   return {
     ...r,
     manual,
+    coverAssets,
+    coverWriter,
+    bodyWrites: () => bodyWrites,
     revision,
     clipboard,
     converter,
@@ -200,7 +236,13 @@ it('a formal version change during saved-image binding keeps the receipt base an
   await r.manual.applyManualEdit(command(initial, 1), {
     ...initial.draft,
     title: 'New',
-    blocks: [{ ...initial.draft.blocks[0], type: 'paragraph', text: 'Body' }],
+    blocks: [
+      {
+        ...initial.draft.blocks[0],
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+      },
+    ],
   });
   const text = session(r.manual.getManualArticleState());
   const end = {
@@ -381,16 +423,19 @@ it('compatibility witness denies forged, foreign session/instance and revoked le
     },
     title: article.title,
     contentDeclaration: article.contentDeclaration,
-    editorBody: {
-      version: 1,
-      blocks: [
-        { type: 'paragraph', text: 'Body' },
-        ...Array.from({ length: positions }, () => ({
-          type: 'image' as const,
-          imageId: 'i',
-        })),
-      ],
-    },
+    editorBody: upgradeEditorBody(
+      {
+        version: 1,
+        blocks: [
+          { type: 'paragraph', text: 'Body' },
+          ...Array.from({ length: positions }, () => ({
+            type: 'image' as const,
+            imageId: 'i',
+          })),
+        ],
+      },
+      [],
+    ),
     images: [{ kind: 'stored', imageId: 'i', lease: authorized.lease }],
   });
   expect(
@@ -500,7 +545,13 @@ it('a cleanup failure cannot be cleared by querying a receipt and discarding a v
   await r.manual.applyManualEdit(command(initial, 1), {
     ...initial.draft,
     title: 'Conflict',
-    blocks: [{ ...initial.draft.blocks[0], type: 'paragraph', text: 'Body' }],
+    blocks: [
+      {
+        ...initial.draft.blocks[0],
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+      },
+    ],
   });
   const text = session(r.manual.getManualArticleState());
   const end = {
@@ -552,7 +603,13 @@ it('a noncanonical title is a known invalid save before any article or receipt e
   await r.manual.applyManualEdit(command(initial, 1), {
     ...initial.draft,
     title: '  Title  ',
-    blocks: [{ ...initial.draft.blocks[0], type: 'paragraph', text: 'Body' }],
+    blocks: [
+      {
+        ...initial.draft.blocks[0],
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+      },
+    ],
   });
   const s = session(r.manual.getManualArticleState());
   const save = {
@@ -700,7 +757,13 @@ it('legacy picker and paste invalidate an outstanding document ticket without ac
   await r.manual.applyManualEdit(command(initial, initial.nextClientSequence), {
     ...initial.draft,
     title: 'Interleaved',
-    blocks: [{ ...initial.draft.blocks[0], type: 'paragraph', text: 'Body' }],
+    blocks: [
+      {
+        ...initial.draft.blocks[0],
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+      },
+    ],
   });
   const before = session(r.manual.getManualArticleState()),
     held = command(before, before.nextClientSequence);
@@ -853,7 +916,13 @@ async function grantTarget(
   await r.manual.applyManualEdit(command(to, to.nextClientSequence), {
     ...to.draft,
     title: 'Target',
-    blocks: [{ ...to.draft.blocks[0], type: 'paragraph', text: 'Target body' }],
+    blocks: [
+      {
+        ...to.draft.blocks[0],
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'Target body', marks: [] }],
+      },
+    ],
   });
   if (ownImage) {
     const bytes = await sharp({
@@ -879,6 +948,8 @@ async function grantTarget(
   }
   if (candidates) {
     r.converter.convert = async () => ({
+      version: 2 as const,
+      warnings: [],
       blocks: Array.from({ length: candidates }, () => ({
         type: 'image',
         source: undefined,
@@ -954,6 +1025,8 @@ it('same-target internal grant reuse adds zero unique tokens at a full retained 
   const first = session(r.manual.getManualArticleState()),
     token = first.images[0].imageToken;
   r.converter.convert = async () => ({
+    version: 2 as const,
+    warnings: [],
     blocks: Array.from({ length: 199 }, () => ({
       type: 'image',
       source: undefined,
@@ -1030,6 +1103,8 @@ it('first same-live-session Cut/Paste at full occupancy preserves the exact orig
   await r.manual.waitForSettlement();
   let state = session(r.manual.getManualArticleState());
   r.converter.convert = async () => ({
+    version: 2 as const,
+    warnings: [],
     blocks: Array.from({ length: 199 }, () => ({
       type: 'image',
       source: undefined,
@@ -1182,7 +1257,13 @@ it('legacy ready progress and no-op updates keep document tickets stable, while 
   await r.manual.applyManualEdit(command(initial, initial.nextClientSequence), {
     ...initial.draft,
     title: 'Legacy progress',
-    blocks: [{ ...initial.draft.blocks[0], type: 'paragraph', text: 'Body' }],
+    blocks: [
+      {
+        ...initial.draft.blocks[0],
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+      },
+    ],
   });
   let release!: () => void;
   const wait = new Promise<void>((resolve) => {
@@ -1193,6 +1274,8 @@ it('legacy ready progress and no-op updates keep document tickets stable, while 
     return r.images.authorizeBytes(sid, png, signal);
   };
   r.converter.convert = async () => ({
+    version: 2 as const,
+    warnings: [],
     blocks: [{ type: 'image', source: 'https://example.invalid/image.png' }],
     plainOnly: false,
   });
@@ -1333,7 +1416,13 @@ it('first Cut/Paste with 200 actual owned tokens preserves the selected origin r
   await r.manual.applyManualEdit(command(initial, initial.nextClientSequence), {
     ...initial.draft,
     title: 'Full owned token budget',
-    blocks: [{ ...initial.draft.blocks[0], type: 'paragraph', text: 'Body' }],
+    blocks: [
+      {
+        ...initial.draft.blocks[0],
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+      },
+    ],
   });
   for (let n = 0; n < 200; n++) {
     const state = session(r.manual.getManualArticleState());
@@ -1521,7 +1610,13 @@ it.each(['moved', 'deleted', 'changed'] as const)(
     await r.manual.applyManualEdit(command(initial, 1), {
       ...initial.draft,
       title: 'Fixture',
-      blocks: [{ ...initial.draft.blocks[0], type: 'paragraph', text: 'Body' }],
+      blocks: [
+        {
+          ...initial.draft.blocks[0],
+          type: 'paragraph',
+          content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+        },
+      ],
     });
     const text = session(r.manual.getManualArticleState());
     const end = {
@@ -1611,3 +1706,378 @@ it.each(['moved', 'deleted', 'changed'] as const)(
     ).toEqual(png);
   },
 );
+
+it('legacy NULL no-change document save settles unchanged without recovery lock', async () => {
+  const r = await setup();
+  await r.manual.openManualArticle(r.article.articleKey);
+  await r.manual.waitForSettlement();
+  await commit(r.manual);
+  const state = session(r.manual.getManualArticleState());
+  expect(state.saveOutcome).toMatchObject({
+    kind: 'unchanged',
+    articleRevision: 1,
+  });
+  expect(r.manual.isBlocked()).toBe(false);
+  expect(
+    r.repository.loadEditableArticle(r.article.articleKey)?.editorBody,
+  ).toBeNull();
+});
+
+it('V2 loader preserves rich leaves and containers with fresh nested session keys', async () => {
+  const r = await setup();
+  const editable = r.repository.loadEditableArticle(r.article.articleKey)!;
+  const body = upgradeEditorBody(editable.editorBody, editable.article.body);
+  const plain = manualSessionFromEditable(
+    { ...editable, editorBody: body },
+    1,
+    randomUUID,
+  );
+  expect(plain.session.draft.blocks[0]).toMatchObject({
+    type: 'paragraph',
+    content: [{ text: ' 原文😀\n ', marks: [] }],
+  });
+  const paragraph = body.blocks[0];
+  if (paragraph.type !== 'paragraph') throw Error('fixture');
+  paragraph.content[0].marks = ['bold'];
+  expect(
+    manualSessionFromEditable({ ...editable, editorBody: body }, 1, randomUUID)
+      .session.draft.blocks[0],
+  ).toMatchObject(paragraph);
+  for (const block of [
+    { type: 'heading' as const, content: paragraph.content },
+    {
+      type: 'list' as const,
+      kind: 'ordered' as const,
+      start: 3,
+      items: [paragraph],
+    },
+    { type: 'blockquote' as const, paragraphs: [paragraph] },
+  ]) {
+    const first = manualSessionFromEditable(
+      { ...editable, editorBody: { version: 2, blocks: [block] } },
+      1,
+      randomUUID,
+    ).session;
+    const second = manualSessionFromEditable(
+      { ...editable, editorBody: { version: 2, blocks: [block] } },
+      1,
+      randomUUID,
+    ).session;
+    expect(first.draft.bodyVersion).toBe(2);
+    expect(first.draft.blocks[0]).toMatchObject(block);
+    expect(first.draft.blocks[0].blockKey).not.toBe(
+      second.draft.blocks[0].blockKey,
+    );
+    expect(JSON.stringify(first.draft)).toContain('bold');
+    if (
+      first.draft.blocks[0].type === 'list' &&
+      second.draft.blocks[0].type === 'list'
+    )
+      expect(first.draft.blocks[0].items[0].blockKey).not.toBe(
+        second.draft.blocks[0].items[0].blockKey,
+      );
+  }
+});
+
+it('rich save/reopen and cross-session copy retain complete format, image bytes and independent identities', async () => {
+  const r = await setup();
+  await r.manual.openManualArticle(r.article.articleKey);
+  await r.manual.waitForSettlement();
+  const opened = session(r.manual.getManualArticleState());
+  const image = opened.draft.blocks.find((b) => b.type === 'image')!;
+  const rich = {
+    ...opened.draft,
+    title: 'Rich saved',
+    blocks: [
+      {
+        type: 'heading' as const,
+        blockKey: randomUUID(),
+        content: [
+          { type: 'text' as const, text: 'A😀B', marks: ['bold' as const] },
+        ],
+      },
+      {
+        type: 'list' as const,
+        kind: 'ordered' as const,
+        start: 7,
+        blockKey: randomUUID(),
+        items: [
+          {
+            type: 'paragraph' as const,
+            blockKey: randomUUID(),
+            content: [
+              {
+                type: 'text' as const,
+                text: 'item\nnext',
+                marks: ['italic' as const, 'underline' as const],
+              },
+            ],
+          },
+        ],
+      },
+      image,
+      {
+        type: 'blockquote' as const,
+        blockKey: randomUUID(),
+        paragraphs: [
+          { type: 'paragraph' as const, blockKey: randomUUID(), content: [] },
+        ],
+      },
+    ],
+  };
+  expect(
+    (
+      await r.manual.applyManualEdit(
+        command(opened, opened.nextClientSequence),
+        rich,
+      )
+    ).status,
+  ).toBe('ok');
+  await commit(r.manual);
+  const saved = session(r.manual.getManualArticleState());
+  expect(saved.saveOutcome).toMatchObject({
+    kind: 'updated',
+    articleKey: r.article.articleKey,
+    articleRevision: 2,
+  });
+  const stored = r.repository.loadEditableArticle(r.article.articleKey)!;
+  expect(JSON.stringify(stored.editorBody)).not.toContain('blockKey');
+  expect(stored.editorBody).toMatchObject({
+    version: 2,
+    blocks: [
+      { type: 'heading', content: [{ marks: ['bold'] }] },
+      { type: 'list', start: 7 },
+      { type: 'image' },
+      { type: 'blockquote' },
+    ],
+  });
+  await r.manual.closeManualEditor(
+    command(saved, saved.nextClientSequence),
+    'discard',
+  );
+  await r.manual.openManualArticle(r.article.articleKey);
+  await r.manual.waitForSettlement();
+  const source = session(r.manual.getManualArticleState());
+  expect(source.draft.blocks[0].blockKey).not.toBe(rich.blocks[0].blockKey);
+  expect(source.draft.blocks[1]).toMatchObject({
+    type: 'list',
+    start: 7,
+    items: [
+      { content: [{ text: 'item\nnext', marks: ['italic', 'underline'] }] },
+    ],
+  });
+  await r.manual.copyManualSelection(
+    command(source, source.nextClientSequence),
+    {
+      anchor: {
+        blockKey: source.draft.blocks[0].blockKey,
+        kind: 'edge',
+        side: 'before',
+      },
+      head: {
+        blockKey: source.draft.blocks.at(-1)!.blockKey,
+        kind: 'edge',
+        side: 'after',
+      },
+    },
+    false,
+  );
+  await r.manual.waitForSettlement();
+  const copied = session(r.manual.getManualArticleState());
+  await r.manual.closeManualEditor(
+    command(copied, copied.nextClientSequence),
+    'discard',
+  );
+  const target = session((await r.manual.beginManualArticle()).snapshot),
+    at = {
+      blockKey: target.draft.blocks[0].blockKey,
+      kind: 'text' as const,
+      offset: 0,
+    };
+  await r.manual.spliceManualPaste(
+    command(target, target.nextClientSequence),
+    { anchor: at, head: at },
+    { kind: 'internal', grantId: r.grant() },
+  );
+  await r.manual.waitForSettlement();
+  const pasted = session(r.manual.getManualArticleState());
+  expect(pasted.sessionId).not.toBe(source.sessionId);
+  expect(pasted.images[0].imageToken).not.toBe(source.images[0].imageToken);
+  expect(JSON.stringify(pasted.draft)).toContain('bold');
+  expect(pasted.draft.blocks.find((b) => b.type === 'list')).toMatchObject({
+    start: 7,
+    items: [
+      { content: [{ text: 'item\nnext', marks: ['italic', 'underline'] }] },
+    ],
+  });
+  const sourceKeys = new Set(
+    source.draft.blocks.flatMap((b) => [
+      b.blockKey,
+      ...(b.type === 'list'
+        ? b.items
+        : b.type === 'blockquote'
+          ? b.paragraphs
+          : []
+      ).map((p) => p.blockKey),
+    ]),
+  );
+  for (const b of pasted.draft.blocks)
+    for (const key of [
+      b.blockKey,
+      ...(b.type === 'list'
+        ? b.items
+        : b.type === 'blockquote'
+          ? b.paragraphs
+          : []
+      ).map((p) => p.blockKey),
+    ])
+      expect(sourceKeys.has(key)).toBe(false);
+  expect(
+    (
+      await r.images.read(
+        pasted.sessionId,
+        pasted.images[0].imageToken,
+        new AbortController().signal,
+      )
+    ).bytes,
+  ).toEqual(png);
+});
+
+it('persists body once then retries only a journal-cleaned failed creation cover with the same article identity', async () => {
+  const runtime = await setup();
+  const { manual, repository, coverAssets } = runtime;
+  const initial = session((await manual.beginManualArticle()).snapshot);
+  await manual.applyManualEdit(command(initial, 1), {
+    ...initial.draft,
+    title: 'Combined creation cover',
+    blocks: [
+      {
+        type: 'paragraph',
+        blockKey: randomUUID(),
+        content: [{ type: 'text', text: 'Body', marks: [] }],
+      },
+    ],
+  });
+  let current = session(manual.getManualArticleState());
+  const countBefore = repository.listCoverOperations().length;
+  await manual.pickManualCoverImage({
+    sessionId: current.sessionId,
+    expectedCoverDraftRevision: 0,
+  });
+  await manual.waitForSettlement();
+  current = session(manual.getManualArticleState());
+  expect(current.target.kind).toBe('new');
+  expect(repository.listCoverOperations()).toHaveLength(countBefore);
+  const prepare = coverAssets.prepareCoverFiles;
+  coverAssets.prepareCoverFiles = async () => {
+    throw new ImportFailure('IMAGE_UNAVAILABLE');
+  };
+  const firstCommand = {
+    sessionId: current.sessionId,
+    expectedDocumentRevision: current.documentRevision,
+    expectedCoverDraftRevision: current.cover!.draftRevision,
+    operationId: current.nextSaveOperationId,
+  };
+  expect((await manual.commitManualDocument(firstCommand)).status).toBe(
+    'started',
+  );
+  await manual.waitForSettlement();
+  current = session(manual.getManualArticleState());
+  expect(current.dirty).toBe(false);
+  expect(current.hasUnsavedChanges).toBe(true);
+  expect(current.cover!.outcome!.status).toBe('failed');
+  const savedTarget = current.target;
+  if (savedTarget.kind !== 'existing') throw Error('Expected saved identity');
+  expect(repository.loadCover(savedTarget.articleKey)!.coverRevision).toBe(0);
+  const failed = repository.listCoverOperations().at(-1)!;
+  expect(failed).toMatchObject({
+    status: 'failed',
+    cleanupComplete: true,
+    articleKey: savedTarget.articleKey,
+  });
+  expect(runtime.bodyWrites()).toBe(1);
+  expect((await manual.commitManualDocument(firstCommand)).status).toBe('ok');
+  expect(repository.listCoverOperations()).toHaveLength(countBefore + 1);
+  coverAssets.prepareCoverFiles = prepare;
+  await manual.commitManualDocument({
+    ...firstCommand,
+    operationId: current.nextSaveOperationId,
+  });
+  await manual.waitForSettlement();
+  current = session(manual.getManualArticleState());
+  expect(runtime.bodyWrites()).toBe(1);
+  expect(current.target).toEqual(savedTarget);
+  expect(current.hasUnsavedChanges).toBe(false);
+  const head = repository.loadCover(savedTarget.articleKey)!;
+  expect(head).toMatchObject({ mode: 'single', coverRevision: 1 });
+  expect(
+    await coverAssets.readCoverAsset(head, head.assets[0].assetKey),
+  ).toEqual(png);
+  const preview = await manual.getManualCoverImage(
+    current.sessionId,
+    current.cover!.image!.imageToken,
+  );
+  expect(preview.status).toBe('ok');
+  ManualStateSchema.parse(current);
+});
+
+it('opening legacy triple covers preserves the exact saved head during body-only save and supports cover-only clear', async () => {
+  const runtime = await setup();
+  const { manual, repository, coverWriter, article } = runtime;
+  const original = repository.loadEditableArticle(article.articleKey)!;
+  const coverIntent = {
+    operationId: randomUUID(),
+    sessionId: randomUUID(),
+    articleKey: article.articleKey,
+    expectedArticleRevision: original.articleRevision,
+    expectedCoverRevision: 0,
+    draftRevision: 1,
+    mode: 'triple' as const,
+    payloadDigest: 'a'.repeat(64),
+    startedAt: new Date().toISOString(),
+  };
+  expect(
+    (
+      await coverWriter.save(
+        coverIntent,
+        async () => [{ bytes: png }, { bytes: png }, { bytes: png }],
+        new AbortController().signal,
+        () => true,
+      )
+    ).status,
+  ).toBe('committed');
+  const head = repository.loadCover(article.articleKey)!;
+  await manual.openManualArticle(article.articleKey);
+  await manual.waitForSettlement();
+  let current = session(manual.getManualArticleState());
+  expect(current.cover).toMatchObject({
+    mode: 'triple',
+    dirty: false,
+    baseCoverRevision: 1,
+  });
+  await manual.applyManualEdit(command(current, 1), {
+    ...current.draft,
+    title: 'Updated body keeps triple',
+  });
+  await commit(manual);
+  expect(repository.loadCover(article.articleKey)).toEqual(head);
+  expect(repository.listCoverOperations()).toHaveLength(1);
+  current = session(manual.getManualArticleState());
+  await manual.setManualCoverMode(
+    { sessionId: current.sessionId, expectedCoverDraftRevision: 0 },
+    'none',
+  );
+  current = session(manual.getManualArticleState());
+  await manual.commitManualDocument({
+    sessionId: current.sessionId,
+    expectedDocumentRevision: current.documentRevision,
+    expectedCoverDraftRevision: current.cover!.draftRevision,
+    operationId: current.nextSaveOperationId,
+  });
+  await manual.waitForSettlement();
+  expect(runtime.bodyWrites()).toBe(1);
+  expect(repository.loadCover(article.articleKey)).toMatchObject({
+    mode: 'none',
+    coverRevision: 2,
+  });
+});

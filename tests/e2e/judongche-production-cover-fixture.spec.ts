@@ -5,6 +5,7 @@ import {
   assertOwnedCoverModal,
   type OwnedCoverModalProof,
   type CoverStageGate,
+  type CoverTerminalDiagnostic,
 } from '../../src/infrastructure/platforms/judongche/production-cover-driver';
 import { unknownEditorEvidence } from '../../src/infrastructure/platforms/judongche/content-evidence';
 import { createLocalCoverUploader } from '../../src/infrastructure/platforms/judongche/cover-pages';
@@ -12,7 +13,11 @@ import { coverInput } from '../fixtures/judongche-cover';
 import { denyExternalNetwork } from './network-policy';
 
 test.beforeEach(async ({ context }) => denyExternalNetwork(context));
-async function fixture(page: Page, stages?: CoverStageGate) {
+async function fixture(
+  page: Page,
+  stages?: CoverStageGate,
+  terminalDiagnostic?: (event: CoverTerminalDiagnostic) => void,
+) {
   await page.route('https://www.autoengine.com/**', (r) =>
     r.fulfill({ contentType: 'text/html', body: html }),
   );
@@ -53,6 +58,7 @@ async function fixture(page: Page, stages?: CoverStageGate) {
     readEditor: read,
     invalidateInspection: () => {},
     stages,
+    terminalDiagnostic,
   });
   const actions = () =>
     page.evaluate(() => (window as unknown as { actions: string[] }).actions);
@@ -153,6 +159,11 @@ for (const fault of [
       await page
         .locator('input[type=file]')
         .evaluate((e) => e.replaceWith(e.cloneNode(true)));
+    if (fault === 'body') {
+      await f.driver.guard();
+      expect(await f.actions()).toEqual(['open']);
+      return;
+    }
     await expect(f.driver.upload(coverInput('single').files)).rejects.toThrow();
     expect(await f.actions()).toEqual(['open']);
   });
@@ -164,17 +175,54 @@ for (const mode of ['single', 'triple'] as const) {
       ' selection then unknown post-upload blocks all confirm/cancel/retry',
     async ({ page }) => {
       const f = await fixture(page);
+      if (mode === 'single') {
+        // Two 90s terminal waits plus one controlled retry need more than test.slow().
+        test.setTimeout(240000);
+        // The production fixture records only mode/open/upload. Real cancel is a
+        // platform footer action; inject the exact button the driver owns.
+        await page.evaluate(() => {
+          const actions = (window as unknown as { actions: string[] }).actions;
+          new MutationObserver(() => {
+            const modal = document.querySelector('[role=dialog]');
+            if (!modal || modal.querySelector('[data-fixture-cancel]')) return;
+            const button = document.createElement('button');
+            button.dataset.fixtureCancel = '';
+            button.textContent = '取消';
+            button.addEventListener('click', () => {
+              actions.push('cancel');
+              document.querySelector('#layer')?.remove();
+            });
+            modal.append(button);
+          }).observe(document.body, { childList: true, subtree: true });
+        });
+      }
       const result = await f.upload(coverInput(mode), () => false);
+      if (mode === 'single') {
+        expect(result).toMatchObject({
+          status: 'blocked',
+          reason: 'COVER_UPLOAD_FAILED',
+          safeEditorProof: { modalClosed: true, uploadsSettled: true },
+        });
+        const actions = await f.actions();
+        expect(actions.filter((a) => a === 'open')).toHaveLength(2);
+        expect(actions.filter((a) => a === 'upload')).toHaveLength(2);
+        expect(actions.filter((a) => a === 'cancel')).toHaveLength(2);
+        expect(actions.some((a) => a.startsWith('confirm:'))).toBe(false);
+        expect(await f.driver.inspect()).toMatchObject({
+          modal: 'closed',
+          settlement: 'settled',
+        });
+        await expect(f.driver.upload(coverInput(mode).files)).rejects.toThrow();
+        return;
+      }
       expect(result).toEqual({
         status: 'blocked',
-        reason: mode === 'single' ? 'PAGE_CHANGED' : 'INPUT_UNSUPPORTED',
+        reason: 'INPUT_UNSUPPORTED',
       });
-      expect(await f.actions()).toEqual(
-        mode === 'single' ? ['open', 'upload'] : ['mode', 'open'],
-      );
+      expect(await f.actions()).toEqual(['mode', 'open']);
       expect(await f.driver.inspect()).toMatchObject({
         modal: 'owned',
-        settlement: mode === 'single' ? 'unknown' : 'settled',
+        settlement: 'settled',
         result: null,
         libraryChecked: null,
         items: [],
@@ -206,8 +254,12 @@ test('candidate post loaded preview and false checkbox without terminal/resource
   expect(await f.actions()).toEqual(['open', 'upload']);
 });
 
-async function candidate(page: Page, fault = '') {
-  const f = await fixture(page);
+async function candidate(
+  page: Page,
+  fault = '',
+  terminalDiagnostic?: (event: CoverTerminalDiagnostic) => void,
+) {
+  const f = await fixture(page, undefined, terminalDiagnostic);
   await page.route('https://cover-resource.invalid/**', (r) =>
     r.fulfill({
       contentType: 'image/png',
@@ -274,6 +326,74 @@ async function candidate(page: Page, fault = '') {
     );
   return { ...f, retainedInput };
 }
+
+for (const fault of [
+  'progress',
+  'marker',
+  'preview-loading',
+  'file-association',
+  'node-change',
+  'none',
+] as const) {
+  test(`T1 terminal diagnostics isolate unmet evidence without changing settlement: ${fault}`, async ({
+    page,
+  }) => {
+    const diagnostics: CoverTerminalDiagnostic[] = [];
+    const f = await candidate(page, '', (event) => diagnostics.push(event));
+    if (fault === 'node-change') await f.driver.inspect();
+    await page.locator('[role=dialog]').evaluate((modal, fault) => {
+      if (fault === 'progress')
+        modal.insertAdjacentHTML('beforeend', '<progress></progress>');
+      if (fault === 'marker') modal.querySelector('span')!.remove();
+      if (fault === 'preview-loading')
+        Object.defineProperty(modal.querySelector('img')!, 'complete', {
+          value: false,
+        });
+      if (fault === 'file-association') {
+        const input =
+          modal.querySelector<HTMLInputElement>('input[type=file]')!;
+        const transfer = new DataTransfer();
+        transfer.items.add(
+          new File(['private'], 'private.png', { type: 'image/png' }),
+        );
+        input.files = transfer.files;
+      }
+      if (fault === 'node-change')
+        modal
+          .querySelector('img')!
+          .replaceWith(modal.querySelector('img')!.cloneNode(true));
+    }, fault);
+    if (fault === 'node-change')
+      await expect(f.driver.inspect()).rejects.toMatchObject({
+        reason: 'PAGE_CHANGED',
+        check: 'cover-node-replaced',
+      });
+    else
+      expect((await f.driver.inspect()).settlement).toBe(
+        fault === 'none' ? 'settled' : 'unknown',
+      );
+    expect(diagnostics.at(-1)).toMatchObject({
+      ...{
+        progress: { busy: true },
+        marker: { completionMarkerCount: 0 },
+        'preview-loading': { previewLoaded: false },
+        'file-association': { selectedFileRetained: false },
+        'node-change': { previewNodeStable: false },
+        none: {
+          busy: false,
+          completionMarkerCount: 1,
+          previewLoaded: true,
+          selectedFileRetained: true,
+          previewNodeStable: true,
+        },
+      }[fault],
+    });
+    expect(JSON.stringify(diagnostics)).not.toMatch(
+      /private|https:|assetKey|sha256|resourceKey|signature|bytes/,
+    );
+    expect(await f.actions()).toEqual(['open', 'upload']);
+  });
+}
 test('candidate single exact HTTPS identity is retained through false and complete modal closure', async ({
   page,
 }) => {
@@ -301,8 +421,13 @@ for (const fault of [
   'input-unmount',
 ] as const) {
   test('candidate fault fails closed: ' + fault, async ({ page }) => {
+    // The typed incomplete terminal is only decidable at the 90s deadline.
+    if (fault === 'no-terminal') test.slow();
     const f = await candidate(page, fault);
-    if (['no-terminal', 'blob'].includes(fault)) {
+    if (fault === 'no-terminal') {
+      expect(await f.driver.waitForUpload()).toBe('incomplete');
+      expect((await f.driver.inspect()).settlement).toBe('unknown');
+    } else if (fault === 'blob') {
       await expect(f.driver.waitForUpload()).rejects.toThrow();
       expect((await f.driver.inspect()).settlement).toBe('unknown');
     } else if (['resource-change', 'input-unmount'].includes(fault)) {
@@ -328,11 +453,12 @@ test('candidate false becomes true before confirmation: no click', async ({
   await expect(f.driver.confirm()).rejects.toThrow();
   expect(await f.actions()).toEqual(['open', 'upload']);
 });
-test('candidate settled cancel checks complete owned layer closure and exact same filled body', async ({
+test('candidate settled cancel checks owned layer closure independently of body normalization', async ({
   page,
 }) => {
   const f = await candidate(page, 'absent-checkbox');
   await f.driver.waitForUpload();
+  await page.locator('[contenteditable] p').fill('normalized body');
   await f.driver.cancel();
   expect(await f.driver.inspect()).toMatchObject({
     modal: 'closed',
@@ -379,6 +505,10 @@ test('one real uploader invocation crosses fixed stages with one selection and o
   const f = await fixture(page, {
     reserve: async (effect) => {
       reserves.push(effect);
+      if (effect !== 'open')
+        await page
+          .locator('[contenteditable] p')
+          .fill('normalization at ' + effect);
     },
     pause: async (name) => {
       stage = name;
@@ -426,16 +556,17 @@ test('stop releases paused invocation without confirmation or a second upload', 
   });
   expect(await f.actions()).toEqual(['open', 'upload']);
 });
-test('FileList cleared by platform stays unknown and never confirms', async ({
+test('FileList cleared after verified selection retains the pinned association', async ({
   page,
 }) => {
   const f = await candidate(page);
   await page
     .locator('input[type=file]')
     .evaluate((e) => ((e as HTMLInputElement).value = ''));
-  expect((await f.driver.inspect()).settlement).toBe('unknown');
-  await expect(f.driver.confirm()).rejects.toThrow();
-  expect(await f.actions()).toEqual(['open', 'upload']);
+  expect((await f.driver.inspect()).settlement).toBe('settled');
+  await f.driver.uncheckLibrary();
+  await f.driver.confirm();
+  expect(await f.actions()).toEqual(['open', 'upload', 'confirm']);
 });
 
 import { createJudongchePages } from '../../src/infrastructure/platforms/judongche/page-contract';

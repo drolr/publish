@@ -1,52 +1,16 @@
 import { z } from 'zod';
 import { IdentifierSchema } from './article-package';
 import { StorageIdSchema } from './stored-article';
-import {
-  DraftSnapshotBudgetSchema,
-  RevisionSchema,
-  codePointLength,
-  textWithin,
-  webPasteLimits,
-} from './web-paste';
+import { RevisionSchema } from './web-paste';
 export const ArticleRevisionSchema = z
   .number()
   .int()
   .positive()
   .max(Number.MAX_SAFE_INTEGER);
-const EditorBodyShape = z
-  .strictObject({
-    version: z.literal(1),
-    blocks: z
-      .array(
-        z.discriminatedUnion('type', [
-          z.strictObject({
-            type: z.literal('paragraph'),
-            text: textWithin(webPasteLimits.paragraphCodePoints),
-          }),
-          z.strictObject({
-            type: z.literal('image'),
-            imageId: IdentifierSchema,
-          }),
-        ]),
-      )
-      .max(webPasteLimits.blocks),
-  })
-  .superRefine((body, ctx) => {
-    if (
-      body.blocks.reduce(
-        (sum, b) =>
-          sum + (b.type === 'paragraph' ? codePointLength(b.text) : 0),
-        0,
-      ) > webPasteLimits.totalCodePoints
-    )
-      ctx.addIssue({ code: 'custom', message: '正文文字过多。' });
-  });
-// Persisted layout deliberately permits legacy repeated positions above the new-paste limit.
-export const PersistedEditorBodyV1Schema =
-  DraftSnapshotBudgetSchema.pipe(EditorBodyShape);
-export type PersistedEditorBodyV1 = z.output<
-  typeof PersistedEditorBodyV1Schema
->;
+export {
+  PersistedEditorBodyV1Schema,
+  type PersistedEditorBodyV1,
+} from './editor-body-v1';
 export const DocumentCommandSchema = z.strictObject({
   sessionId: StorageIdSchema,
   expectedDocumentRevision: RevisionSchema,
@@ -58,6 +22,7 @@ export const SaveCommandSchema = z.strictObject({
   sessionId: StorageIdSchema,
   expectedDocumentRevision: RevisionSchema,
   operationId: StorageIdSchema,
+  expectedCoverDraftRevision: RevisionSchema.optional(),
 });
 export type SaveCommand = z.output<typeof SaveCommandSchema>;
 export const DraftBoundarySchema = z.discriminatedUnion('kind', [

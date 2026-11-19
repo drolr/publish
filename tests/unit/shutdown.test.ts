@@ -1,3 +1,4 @@
+import type { ConvertedRichPaste } from '../../src/contracts/rich-web-paste';
 import { expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
@@ -142,10 +143,7 @@ function hosts() {
 }
 it('quit_waits_paste_and_cleanup_before_database even after parser abort', async () => {
   // Dropping any awaited controller work exposes database/destroy before settlement.
-  const parse = deferred<{
-    blocks: { type: 'paragraph'; text: string }[];
-    plainOnly: boolean;
-  }>();
+  const parse = deferred<ConvertedRichPaste>();
   const cleanup = deferred<void>();
   let signal!: AbortSignal;
   const { manual, begin } = manualFixture({
@@ -177,7 +175,14 @@ it('quit_waits_paste_and_cleanup_before_database even after parser abort', async
   expect(closing()).toBe(true);
   expect(host.events).toEqual([]);
   parse.resolve({
-    blocks: [{ type: 'paragraph', text: 'Body' }],
+    version: 2 as const,
+    warnings: [],
+    blocks: [
+      {
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+      },
+    ],
     plainOnly: false,
   });
   await flush();
@@ -373,8 +378,13 @@ it.each(['network', 'decoder'] as const)(
     const { manual, begin } = manualFixture({
       converter: {
         convert: async () => ({
+          version: 2 as const,
+          warnings: [],
           blocks: [
-            { type: 'paragraph', text: 'Body' },
+            {
+              type: 'paragraph',
+              content: [{ type: 'text' as const, text: 'Body', marks: [] }],
+            },
             { type: 'image', source: 'https://public.invalid/one.jpg' },
             { type: 'image', source: 'https://public.invalid/two.jpg' },
           ],

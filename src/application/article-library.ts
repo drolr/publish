@@ -1,3 +1,4 @@
+import { upgradeEditorBody } from '../domain/rich-text-body';
 import {
   ArticleCursorSchema,
   ListResultSchema,
@@ -60,6 +61,7 @@ export function createArticleLibrary(
             createdAt: article.createdAt,
             imageCount: article.assets.length,
             body: article.body,
+            editorBody: upgradeEditorBody(found.editorBody, article.body),
             assets: article.assets.map(
               ({ assetKey, imageId, mime, width, height }) => ({
                 assetKey,

@@ -1,12 +1,13 @@
 import {
   BatchPrepareInputSchema,
+  BatchRecoveryInputSchema,
   BatchStartInputSchema,
   BatchIdentityInputSchema,
   type BatchApi,
   type BatchSeed,
   type BatchCommandResult,
 } from '../contracts/draft-batch';
-import type { ReasonCode } from '../contracts/draft-task';
+import { ReasonCodeSchema, type ReasonCode } from '../contracts/draft-task';
 import { coverSummary } from '../contracts/cover-task';
 import { batchLocalReasons } from '../domain/draft-batch';
 import type { DraftBatchRepository } from '../domain/ports/draft-batch';
@@ -39,6 +40,7 @@ export function createBatchController(deps: {
     | {
         seed: BatchSeed;
         generation: string;
+        capabilityRevision: string;
         expires: number;
         versions: Array<{
           articleKey: string;
@@ -99,7 +101,11 @@ export function createBatchController(deps: {
       storageFailed = true;
     }
   }
-  async function loop(id: string, generation: string) {
+  async function loop(
+    id: string,
+    generation: string,
+    capabilityRevision: string,
+  ) {
     try {
       while (!stopping && !storageFailed) {
         const current = deps.repository.get(id);
@@ -129,7 +135,11 @@ export function createBatchController(deps: {
           return;
         }
         if (stopping) deps.draft.requestStop();
-        await deps.draft.executeBatchTask(task.taskId, generation);
+        await deps.draft.executeBatchTask(
+          task.taskId,
+          generation,
+          capabilityRevision,
+        );
         const after = deps.repository.settleItem(id, task.taskId, deps.now());
         if (after.state !== 'running') return;
       }
@@ -169,6 +179,117 @@ export function createBatchController(deps: {
       await api.waitForIdle();
     },
     getCurrent: async () => view(),
+    skipCurrentAndContinue: (input) =>
+      track(async () => {
+        const parsed = BatchRecoveryInputSchema.safeParse(input);
+        if (!parsed.success) return result('INPUT_UNSUPPORTED');
+        const reason = gate();
+        if (reason) return result(reason);
+        if (busy || running) return result('PLATFORM_BUSY');
+        let context: ReturnType<DraftBatchRepository['recovery']>;
+        try {
+          context = deps.repository.recovery(parsed.data);
+        } catch {
+          return result('STALE_PREPARATION');
+        }
+        busy = true;
+        stopping = false;
+        const ticket = ++epoch;
+        const cancelled = () => stopping || epoch !== ticket;
+        try {
+          // Capture persisted startup status before release; a non-null task ID
+          // is common after a crash and does not prove a live session.
+          const startup = view()?.state === 'interrupted';
+          let session:
+            | Awaited<ReturnType<DraftController['recoverBatchSession']>>
+            | undefined;
+          if (parsed.data.taskId) {
+            if (startup)
+              await deps.draft.releaseHandledTask(parsed.data.taskId);
+            else {
+              session = await deps.draft.releaseHandledTaskForContinuation(
+                parsed.data.taskId,
+                cancelled,
+              );
+              if (session.status === 'blocked') return result(session.reason);
+            }
+          }
+          if (cancelled()) return result('STOP_REQUESTED');
+          if (deps.draft.isActive() || deps.draft.isBlocked())
+            return result('PLATFORM_BUSY');
+          const verify = async () => {
+            for (const reservation of context.queued) {
+              const article = deps.articles.loadEditableArticle(
+                reservation.snapshot.article.articleKey,
+              );
+              const cover = deps.articles.loadCover(
+                reservation.snapshot.article.articleKey,
+              );
+              if (
+                article?.articleRevision !==
+                  reservation.expectedArticleRevision ||
+                (reservation.coverSnapshot &&
+                  (cover?.coverRevision !== reservation.expectedCoverRevision ||
+                    cover?.configurationDigest !==
+                      reservation.coverSnapshot.digest))
+              )
+                return false;
+              await deps.snapshots.verify(reservation.snapshot);
+              if (cancelled()) return false;
+            }
+            return true;
+          };
+          if (!(await verify()))
+            return result(cancelled() ? 'STOP_REQUESTED' : 'STALE_PREPARATION');
+          if (context.queued.length) {
+            if (startup)
+              session = await deps.draft.recoverBatchSession(context.store);
+            if (!session) return result('INPUT_UNSUPPORTED');
+            if (cancelled()) return result('STOP_REQUESTED');
+            if (session.status === 'blocked') return result(session.reason);
+            if (!(await verify()))
+              return result(
+                cancelled() ? 'STOP_REQUESTED' : 'STALE_PREPARATION',
+              );
+          }
+          const afterGate = gate();
+          if (afterGate || cancelled())
+            return result(afterGate ?? 'STOP_REQUESTED');
+          const resumed = deps.repository.skipCurrentAndContinue(
+            parsed.data,
+            deps.now(),
+          );
+          if (session?.status === 'ready' && resumed.state === 'running') {
+            const flight = loop(
+              resumed.id,
+              session.generation,
+              session.capabilityRevision,
+            );
+            running = flight;
+            void flight.finally(() => {
+              if (running === flight) running = undefined;
+            });
+          }
+          return result();
+        } catch (error) {
+          const parsedReason =
+            error instanceof Error
+              ? ReasonCodeSchema.safeParse(error.message)
+              : undefined;
+          const reason =
+            typeof error === 'object' &&
+            error !== null &&
+            'code' in error &&
+            error.code === 'ASSET_UNAVAILABLE'
+              ? 'ASSET_UNAVAILABLE'
+              : parsedReason?.success
+                ? parsedReason.data
+                : 'STORAGE_UNAVAILABLE';
+          return result(reason);
+        } finally {
+          busy = false;
+        }
+      }),
     prepare: (input) =>
       track(async () => {
         const parsed = BatchPrepareInputSchema.safeParse(input);
@@ -267,6 +388,11 @@ export function createBatchController(deps: {
                 return { status: 'blocked', reason: 'INPUT_UNSUPPORTED' };
               if (
                 first &&
+                selected.capabilityRevision !== first.capabilityRevision
+              )
+                return { status: 'blocked', reason: 'STALE_PREPARATION' };
+              if (
+                first &&
                 (selected.generation !== first.generation ||
                   selected.store.storeKey !== first.store.storeKey)
               )
@@ -324,6 +450,7 @@ export function createBatchController(deps: {
           prepared = {
             seed,
             generation: first.generation,
+            capabilityRevision: first.capabilityRevision,
             versions,
             expires: Date.parse(deps.now()) + 120000,
           };
@@ -415,7 +542,11 @@ export function createBatchController(deps: {
           });
           prepared = undefined;
           stopping = false;
-          const flight = loop(created.id, chosen.generation);
+          const flight = loop(
+            created.id,
+            chosen.generation,
+            chosen.capabilityRevision,
+          );
           running = flight;
           void flight.finally(() => {
             if (running === flight) running = undefined;

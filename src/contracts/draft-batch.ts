@@ -49,8 +49,15 @@ export const BatchStartInputSchema = z.strictObject({
 export const BatchIdentityInputSchema = z.strictObject({
   batchId: StorageIdSchema,
 });
+export const BatchRecoveryInputSchema = z.strictObject({
+  batchId: StorageIdSchema,
+  expectedRevision: z.number().int().nonnegative(),
+  taskId: StorageIdSchema.nullable(),
+});
+export type BatchRecoveryInput = z.infer<typeof BatchRecoveryInputSchema>;
 export const BatchItemViewSchema = z.strictObject({
   submission: SubmissionSchema.optional(),
+  saveAttempted: z.boolean().optional(),
   articleKey: StorageIdSchema,
   title: StoredArticleSchema.shape.title,
   contentDeclaration: z.enum(['original', 'repost']),
@@ -142,6 +149,9 @@ export type BatchPreparationView = z.infer<typeof BatchPreparationViewSchema>;
 export type BatchCommandResult = z.infer<typeof BatchCommandResultSchema>;
 export type BatchPrepareResult = z.infer<typeof BatchPrepareResultSchema>;
 export interface BatchApi {
+  skipCurrentAndContinue(
+    input: BatchRecoveryInput,
+  ): Promise<BatchCommandResult>;
   prepare(
     input: z.infer<typeof BatchPrepareInputSchema>,
   ): Promise<BatchPrepareResult>;
@@ -161,6 +171,7 @@ export interface BatchApi {
 }
 
 export const batchChannels = {
+  skipCurrentAndContinue: 'batch:skip-current-and-continue',
   prepare: 'batch:prepare',
   start: 'batch:start',
   stop: 'batch:stop',
@@ -169,6 +180,7 @@ export const batchChannels = {
   getCurrent: 'batch:state',
 } as const;
 export const batchRequests = {
+  skipCurrentAndContinue: z.tuple([BatchRecoveryInputSchema]),
   prepare: z.tuple([BatchPrepareInputSchema]),
   start: z.tuple([BatchStartInputSchema]),
   stop: z.tuple([BatchIdentityInputSchema]),
@@ -177,6 +189,7 @@ export const batchRequests = {
   getCurrent: z.tuple([]),
 };
 export const batchResponses = {
+  skipCurrentAndContinue: BatchCommandResultSchema,
   prepare: BatchPrepareResultSchema,
   start: BatchCommandResultSchema,
   stop: BatchCommandResultSchema,

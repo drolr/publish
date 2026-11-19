@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import {
   EditorState,
@@ -8,11 +8,14 @@ import {
   TextSelection,
   type Transaction,
 } from 'prosemirror-state';
-import { EditorView } from 'prosemirror-view';
-import { baseKeymap, chainCommands, exitCode } from 'prosemirror-commands';
+import { EditorView, Decoration, DecorationSet } from 'prosemirror-view';
+import { baseKeymap } from 'prosemirror-commands';
 import { history, undo, redo, closeHistory } from 'prosemirror-history';
 import { keymap } from 'prosemirror-keymap';
-import type { ManualDraft } from '../../contracts/manual-article';
+import {
+  isManualImageBlock,
+  type ManualDraft,
+} from '../../contracts/manual-article';
 import type {
   DraftRange,
   InternalPasteInput,
@@ -22,8 +25,8 @@ import { parseManualClipboardFragment } from '../../contracts/editor-close';
 import { editorSchema } from './editor-schema';
 import {
   documentPatch,
-  draftToEditor,
-  editorToDraft,
+  draftV2ToEditor,
+  editorToDraftV2,
   emptyEditorKey,
   rangeFromSelection,
 } from './editor-codec';
@@ -32,21 +35,73 @@ import {
   InlinePreviewPool,
   type ImageProjection,
 } from './InlineArticleImage';
+import { RichTextToolbar } from './RichTextToolbar';
+import {
+  applyRichEditorCommand,
+  readRichToolbarState,
+  richEditorEnter,
+  richEditorBackspace,
+  richEditorSoftBreak,
+  type RichEditorCommand,
+} from './editor-commands';
 import './editor.css';
-const keyedParagraphs = new Plugin({
+/** Attribute-only decorations keep safe-integer labels outside text/clipboard/AST. */
+export const orderedEditorMarkers = new Plugin({
+  props: {
+    decorations(state) {
+      const decorations: Decoration[] = [];
+      state.doc.descendants((node, pos) => {
+        if (
+          node.type.name !== 'ordered_list' ||
+          node.attrs.start + node.childCount - 1 <= 2147483647
+        )
+          return;
+        decorations.push(
+          Decoration.node(pos, pos + node.nodeSize, {
+            class: 'editor-ordered-list',
+            role: 'list',
+          }),
+        );
+        node.forEach((item, offset, index) =>
+          decorations.push(
+            Decoration.node(
+              pos + 1 + offset,
+              pos + 1 + offset + item.nodeSize,
+              {
+                'data-editor-ordinal': String(node.attrs.start + index),
+                role: 'listitem',
+              },
+            ),
+          ),
+        );
+      });
+      return DecorationSet.create(state.doc, decorations);
+    },
+  },
+});
+export const keyedEditorBlocks = new Plugin({
   appendTransaction(transactions, _old, state) {
     if (!transactions.some((t) => t.docChanged)) return null;
     const seen = new Set<string>();
     let tr: Transaction | undefined;
-    state.doc.forEach((node, pos) => {
+    state.doc.descendants((node, pos) => {
       const key = node.attrs.blockKey;
       if (
-        node.type.name === 'paragraph' &&
+        [
+          'paragraph',
+          'heading',
+          'ordered_list',
+          'bullet_list',
+          'blockquote',
+        ].includes(node.type.name) &&
         (!key || key === emptyEditorKey || seen.has(key))
       ) {
         tr ??= state.tr;
-        tr.setNodeMarkup(pos, undefined, { blockKey: crypto.randomUUID() });
-      } else seen.add(key);
+        tr.setNodeMarkup(pos, undefined, {
+          ...node.attrs,
+          blockKey: crypto.randomUUID(),
+        });
+      } else if (key) seen.add(key);
     });
     return tr ?? null;
   },
@@ -93,6 +148,8 @@ function synchronizeNativeSelection(
   publish(rangeFromSelection(editor.state.doc, editor.state.selection));
 }
 export function ContinuousBodyEditor(props: {
+  beforeBody?: React.ReactNode;
+  onInsertImage?: () => void;
   session: string;
   draft: ManualDraft;
   imageProjection: ImageProjection[];
@@ -102,6 +159,35 @@ export function ContinuousBodyEditor(props: {
   onCopyCut: (cut: boolean) => void;
   onRangeChange: (range: DraftRange) => void;
 }) {
+  const [toolbar, setToolbar] = useState(() => ({
+    format: readRichToolbarState(EditorState.create({ schema: editorSchema })),
+    canUndo: false,
+    canRedo: false,
+  }));
+  const queuedCommands = useRef<RichEditorCommand[]>([]);
+  const plainPasteUntil = useRef(0);
+  function updateToolbar(editor: EditorView) {
+    setToolbar({
+      format: readRichToolbarState(editor.state),
+      canUndo: undo(editor.state),
+      canRedo: redo(editor.state),
+    });
+  }
+  function executeCommand(command: RichEditorCommand) {
+    const editor = view.current;
+    if (!editor || !latest.current.editable) return;
+    if (composition.current || editor.composing) {
+      queuedCommands.current.push(command);
+      return;
+    }
+    synchronizeNativeSelection(editor, (range) => {
+      latest.current.onRangeChange(range);
+      updateToolbar(editor);
+    });
+    applyRichEditorCommand(editor, command);
+    updateToolbar(editor);
+    editor.focus();
+  }
   const host = useRef<HTMLDivElement>(null),
     view = useRef<EditorView | undefined>(undefined);
   const latest = useRef(props);
@@ -113,7 +199,16 @@ export function ContinuousBodyEditor(props: {
     endTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const compositionGeneration = useRef(0);
   for (const block of props.draft.blocks)
-    if (block.type !== 'paragraph') images.current.set(block.blockKey, block);
+    if (isManualImageBlock(block)) images.current.set(block.blockKey, block);
+  // Title input may temporarily violate the contract. Validate the body projection
+  // independently, then return the raw title to the existing session validator.
+  function readDraft(doc: EditorState['doc']) {
+    const raw = latest.current.draft;
+    const body = editorToDraftV2(doc, { ...raw, title: '' }, [
+      ...images.current.values(),
+    ]);
+    return { ...raw, blocks: body.blocks };
+  }
   function projection(key: string) {
     return (
       latest.current.imageProjection.find((p) => p.blockKey === key) ?? {
@@ -126,10 +221,14 @@ export function ContinuousBodyEditor(props: {
     if (!host.current) return;
     images.current = new Map(
       latest.current.draft.blocks
-        .filter((b) => b.type !== 'paragraph')
+        .filter(isManualImageBlock)
         .map((b) => [b.blockKey, b]),
     );
-    const previews = new InlinePreviewPool(host.current);
+    const previews = new InlinePreviewPool(
+      props.beforeBody
+        ? (host.current.closest<HTMLElement>('main') ?? host.current)
+        : host.current,
+    );
     pool.current = previews;
     const renderImage = (key: string, root: Root) =>
       root.render(
@@ -143,23 +242,52 @@ export function ContinuousBodyEditor(props: {
     const editor = new EditorView(host.current, {
       state: EditorState.create({
         schema: editorSchema,
-        doc: draftToEditor(latest.current.draft),
+        doc: draftV2ToEditor({ ...latest.current.draft, title: '' }),
         plugins: [
-          keyedParagraphs,
+          keyedEditorBlocks,
+          orderedEditorMarkers,
           history({ depth: 100, newGroupDelay: 500 }),
           keymap({
-            'Mod-z': undo,
-            'Mod-y': redo,
-            'Mod-Shift-z': redo,
-            'Shift-Enter': chainCommands(exitCode, (state, dispatch) => {
-              if (dispatch)
-                dispatch(
-                  state.tr
-                    .replaceSelectionWith(editorSchema.node('hard_break'))
-                    .scrollIntoView(),
-                );
+            'Mod-z': () => {
+              executeCommand({ type: 'undo' });
               return true;
-            }),
+            },
+            'Mod-y': () => {
+              executeCommand({ type: 'redo' });
+              return true;
+            },
+            'Mod-Shift-z': () => {
+              executeCommand({ type: 'redo' });
+              return true;
+            },
+            'Mod-b': () => {
+              executeCommand({ type: 'toggleMark', mark: 'bold' });
+              return true;
+            },
+            'Mod-i': () => {
+              executeCommand({ type: 'toggleMark', mark: 'italic' });
+              return true;
+            },
+            'Mod-u': () => {
+              executeCommand({ type: 'toggleMark', mark: 'underline' });
+              return true;
+            },
+            'Shift-Enter': richEditorSoftBreak,
+            Enter: (state, dispatch) => {
+              if (richEditorEnter(state, dispatch)) return true;
+              // A closed list/quote cannot fall through to generic splitting,
+              // including an overflow refusal at MAX_SAFE_INTEGER.
+              for (let depth = state.selection.$from.depth; depth > 0; depth--)
+                if (
+                  ['list_item', 'blockquote'].includes(
+                    state.selection.$from.node(depth).type.name,
+                  )
+                )
+                  return true;
+              return false;
+            },
+            Backspace: (state, dispatch) =>
+              richEditorBackspace(state, dispatch),
           }),
           keymap(baseKeymap),
         ],
@@ -175,9 +303,10 @@ export function ContinuousBodyEditor(props: {
       editable: () => latest.current.editable,
       handleKeyDown() {
         if (composition.current || editor.composing) return false;
-        synchronizeNativeSelection(editor, (range) =>
-          latest.current.onRangeChange(range),
-        );
+        synchronizeNativeSelection(editor, (range) => {
+          latest.current.onRangeChange(range);
+          updateToolbar(editor);
+        });
         return false;
       },
       dispatchTransaction(tr) {
@@ -185,14 +314,13 @@ export function ContinuousBodyEditor(props: {
           return;
         const state = editor.state.apply(tr);
         editor.updateState(state);
+        updateToolbar(editor);
         latest.current.onRangeChange(
           rangeFromSelection(state.doc, state.selection),
         );
         if (tr.docChanged)
           latest.current.onTransaction(
-            editorToDraft(state.doc, latest.current.draft, [
-              ...images.current.values(),
-            ]),
+            readDraft(state.doc),
             composition.current,
           );
       },
@@ -240,6 +368,14 @@ export function ContinuousBodyEditor(props: {
         },
         keydown(_view, event) {
           if (
+            (event.ctrlKey || event.metaKey) &&
+            event.shiftKey &&
+            event.key.toLowerCase() === 'v'
+          )
+            plainPasteUntil.current = Date.now() + 1500;
+          else if (!['Control', 'Meta', 'Shift'].includes(event.key))
+            plainPasteUntil.current = 0;
+          if (
             composition.current ||
             editor.composing ||
             !latest.current.editable
@@ -259,9 +395,10 @@ export function ContinuousBodyEditor(props: {
             !editor.composing &&
             latest.current.editable
           )
-            synchronizeNativeSelection(editor, (range) =>
-              latest.current.onRangeChange(range),
-            );
+            synchronizeNativeSelection(editor, (range) => {
+              latest.current.onRangeChange(range);
+              updateToolbar(editor);
+            });
           nativeNavigation = false;
           return false;
         },
@@ -274,12 +411,7 @@ export function ContinuousBodyEditor(props: {
           endTimer.current = undefined;
           compositionGeneration.current++;
           composition.current = true;
-          latest.current.onTransaction(
-            editorToDraft(editor.state.doc, latest.current.draft, [
-              ...images.current.values(),
-            ]),
-            true,
-          );
+          latest.current.onTransaction(readDraft(editor.state.doc), true);
           return false;
         },
         compositionend() {
@@ -293,19 +425,27 @@ export function ContinuousBodyEditor(props: {
               return;
             endTimer.current = undefined;
             composition.current = false;
-            latest.current.onTransaction(
-              editorToDraft(editor.state.doc, latest.current.draft, [
-                ...images.current.values(),
-              ]),
-              false,
-            );
+            // Browser composition mutations are settled before any toolbar action.
+            const commands = queuedCommands.current.splice(0);
+            for (const command of commands) executeCommand(command);
+            updateToolbar(editor);
+            latest.current.onTransaction(readDraft(editor.state.doc), false);
           }, 30);
           return false;
         },
         paste(_view, event) {
           event.preventDefault();
-          if (!latest.current.editable) return true;
-          const html = event.clipboardData?.getData('text/html') ?? '',
+          if (
+            !latest.current.editable ||
+            composition.current ||
+            editor.composing
+          )
+            return true;
+          const pure = Date.now() < plainPasteUntil.current;
+          plainPasteUntil.current = 0;
+          const html = pure
+              ? ''
+              : (event.clipboardData?.getData('text/html') ?? ''),
             plain = event.clipboardData?.getData('text/plain') ?? '';
           const grantId = parseManualClipboardFragment(html);
           captureActiveRange();
@@ -361,9 +501,10 @@ export function ContinuousBodyEditor(props: {
         !composition.current &&
         !editor.composing
       )
-        synchronizeNativeSelection(editor, (range) =>
-          latest.current.onRangeChange(range),
-        );
+        synchronizeNativeSelection(editor, (range) => {
+          latest.current.onRangeChange(range);
+          updateToolbar(editor);
+        });
     };
     // Capture navigation selection before the library's focus-reset recovery.
     const ownerDocument = editor.dom.ownerDocument;
@@ -373,6 +514,25 @@ export function ContinuousBodyEditor(props: {
       true,
     );
     view.current = editor;
+    const scrollport = props.beforeBody
+      ? host.current.closest<HTMLElement>('main')
+      : null;
+    const toolElement = host.current
+      .closest('.rich-body-editor')
+      ?.querySelector<HTMLElement>('.rich-text-tools');
+    const resizeTools = () => {
+      if (!scrollport || !toolElement) return;
+      const top = Math.ceil(toolElement.getBoundingClientRect().height) + 16;
+      scrollport.style.setProperty('--focused-toolbar-height', top + 'px');
+      editor.setProps({
+        scrollThreshold: { top, bottom: 20, left: 0, right: 0 },
+        scrollMargin: { top, bottom: 20, left: 0, right: 0 },
+      });
+    };
+    resizeTools();
+    const toolResize = new ResizeObserver(resizeTools);
+    if (scrollport && toolElement) toolResize.observe(toolElement);
+    updateToolbar(editor);
     latest.current.onRangeChange(
       rangeFromSelection(editor.state.doc, editor.state.selection),
     );
@@ -382,6 +542,8 @@ export function ContinuousBodyEditor(props: {
       endTimer.current = undefined;
       compositionGeneration.current++;
       composition.current = false;
+      queuedCommands.current = [];
+      plainPasteUntil.current = 0;
       view.current = undefined;
       ownerDocument.removeEventListener(
         'selectionchange',
@@ -389,17 +551,22 @@ export function ContinuousBodyEditor(props: {
         true,
       );
       editor.destroy();
+      toolResize.disconnect();
+      scrollport?.style.removeProperty('--focused-toolbar-height');
       previews.dispose();
       roots.current.clear();
     };
   }, [props.session]);
-  useEffect(() => {
+  // Complete projection changes in the commit before another native edit can
+  // make a captured draft stale and turn its echo into a new history event.
+  useLayoutEffect(() => {
     const editor = view.current;
     if (!editor) return;
     if (composition.current || editor.composing) return;
-    synchronizeNativeSelection(editor, (range) =>
-      latest.current.onRangeChange(range),
-    );
+    synchronizeNativeSelection(editor, (range) => {
+      latest.current.onRangeChange(range);
+      updateToolbar(editor);
+    });
     editor.setProps({
       editable: () => latest.current.editable,
       attributes: {
@@ -420,7 +587,10 @@ export function ContinuousBodyEditor(props: {
             pool={pool.current}
           />,
         );
-    const patch = documentPatch(editor.state.doc, draftToEditor(props.draft));
+    const patch = documentPatch(
+      editor.state.doc,
+      draftV2ToEditor({ ...props.draft, title: '' }),
+    );
     if (!patch) return;
     // Main-admitted paste/picker/cut is one user history event; ready metadata never changes nodes.
     const tr = closeHistory(editor.state.tr)
@@ -432,9 +602,25 @@ export function ContinuousBodyEditor(props: {
         closeHistory(editor.state.tr).setMeta('addToHistory', false),
       ),
     );
+    updateToolbar(editor);
     latest.current.onRangeChange(
       rangeFromSelection(editor.state.doc, editor.state.selection),
     );
   }, [props.draft, props.imageProjection, props.editable, props.session]);
-  return <div ref={host} className="continuous-body-shell" />;
+  return (
+    <div className="rich-body-editor">
+      <RichTextToolbar
+        state={toolbar.format}
+        disabled={!props.editable}
+        canUndo={toolbar.canUndo}
+        canRedo={toolbar.canRedo}
+        onCommand={executeCommand}
+        onInsertImage={props.onInsertImage}
+      />
+      <div className="article-writing-surface">
+        {props.beforeBody}
+        <div ref={host} className="continuous-body-shell" />
+      </div>
+    </div>
+  );
 }

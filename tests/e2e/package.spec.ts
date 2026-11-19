@@ -1,4 +1,9 @@
 import { checkSharedCoverDesktop } from './batch-cover-desktop-flow';
+import { checkLiveManualSkip } from './live-skip-desktop-flow';
+import {
+  checkCreationCover,
+  checkManualSkip,
+} from './operator-recovery-desktop-flow';
 import { checkBatchRecovery } from './batch-desktop-flow';
 import { checkCoverDesktop } from './cover-desktop-flow';
 import { hasSchema6Backup } from '../fixtures/library-historical-data';
@@ -32,7 +37,7 @@ import {
 } from './package-browser-checks';
 import { checkDraftRecovery } from './draft-desktop-flow';
 test('the actual Windows ZIP starts with SQLite, migrations and sandbox intact', async () => {
-  test.setTimeout(240000);
+  test.setTimeout(600000);
   const coverEvidence = test.info().outputPath('cover-evidence');
   const directory = resolve('out/make/zip/win32/x64');
   const archives = readdirSync(directory).filter((name) =>
@@ -40,6 +45,7 @@ test('the actual Windows ZIP starts with SQLite, migrations and sandbox intact',
   );
   expect(archives).toHaveLength(1);
   const root = mkdtempSync(join(tmpdir(), 'draft-package-'));
+  let checksAndClosuresConfirmed = false;
   try {
     execFileSync(
       'powershell.exe',
@@ -107,7 +113,19 @@ test('the actual Windows ZIP starts with SQLite, migrations and sandbox intact',
       'task-6-package',
       coverEvidence,
     );
-    await checkCoverDesktop(join(root, 'draft-assistant.exe'));
+    await checkCreationCover(
+      join(root, 'draft-assistant.exe'),
+      join(coverEvidence, 'creation'),
+    );
+    await checkManualSkip(
+      join(root, 'draft-assistant.exe'),
+      join(coverEvidence, 'skip'),
+    );
+    await checkCoverDesktop(join(root, 'draft-assistant.exe'), coverEvidence);
+    await checkLiveManualSkip(
+      join(root, 'draft-assistant.exe'),
+      join(coverEvidence, 'live-skip'),
+    );
     await checkSharedCoverDesktop(join(root, 'draft-assistant.exe'));
     if (hasSchema6Backup)
       await checkHistoricalLibraryUpgrade(
@@ -121,14 +139,21 @@ test('the actual Windows ZIP starts with SQLite, migrations and sandbox intact',
         description:
           'NOT RUN: explicitly authorized local schema6 backup unavailable',
       });
+    // Helpers return only after their acquired contexts/apps confirm closure.
+    checksAndClosuresConfirmed = true;
   } finally {
     expect(resolve(root)).toBe(root);
     expect(root.startsWith(join(tmpdir(), 'draft-package-'))).toBe(true);
-    rmSync(root, {
-      recursive: true,
-      force: true,
-      maxRetries: 5,
-      retryDelay: 300,
-    });
+    if (!checksAndClosuresConfirmed) {
+      console.error(
+        `PRESERVED owned extraction after failure/unconfirmed closure: ${root}`,
+      );
+    } else
+      rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 300,
+      });
   }
 });

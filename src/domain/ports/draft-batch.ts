@@ -1,6 +1,19 @@
-import type { BatchSeed, BatchView } from '../../contracts/draft-batch';
-import type { DraftTask, ReasonCode } from '../../contracts/draft-task';
+import type {
+  BatchRecoveryInput,
+  BatchSeed,
+  BatchView,
+} from '../../contracts/draft-batch';
+import type {
+  DraftTask,
+  ReasonCode,
+  ReserveInput,
+} from '../../contracts/draft-task';
 export interface DraftBatchRepository {
+  recovery(input: BatchRecoveryInput): {
+    store: ReserveInput['store'];
+    queued: ReserveInput[];
+  };
+  skipCurrentAndContinue(input: BatchRecoveryInput, now: string): BatchView;
   create(seed: BatchSeed): BatchView;
   getCurrent(): BatchView | null;
   archiveFinished(id: string, revision: number, now: string): void;

@@ -1,4 +1,9 @@
 import { checkSharedCoverDesktop } from './batch-cover-desktop-flow';
+import { checkLiveManualSkip } from './live-skip-desktop-flow';
+import {
+  checkCreationCover,
+  checkManualSkip,
+} from './operator-recovery-desktop-flow';
 import { checkBatchRecovery } from './batch-desktop-flow';
 import { checkCoverDesktop } from './cover-desktop-flow';
 import { hasSchema6Backup } from '../fixtures/library-historical-data';
@@ -26,7 +31,14 @@ test('compiled desktop protects its bridge and handles database restart/failure'
   await test.step('batch recovery', () => checkBatchRecovery());
   await test.step('library management', () =>
     checkLibraryManagement(undefined, 'task-6-desktop', coverEvidence));
-  await test.step('local cover native/new process', () => checkCoverDesktop());
+  await test.step('creation cover combined save/reopen', () =>
+    checkCreationCover(undefined, coverEvidence + '/creation'));
+  await test.step('manual skip remaining frozen queue', () =>
+    checkManualSkip(undefined, coverEvidence + '/skip'));
+  await test.step('live manual skip same browser', () =>
+    checkLiveManualSkip(undefined, coverEvidence + '/live-skip'));
+  await test.step('local cover native/new process', () =>
+    checkCoverDesktop(undefined, coverEvidence));
   await checkSharedCoverDesktop();
   if (hasSchema6Backup)
     await test.step('historical schema6 business copy', () =>

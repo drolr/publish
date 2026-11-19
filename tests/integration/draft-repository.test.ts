@@ -1,3 +1,5 @@
+import { upgradeEditorBody } from '../../src/domain/rich-text-body';
+import { createDraftSnapshotV2Digest } from '../../src/infrastructure/draft-snapshot-integrity';
 import { randomUUID, createHash } from 'node:crypto';
 import {
   mkdtempSync,
@@ -295,7 +297,7 @@ it('upgrades v2 with real imported assets, preserves checksums and reopens witho
   expect(
     db.prepare('SELECT * FROM schema_migrations').all().slice(0, 2),
   ).toEqual(history);
-  expect(s.articles.getSchemaVersion()).toBe(14);
+  expect(s.articles.getSchemaVersion()).toBe(15);
   expect(s.articles.load(input.snapshot.article.articleKey)).toEqual(
     input.snapshot.article,
   );
@@ -321,7 +323,7 @@ it('upgrades an existing v3 draft ledger for manual cover after save', async () 
   old.close();
   const current = s.open();
   expect(current.reserve(input).status).toBe('created');
-  expect(s.articles.getSchemaVersion()).toBe(14);
+  expect(s.articles.getSchemaVersion()).toBe(15);
 });
 it('migration 0005 preserves every v4 task field and snapshot with no closure inferred', async () => {
   const s = await setup(true);
@@ -611,63 +613,76 @@ it('import recovery refuses cleanup of a committed article retained by a draft t
   expect(s.articles.attempts()[0].status).toBe('needs_review');
   await expect(s.assets.verify(article)).resolves.toBeUndefined();
 });
-it('competing child connections serialize reservation and return only one created permission', async () => {
-  const s = await setup();
-  const a = await s.input();
-  const file = join(s.root, 'reserve.json');
-  writeFileSync(file, JSON.stringify(a));
-  function contender() {
-    const child = spawn(
-      process.execPath,
-      [
-        '--import',
-        'tsx',
-        resolve('tests/integration/draft-crash-child.ts'),
-        s.path,
-        migrations,
-        a.taskId,
-        a.now,
-        'race',
-        file,
-      ],
-      { stdio: ['pipe', 'pipe', 'pipe'] },
-    );
-    let output = '';
-    let errors = '';
-    const ready = new Promise<void>((resolve, reject) => {
-      child.once('error', reject);
-      child.stdout.on('data', (chunk: Buffer) => {
-        output += chunk.toString();
-        if (output.includes('ready')) resolve();
-      });
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      errors += chunk.toString();
-    });
-    const done = new Promise<string>((resolve, reject) => {
-      child.once('error', reject);
-      child.once('exit', (code) =>
-        code === 0 ? resolve(output) : reject(new Error(errors)),
+it.each([1, 2])(
+  'competing child connections serialize V%s reservation and return only one created permission',
+  async (version) => {
+    const s = await setup();
+    const a = await s.input();
+    if (version === 2) {
+      const article = a.snapshot.article,
+        editorBody = upgradeEditorBody(null, article.body);
+      a.snapshot = {
+        version: 2,
+        article,
+        editorBody,
+        digest: createDraftSnapshotV2Digest(article, editorBody),
+      };
+    }
+    const file = join(s.root, 'reserve.json');
+    writeFileSync(file, JSON.stringify(a));
+    function contender() {
+      const child = spawn(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          resolve('tests/integration/draft-crash-child.ts'),
+          s.path,
+          migrations,
+          a.taskId,
+          a.now,
+          'race',
+          file,
+        ],
+        { stdio: ['pipe', 'pipe', 'pipe'] },
       );
-    });
-    return { child, ready, done };
-  }
-  const first = contender();
-  const second = contender();
-  await Promise.all([first.ready, second.ready]);
-  first.child.stdin.end('go');
-  second.child.stdin.end('go');
-  const results = await Promise.all([first.done, second.done]);
-  expect(results.filter((output) => output.includes('created'))).toHaveLength(
-    1,
-  );
-  expect(results.filter((output) => output.includes('blocked'))).toHaveLength(
-    1,
-  );
-  expect(s.open().occupied()?.snapshot.article.articleKey).toBe(
-    a.snapshot.article.articleKey,
-  );
-});
+      let output = '';
+      let errors = '';
+      const ready = new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.stdout.on('data', (chunk: Buffer) => {
+          output += chunk.toString();
+          if (output.includes('ready')) resolve();
+        });
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        errors += chunk.toString();
+      });
+      const done = new Promise<string>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('exit', (code) =>
+          code === 0 ? resolve(output) : reject(new Error(errors)),
+        );
+      });
+      return { child, ready, done };
+    }
+    const first = contender();
+    const second = contender();
+    await Promise.all([first.ready, second.ready]);
+    first.child.stdin.end('go');
+    second.child.stdin.end('go');
+    const results = await Promise.all([first.done, second.done]);
+    expect(results.filter((output) => output.includes('created'))).toHaveLength(
+      1,
+    );
+    expect(results.filter((output) => output.includes('blocked'))).toHaveLength(
+      1,
+    );
+    expect(s.open().occupied()?.snapshot.article.articleKey).toBe(
+      a.snapshot.article.articleKey,
+    );
+  },
+);
 
 it.each([3, 4])(
   'schema %s preserves saved and ambiguous tasks plus article assets through v5 recovery',
@@ -723,7 +738,7 @@ it.each([3, 4])(
       .all();
     const repo = s.open();
     repo.recover(saved.now);
-    expect(s.articles.getSchemaVersion()).toBe(14);
+    expect(s.articles.getSchemaVersion()).toBe(15);
     expect(
       db.prepare('SELECT * FROM judongche_draft_tasks ORDER BY task_id').all(),
     ).toEqual(

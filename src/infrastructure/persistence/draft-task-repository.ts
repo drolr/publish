@@ -12,9 +12,10 @@ import type { StoredArticle } from '../../contracts/stored-article';
 import type { DraftTaskRepository } from '../../domain/ports/draft-task';
 import { reduceTask } from '../../domain/draft-task';
 import { migrate, readMigrations } from './migrate';
-import { loadStoredArticle } from './stored-article-reader';
+import { loadActiveEditableArticle } from './stored-article-reader';
+import { upgradeEditorBody, richBodyEquals } from '../../domain/rich-text-body';
 import {
-  createDraftSnapshotDigest,
+  verifyDraftSnapshotIntegrity,
   serializeDraftArticle,
 } from '../draft-snapshot-integrity';
 
@@ -32,8 +33,7 @@ function normalized(article: StoredArticle): string {
   return serializeDraftArticle(article);
 }
 function verifySnapshot(snapshot: DraftSnapshot): void {
-  if (createDraftSnapshotDigest(snapshot.article) !== snapshot.digest)
-    throw new Error('Invalid task snapshot digest');
+  verifyDraftSnapshotIntegrity(snapshot);
 }
 function encodeTask(input: DraftTask) {
   const task = DraftTaskSchema.parse(input);
@@ -325,22 +325,21 @@ export function draftTaskRepository(
             const busy = occupied();
             if (busy) return { status: 'blocked', task: busy };
             verifySnapshot(value.snapshot);
-            const article = loadStoredArticle(
+            const editable = loadActiveEditableArticle(
               db,
-              'article_key',
               value.snapshot.article.articleKey,
             );
-            const articleVersion = db
-              .prepare(
-                'SELECT content_revision FROM articles WHERE article_key=? AND deleted_at IS NULL',
-              )
-              .get(value.snapshot.article.articleKey) as
-              { content_revision: number } | undefined;
+            const article = editable?.article;
             if (
-              articleVersion?.content_revision !==
-                value.expectedArticleRevision ||
+              !editable ||
               !article ||
-              normalized(article) !== normalized(value.snapshot.article)
+              editable.articleRevision !== value.expectedArticleRevision ||
+              normalized(article) !== normalized(value.snapshot.article) ||
+              (value.snapshot.version === 2 &&
+                !richBodyEquals(
+                  upgradeEditorBody(editable.editorBody, article.body),
+                  value.snapshot.editorBody,
+                ))
             )
               return { status: 'stale' };
             if (value.coverSnapshot) {
@@ -361,10 +360,7 @@ export function draftTaskRepository(
               platform: 'judongche',
               mode: 'draft',
               store: value.store,
-              snapshot: {
-                ...value.snapshot,
-                article: JSON.parse(normalized(article)) as unknown,
-              },
+              snapshot: structuredClone(value.snapshot),
               coverPolicy: 'manual-after-draft',
               ...(value.coverSnapshot
                 ? {

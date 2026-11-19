@@ -80,7 +80,9 @@ it.each(restartCheckpoints)(
         repository: articles,
         assets: covers,
       });
-      const snapshot = await snapshots.capture(imported.article);
+      const snapshot = await snapshots.capture(
+        articles.loadEditableArticle(articleKey)!,
+      );
       const coverSnapshot = snapshots.captureCover(
         articles.loadCover(articleKey)!,
       );
@@ -144,6 +146,10 @@ it.each(restartCheckpoints)(
         generation: randomUUID(),
       };
       const platform: DraftPlatform = {
+        contentCapabilities: () => ({
+          revision: 'judongche-rich-unknown-v1',
+          features: {},
+        }),
         openSession: async () => {
           calls.push('open');
           return probe;
@@ -185,6 +191,10 @@ it.each(restartCheckpoints)(
         assets: createCoverAssetStore(root, articles),
       });
       const preparation = createDraftPreparation({
+        contentCapabilities: () => ({
+          revision: 'judongche-rich-unknown-v1',
+          features: {},
+        }),
         repository: articles,
         covers: articles,
         tasks,
@@ -192,6 +202,7 @@ it.each(restartCheckpoints)(
         newId: randomUUID,
       });
       controller = createDraftController({
+        invalidateBrowserHealth: () => {},
         tasks,
         preparation,
         snapshots: recoveredSnapshots,

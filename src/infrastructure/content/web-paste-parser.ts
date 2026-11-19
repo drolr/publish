@@ -7,6 +7,11 @@ import {
   type ConvertedPaste,
   type WebPasteInput,
 } from '../../contracts/web-paste';
+import {
+  ConvertedRichPasteSchema,
+  type ConvertedRichPaste,
+} from '../../contracts/rich-web-paste';
+import { normalizeRichNodes } from './rich-web-paste-normalizer';
 import { WebPasteFailure } from '../../domain/web-paste-error';
 
 const forbidden = new Set([
@@ -49,14 +54,18 @@ const boundaries = new Set([
   'figure',
 ]);
 const ignored = new Set(['script', 'style', 'head']);
-type Element = {
+export type PasteElement = {
   type: 'element';
   name: string;
   hidden: boolean;
   source?: string;
+  attributes: Record<string, string>;
   children: Node[];
 };
-type Node = Element | { type: 'text'; text: string } | { type: 'comment' };
+type Element = PasteElement;
+export type PasteNode =
+  Element | { type: 'text'; text: string } | { type: 'comment' };
+type Node = PasteNode;
 
 /** htmlparser2 6.1.0 drops unfinished attributes/tags at EOF. Fail closed instead.
  * The pinned tokenizer exposes its states: Text=1, incomplete entities=62..66.
@@ -194,6 +203,7 @@ function parse(html: string): Node[] {
             Object.hasOwn(attributes, 'hidden') ||
             attributes['aria-hidden']?.toLowerCase() === 'true',
           source: name === 'img' ? attributes.src : undefined,
+          attributes,
           children: [],
         };
         children().push(node);
@@ -285,6 +295,35 @@ export function convertWebPaste(input: WebPasteInput): ConvertedPaste {
     : normalize(parse(fragment(html)));
   if (!blocks.length) throw new WebPasteFailure('EMPTY');
   const result = ConvertedPasteSchema.safeParse({ blocks, plainOnly });
+  if (!result.success) throw new WebPasteFailure('PARSE_LIMIT');
+  return result.data;
+}
+
+/** V2 opt-in: the legacy production converter remains unchanged until wiring. */
+export function convertRichWebPaste(input: WebPasteInput): ConvertedRichPaste {
+  const validated = WebPasteInputSchema.safeParse(input);
+  if (!validated.success) throw new WebPasteFailure('INPUT_LIMIT');
+  const { html, plain } = validated.data;
+  const plainOnly = html.length === 0;
+  const converted = plainOnly
+    ? {
+        blocks: plain
+          .replace(/\r\n?/g, '\n')
+          .split('\n\n')
+          .map((text) => ({
+            type: 'paragraph' as const,
+            content: text ? [{ type: 'text' as const, text, marks: [] }] : [],
+          })),
+        warnings: ['PLAIN_ONLY' as const],
+      }
+    : normalizeRichNodes(parse(fragment(html)));
+  if ((!html && !plain) || !converted.blocks.length)
+    throw new WebPasteFailure('EMPTY');
+  const result = ConvertedRichPasteSchema.safeParse({
+    version: 2,
+    plainOnly,
+    ...converted,
+  });
   if (!result.success) throw new WebPasteFailure('PARSE_LIMIT');
   return result.data;
 }

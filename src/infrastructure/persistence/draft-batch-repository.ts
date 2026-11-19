@@ -6,6 +6,7 @@ import {
   BatchViewSchema,
   BatchItemViewSchema,
   type BatchView,
+  type BatchRecoveryInput,
 } from '../../contracts/draft-batch';
 import {
   ReserveInputSchema,
@@ -66,6 +67,7 @@ export function openDraftBatchRepository(
           state: item.state,
           reason: item.reason,
           taskId: item.task_id,
+          ...(task ? { saveAttempted: task.saveAttempted } : {}),
           ...(task?.evidence.submission
             ? { submission: task.evidence.submission }
             : {}),
@@ -130,9 +132,86 @@ export function openDraftBatchRepository(
         "UPDATE draft_batch_items SET state='stopped',reason='STOP_REQUESTED',updated_at=? WHERE batch_id=? AND state='queued'",
       ).run(now, id);
     }
+    function recovery(input: BatchRecoveryInput) {
+      const batch = requireRevision(input.batchId, input.expectedRevision);
+      const list = items(input.batchId);
+      const unhandled = list.filter((i) =>
+        ['running', 'needs_human'].includes(i.state),
+      );
+      if (
+        !['paused', 'interrupted'].includes(batch.state) ||
+        (batch.stop_requested && batch.state !== 'interrupted') ||
+        (batch.state === 'interrupted' && batch.reason !== 'RESULT_AMBIGUOUS')
+      )
+        throw Error('Batch not recoverable');
+      if (
+        input.taskId === null
+          ? unhandled.length !== 0 || batch.state !== 'interrupted'
+          : unhandled.length !== 1 || unhandled[0].task_id !== input.taskId
+      )
+        throw Error('Batch task conflict');
+      const seed = BatchSeedSchema.parse(JSON.parse(batch.seed_json));
+      const queued = list
+        .filter((i) => i.state === 'queued')
+        .map((i) => ReserveInputSchema.parse(JSON.parse(i.reservation_json!)));
+      const source = input.taskId
+        ? tasks.get(input.taskId)?.store
+        : queued[0]?.store;
+      if (!source || source.storeKey !== seed.storeKey)
+        throw Error('Missing recovery binding');
+      return { store: source, queued };
+    }
     const get = (id: string) => db.transaction(() => view(id))();
     return {
       get,
+      recovery: (input) => db.transaction(() => recovery(input))(),
+      skipCurrentAndContinue(input, now) {
+        return db
+          .transaction(() => {
+            const context = recovery(input);
+            for (const reservation of context.queued) {
+              const article = db
+                .prepare(
+                  'SELECT content_revision FROM articles WHERE article_key=? AND deleted_at IS NULL',
+                )
+                .get(reservation.snapshot.article.articleKey) as
+                { content_revision: number } | undefined;
+              const cover = covers.loadCover(
+                reservation.snapshot.article.articleKey,
+              );
+              if (
+                article?.content_revision !==
+                  reservation.expectedArticleRevision ||
+                (reservation.coverSnapshot &&
+                  (cover?.coverRevision !== reservation.expectedCoverRevision ||
+                    cover?.configurationDigest !==
+                      reservation.coverSnapshot.digest))
+              )
+                throw Error('STALE_PREPARATION');
+            }
+            if (tasks.occupied()) throw Error('Task still occupied');
+            if (
+              input.taskId &&
+              tasks.get(input.taskId)?.state !== 'stopped_by_user'
+            )
+              throw Error('Task not released');
+            if (input.taskId)
+              db.prepare(
+                "UPDATE draft_batch_items SET state='skipped',updated_at=? WHERE batch_id=? AND task_id=?",
+              ).run(now, input.batchId, input.taskId);
+            db.prepare(
+              'UPDATE draft_batches SET stop_requested=0 WHERE id=?',
+            ).run(input.batchId);
+            update(
+              input.batchId,
+              context.queued.length ? 'running' : 'completed',
+              null,
+              now,
+            );
+            return view(input.batchId)!;
+          })
+          .immediate();
+      },
       getCurrent() {
         return db.transaction(() => {
           const latest = db
@@ -351,6 +430,11 @@ export function openDraftBatchRepository(
             )
             .all() as Array<{ id: string }>;
           for (const batch of active) {
+            const before = row(batch.id)!;
+            const intentionalStop =
+              before.stop_requested === 1 &&
+              (before.state !== 'interrupted' ||
+                before.reason === 'STOP_REQUESTED');
             for (const item of items(batch.id)) {
               if (item.state === 'running' && item.task_id)
                 settle(batch.id, item.task_id, now);
@@ -359,7 +443,12 @@ export function openDraftBatchRepository(
               'UPDATE draft_batches SET stop_requested=1 WHERE id=?',
             ).run(batch.id);
             if (row(batch.id)!.state !== 'completed')
-              update(batch.id, 'interrupted', 'RESULT_AMBIGUOUS', now);
+              update(
+                batch.id,
+                'interrupted',
+                intentionalStop ? 'STOP_REQUESTED' : 'RESULT_AMBIGUOUS',
+                now,
+              );
           }
         }).immediate();
       },

@@ -1,3 +1,4 @@
+import { returnToArticlePool } from './focused-editor-navigation';
 // Real Electron/main/picker/decoder/SQLite/assets. Only native chooser selection is test controlled.
 import {
   _electron as electron,
@@ -20,7 +21,6 @@ import { createHash } from 'node:crypto';
 import sharp from 'sharp';
 import Database from 'better-sqlite3';
 import { treeHashes } from '../fixtures/library-historical-data';
-const evidence = resolve('.superpowers/sdd/2026-10-09-judongche-local-cover');
 const hash = (v: Uint8Array) => createHash('sha256').update(v).digest('hex');
 const cover = (p: Page) => p.getByRole('region', { name: '封面图片' });
 async function choose(app: ElectronApplication, paths?: string[]) {
@@ -46,19 +46,7 @@ async function waitIdle(p: Page) {
     .toBe('idle');
 }
 async function closeBody(p: Page) {
-  const button = p.getByRole('button', { name: '结束编辑', exact: true });
-  if (await button.isVisible()) await button.click();
-  await expect
-    .poll(() =>
-      p.evaluate(() =>
-        window.desktopApi.getManualArticleState().then((s) => s.state),
-      ),
-    )
-    .toBe('idle');
-  await expect(button).not.toBeVisible();
-  await expect(
-    p.getByRole('button', { name: '新建文章', exact: true }),
-  ).toBeEnabled();
+  await returnToArticlePool(p);
 }
 async function selectCoverArticle(page: Page, index: number, dirty = false) {
   await expect(
@@ -89,12 +77,16 @@ async function selectCoverArticle(page: Page, index: number, dirty = false) {
     await expect(page.getByLabel('文章标题')).toHaveValue(
       '封面本机验证' + index,
     );
+    await returnToArticlePool(page);
     await expect(
       page.getByRole('button', { name: '新建文章', exact: true }),
     ).toBeEnabled();
   }
 }
-export async function checkCoverDesktop(executablePath?: string) {
+export async function checkCoverDesktop(
+  executablePath?: string,
+  evidence = resolve('.tmp/operator-recovery/cover-evidence'),
+) {
   mkdirSync(evidence, { recursive: true });
   const root = mkdtempSync(join(tmpdir(), 'cover-native-'));
   const input = join(root, 'input');
@@ -168,7 +160,7 @@ export async function checkCoverDesktop(executablePath?: string) {
         ).toBeVisible();
         expect(
           await page.evaluate(() => window.desktopApi.getAppStatus()),
-        ).toMatchObject({ state: 'ready', schemaVersion: 14 });
+        ).toMatchObject({ state: 'ready', schemaVersion: 15 });
         if (run === 0) {
           for (let i = 0; i < 2; i++) {
             const article = join(input, `article-${i}.json`);
@@ -418,6 +410,7 @@ export async function checkCoverDesktop(executablePath?: string) {
           await expect(page.getByLabel('文章标题')).toHaveValue(
             '封面本机验证1',
           );
+          await returnToArticlePool(page);
           await selectCoverArticle(page, 2);
           await page
             .getByRole('button', { name: '编辑封面', exact: true })

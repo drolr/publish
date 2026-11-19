@@ -76,7 +76,7 @@ it.runIf(hasSchema6Backup)(
       }
       expect(verifyHistoricalUpgrade(root, expected)).toMatchObject({
         status: 'PASS',
-        schemaVersion: 14,
+        schemaVersion: 15,
         historicalArticleCount: 1,
       });
     } finally {
@@ -108,7 +108,7 @@ it('valid nonempty schema6 save receipt and settled task survive upgrade in a fr
     const result = run('upgrade-schema6', target, source);
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({
-      schemaVersion: 14,
+      schemaVersion: 15,
       count: 11,
       sameTask: true,
       legacyArticleRevision: null,

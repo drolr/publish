@@ -93,4 +93,61 @@ describe('operator-reviewed batch submission', () => {
       }).success,
     ).toBe(false);
   });
+  it('preserves a stopped submission observation as immutable evidence without releasing the task', () => {
+    const task = makeDraftTask({
+      state: 'running',
+      stage: 'save',
+      saveAttempted: true,
+      possibleRemoteEffect: true,
+      stopRequested: true,
+      updatedAt: now,
+    });
+    const observed = reduceTask(
+      task,
+      { type: 'evidence', evidence: { ...task.evidence, submission } },
+      now,
+    );
+    expect(() =>
+      reduceTask(
+        { ...task, saveAttempted: false },
+        { type: 'evidence', evidence: { ...task.evidence, submission } },
+        now,
+      ),
+    ).toThrow();
+    expect(observed).toMatchObject({
+      state: 'running',
+      stopRequested: true,
+      holdsPlatform: true,
+      evidence: { submission },
+    });
+    expect(() =>
+      reduceTask(
+        observed,
+        {
+          type: 'evidence',
+          evidence: {
+            ...observed.evidence,
+            submission: { ...submission, observation: 'acknowledged' },
+          },
+        },
+        now,
+      ),
+    ).toThrow();
+    const settled = reduceTask(
+      observed,
+      { type: 'settle', state: 'needs_human', reason: 'STOP_REQUESTED' },
+      now,
+    );
+    expect(settled).toMatchObject({
+      state: 'needs_human',
+      holdsPlatform: true,
+      stopRequested: true,
+      evidence: { submission },
+    });
+    expect(classifyBatchTask(settled)).toEqual({
+      state: 'needs_human',
+      pause: true,
+      reason: 'STOP_REQUESTED',
+    });
+  });
 });

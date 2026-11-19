@@ -1,6 +1,14 @@
+import type {
+  ManualDraftV2,
+  ManualFragmentV2,
+} from '../contracts/manual-rich-draft';
 import {
-  ManualDraftSchema,
-  type ManualDraft,
+  selectRichManualRange,
+  spliceRichManualRange,
+} from './rich-text-range';
+import {
+  ManualDraftV1Schema,
+  type ManualDraftV1,
 } from '../contracts/manual-article';
 import {
   DraftRangeSchema,
@@ -8,7 +16,7 @@ import {
   type DraftRange,
 } from '../contracts/manual-edit';
 import { WebPasteFailure } from './web-paste-error';
-type Block = ManualDraft['blocks'][number];
+type Block = ManualDraftV1['blocks'][number];
 type Point = {
   index: number;
   offset?: number;
@@ -44,7 +52,7 @@ function point(blocks: Block[], boundary: DraftBoundary): Point {
     throw new WebPasteFailure('INPUT_LIMIT');
   return { index, offset, position: base + 1 + offset };
 }
-function bounds(draft: ManualDraft, range: DraftRange) {
+function bounds(draft: ManualDraftV1, range: DraftRange) {
   const parsed = DraftRangeSchema.safeParse(range);
   if (!parsed.success) throw new WebPasteFailure('INPUT_LIMIT');
   const a = point(draft.blocks, parsed.data.anchor),
@@ -52,7 +60,22 @@ function bounds(draft: ManualDraft, range: DraftRange) {
   return a.position <= b.position ? [a, b] : [b, a];
 }
 export function selectManualRange(
-  draft: ManualDraft,
+  draft: ManualDraftV2,
+  range: DraftRange,
+): ManualFragmentV2;
+export function selectManualRange(
+  draft: ManualDraftV1,
+  range: DraftRange,
+): Block[];
+export function selectManualRange(
+  draft: ManualDraftV1 | ManualDraftV2,
+  range: DraftRange,
+): Block[] | ManualFragmentV2 {
+  if ('bodyVersion' in draft) return selectRichManualRange(draft, range);
+  return selectLegacyManualRange(draft, range);
+}
+function selectLegacyManualRange(
+  draft: ManualDraftV1,
   range: DraftRange,
 ): Block[] {
   const [start, end] = bounds(draft, range);
@@ -76,11 +99,36 @@ export function selectManualRange(
 }
 /** Confirms the entire merged proposal; no caller should delete the range first. */
 export function spliceManualRange(
-  draft: ManualDraft,
+  draft: ManualDraftV2,
+  range: DraftRange,
+  fragment: ManualFragmentV2,
+  newId: () => string,
+): ManualDraftV2;
+export function spliceManualRange(
+  draft: ManualDraftV1,
   range: DraftRange,
   inserted: Block[],
   newId: () => string,
-): ManualDraft {
+): ManualDraftV1;
+export function spliceManualRange(
+  draft: ManualDraftV1 | ManualDraftV2,
+  range: DraftRange,
+  inserted: Block[] | ManualFragmentV2,
+  newId: () => string,
+): ManualDraftV1 | ManualDraftV2 {
+  if ('bodyVersion' in draft) {
+    if (Array.isArray(inserted)) throw new WebPasteFailure('INPUT_LIMIT');
+    return spliceRichManualRange(draft, range, inserted, newId);
+  }
+  if (!Array.isArray(inserted)) throw new WebPasteFailure('INPUT_LIMIT');
+  return spliceLegacyManualRange(draft, range, inserted, newId);
+}
+function spliceLegacyManualRange(
+  draft: ManualDraftV1,
+  range: DraftRange,
+  inserted: Block[],
+  newId: () => string,
+): ManualDraftV1 {
   const [start, end] = bounds(draft, range);
   const prefix = draft.blocks.slice(0, start.index + (start.after ? 1 : 0));
   const suffix = draft.blocks.slice(end.index + (end.after === false ? 0 : 1));
@@ -120,7 +168,7 @@ export function spliceManualRange(
       middle[last] = { ...b, text: b.text + right.text };
     right = undefined;
   }
-  const parsed = ManualDraftSchema.safeParse({
+  const parsed = ManualDraftV1Schema.safeParse({
     ...draft,
     blocks: [
       ...prefix,

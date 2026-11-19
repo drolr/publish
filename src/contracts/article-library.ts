@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { PersistedEditorBodyV2Schema } from './rich-text-body';
 import {
   DeclarationKeysSchema,
   DeclarationChangeSchema,
@@ -51,6 +52,7 @@ export const ArticlePageSchema = z.strictObject({
 export type ArticlePage = z.infer<typeof ArticlePageSchema>;
 export const ArticlePreviewSchema = ArticleSummarySchema.extend({
   body: StoredArticleSchema.shape.body,
+  editorBody: PersistedEditorBodyV2Schema,
   assets: z
     .array(
       z.strictObject({

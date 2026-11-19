@@ -20,7 +20,14 @@ it.each(['resolve', 'reject'] as const)(
     let next = 0;
     const manual = createManualArticleController({
       newId: () => id(++next),
-      converter: { convert: async () => ({ blocks: [], plainOnly: true }) },
+      converter: {
+        convert: async () => ({
+          version: 2 as const,
+          warnings: ['PLAIN_ONLY' as const],
+          blocks: [],
+          plainOnly: true,
+        }),
+      },
       pasteImages: {
         acquire: async () => {
           throw new Error('unexpected image');
@@ -93,9 +100,16 @@ it.each(['resolve', 'reject'] as const)(
     if (!('sessionId' in begun)) throw new Error('Expected session');
     const edited = (
       await manual.updateManualDraft(begun.sessionId, begun.revision, {
+        bodyVersion: 2 as const,
         title: 'saved',
         contentDeclaration: 'repost',
-        blocks: [{ blockKey: id(70), type: 'paragraph', text: 'body' }],
+        blocks: [
+          {
+            blockKey: id(70),
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: 'body', marks: [] }],
+          },
+        ],
       })
     ).snapshot;
     manual.saveManualArticle(begun.sessionId, edited.revision);

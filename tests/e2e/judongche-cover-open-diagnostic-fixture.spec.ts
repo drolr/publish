@@ -1,3 +1,4 @@
+import { defaultUploadWaits } from '../../src/infrastructure/platforms/judongche/upload-waits';
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createJudongchePages } from '../../src/infrastructure/platforms/judongche/page-contract';
@@ -5,8 +6,8 @@ import type { ProbeDiagnostic } from '../../src/infrastructure/platforms/judongc
 import { coverInput } from '../fixtures/judongche-cover';
 import { denyExternalNetwork } from './network-policy';
 
-for (const fault of ['slot-click', 'modal-visible'] as const) {
-  for (const sinkThrows of [false, true]) {
+for (const fault of ['slot-click', 'modal-visible', 'late-picker'] as const) {
+  for (const sinkThrows of fault === 'late-picker' ? [false] : [false, true]) {
     test(`cover open identifies ${fault} timeout without another effect; sink throws=${sinkThrows}`, async ({
       page,
       context,
@@ -45,6 +46,9 @@ for (const fault of ['slot-click', 'modal-visible'] as const) {
         },
         {
           manualReview: true,
+          ...(fault === 'late-picker'
+            ? { uploadWaits: { ...defaultUploadWaits, imageAction: 350 } }
+            : {}),
           ownerConfirmedPilot: { dealerId: '123', storeName: 'fixture' },
         },
       );
@@ -61,7 +65,13 @@ for (const fault of ['slot-click', 'modal-visible'] as const) {
       await page.locator('.article-cover-add').evaluate((element, failure) => {
         if (failure === 'slot-click')
           (element as HTMLElement).style.pointerEvents = 'none';
-        else
+        else if (failure === 'late-picker') {
+          const slot = element as HTMLElement;
+          const open = slot.onclick!;
+          slot.onclick = (event) => {
+            setTimeout(() => open.call(slot, event), 850);
+          };
+        } else
           (element as HTMLElement).onclick = () => {
             (window as unknown as { actions: string[] }).actions.push('open');
           };
@@ -78,15 +88,22 @@ for (const fault of ['slot-click', 'modal-visible'] as const) {
         exceptionCategory: 'timeout',
         check: 'page-operation-failed',
       });
+      expect(diagnostics.find((e) => e.coverClick)?.coverClick).toMatchObject({
+        taskId: 'open-diagnostic-task',
+        checkpoint: 'open-failed',
+        clickReceived: fault !== 'slot-click',
+        pickerVisible: false,
+        clickToPickerMs: null,
+      });
       const boundaries = firstFailure.coverOpen!;
       expect(boundaries).toEqual(expect.any(Array));
       expect(boundaries.at(-1)).toMatchObject({
-        phase: fault,
+        phase: fault === 'late-picker' ? 'modal-visible' : fault,
         status: 'failed',
         exceptionCategory: 'timeout',
       });
       expect(boundaries.at(-2)).toMatchObject({
-        phase: fault,
+        phase: fault === 'late-picker' ? 'modal-visible' : fault,
         status: 'start',
       });
       expect(
@@ -97,11 +114,30 @@ for (const fault of ['slot-click', 'modal-visible'] as const) {
           (event) =>
             event.phase === 'slot-click' && event.status === 'returned',
         ),
-      ).toBe(fault === 'modal-visible');
+      ).toBe(fault !== 'slot-click');
       for (let index = 0; index < boundaries.length; index++) {
         expect(boundaries[index]!.elapsedMs).toBeGreaterThanOrEqual(
           index === 0 ? 0 : boundaries[index - 1]!.elapsedMs,
         );
+      }
+      if (fault === 'late-picker') {
+        await expect
+          .poll(
+            () =>
+              diagnostics.find((e) => e.coverClick?.checkpoint === 'follow-up')
+                ?.coverClick,
+            { timeout: 8000 },
+          )
+          .toMatchObject({
+            clickReceived: true,
+            pickerVisible: true,
+            taskId: 'open-diagnostic-task',
+            interrupted: false,
+          });
+        expect(
+          diagnostics.find((e) => e.coverClick?.checkpoint === 'follow-up')
+            ?.coverClick?.clickToPickerMs,
+        ).toBeGreaterThanOrEqual(800);
       }
       const serializedFailure = JSON.stringify(firstFailure);
       expect(JSON.stringify(diagnostics)).not.toMatch(

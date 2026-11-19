@@ -1,3 +1,9 @@
+import { submissionContentEquivalent } from '../../src/domain/draft-content';
+import { makeDraftTask } from '../fixtures/draft-task';
+import {
+  verifyDraftSnapshotIntegrity,
+  createDraftSnapshotDigest,
+} from '../../src/infrastructure/draft-snapshot-integrity';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -18,6 +24,11 @@ afterEach(async () => {
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
+});
+const editable = (article: StoredArticle) => ({
+  article,
+  articleRevision: 1,
+  editorBody: null,
 });
 const signal = () => new AbortController().signal;
 async function bytes(format: 'png' | 'jpeg' | 'webp') {
@@ -68,13 +79,13 @@ it('captures PNG/JPEG exact bytes, rejects WebP and oversize metadata before rea
   const jpeg = await seed('jpeg');
   const webp = await seed('webp');
   expect(
-    await createDraftSnapshotPort(png.store).capture(png.article),
+    await createDraftSnapshotPort(png.store).capture(editable(png.article)),
   ).toMatchObject({ article: png.article });
   await expect(
-    createDraftSnapshotPort(jpeg.store).capture(jpeg.article),
+    createDraftSnapshotPort(jpeg.store).capture(editable(jpeg.article)),
   ).resolves.toMatchObject({ article: jpeg.article });
   await expect(
-    createDraftSnapshotPort(webp.store).capture(webp.article),
+    createDraftSnapshotPort(webp.store).capture(editable(webp.article)),
   ).rejects.toMatchObject({ code: 'IMAGE_FORMAT_UNSUPPORTED' });
   const readImage = vi.fn(async () => new Uint8Array([1]));
   const controlled = {
@@ -86,7 +97,7 @@ it('captures PNG/JPEG exact bytes, rejects WebP and oversize metadata before rea
     assets: [{ ...png.asset, byteSize: 10_000_001 }],
   };
   await expect(
-    createDraftSnapshotPort(controlled).capture(oversized),
+    createDraftSnapshotPort(controlled).capture(editable(oversized)),
   ).rejects.toMatchObject({ code: 'IMAGE_SIZE_UNSUPPORTED' });
   expect(readImage).not.toHaveBeenCalled();
 });
@@ -113,7 +124,7 @@ it('accepts the 10,000,000-byte boundary and calls trusted read once per distinc
     verify: vi.fn(async () => {}),
     readImage,
   } as unknown as AssetStore);
-  const snapshot = await port.capture(article);
+  const snapshot = await port.capture(editable(article));
   expect(readImage).toHaveBeenCalledTimes(1);
   expect((await port.readImage(snapshot, asset.assetKey)).byteLength).toBe(
     10_000_000,
@@ -142,7 +153,9 @@ it('deep-copies and canonically hashes sorted assets while retaining body order'
     verify: vi.fn(async () => {}),
     readImage: vi.fn(async () => await bytes('png')),
   } as unknown as AssetStore;
-  const snapshot = await createDraftSnapshotPort(store).capture(article);
+  const snapshot = await createDraftSnapshotPort(store).capture(
+    editable(article),
+  );
   article.body[0] = { type: 'paragraph', text: 'mutated' };
   expect(snapshot.article.body[0]).toEqual({
     type: 'paragraph',
@@ -156,7 +169,7 @@ it('deep-copies and canonically hashes sorted assets while retaining body order'
 it('re-reads on verify and upload, rejecting byte tampering, missing read capability, and foreign links', async () => {
   const seeded = await seed();
   const port = createDraftSnapshotPort(seeded.store);
-  const snapshot = await port.capture(seeded.article);
+  const snapshot = await port.capture(editable(seeded.article));
   await expect(port.verify(snapshot)).resolves.toBeUndefined();
   const reread = await port.readImage(snapshot, seeded.asset.assetKey);
   expect(reread.byteLength).toBe(seeded.asset.byteSize);
@@ -185,7 +198,7 @@ it('re-reads on verify and upload, rejecting byte tampering, missing read capabi
   await expect(
     createDraftSnapshotPort({
       verify: async () => {},
-    } as unknown as AssetStore).capture(seeded.article),
+    } as unknown as AssetStore).capture(editable(seeded.article)),
   ).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE' });
   const linked = await seed();
   const outside = await mkdtemp(join(tmpdir(), 'draft-outside-'));
@@ -194,7 +207,7 @@ it('re-reads on verify and upload, rejecting byte tampering, missing read capabi
   await rm(articleDirectory, { recursive: true });
   await symlink(outside, articleDirectory, 'junction');
   await expect(
-    createDraftSnapshotPort(linked.store).capture(linked.article),
+    createDraftSnapshotPort(linked.store).capture(editable(linked.article)),
   ).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE' });
 });
 
@@ -203,15 +216,117 @@ it('rejects a committed image missing before capture or removed before verificat
   await rm(join(missingAtCapture.root, missingAtCapture.asset.relativePath));
   await expect(
     createDraftSnapshotPort(missingAtCapture.store).capture(
-      missingAtCapture.article,
+      editable(missingAtCapture.article),
     ),
   ).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE' });
 
   const missingAtVerify = await seed();
   const port = createDraftSnapshotPort(missingAtVerify.store);
-  const snapshot = await port.capture(missingAtVerify.article);
+  const snapshot = await port.capture(editable(missingAtVerify.article));
   await rm(join(missingAtVerify.root, missingAtVerify.asset.relativePath));
   await expect(port.verify(snapshot)).rejects.toMatchObject({
     code: 'ASSET_UNAVAILABLE',
   });
 });
+
+it('freezes V2 exact formatting and empty layout, rejects mark tampering and projection mismatch', async () => {
+  const { article, store } = await seed();
+  const port = createDraftSnapshotPort(store);
+  const body = {
+    version: 2 as const,
+    blocks: [
+      { type: 'paragraph' as const, content: [] },
+      {
+        type: 'paragraph' as const,
+        content: [
+          { type: 'text' as const, text: 'body', marks: ['bold' as const] },
+        ],
+      },
+      { type: 'image' as const, imageId: 'image' },
+    ],
+  };
+  const snapshot = await port.capture({
+    ...editable(article),
+    editorBody: body,
+  });
+  expect(snapshot).toMatchObject({ version: 2, editorBody: body });
+  if (snapshot.version !== 2) throw Error('expected V2');
+  const changed = structuredClone(snapshot);
+  changed.editorBody.blocks[1] = {
+    type: 'paragraph',
+    content: [{ type: 'text', text: 'body', marks: [] }],
+  };
+  await expect(port.verify(changed)).rejects.toMatchObject({
+    code: 'INPUT_UNSUPPORTED',
+  });
+  await expect(
+    port.capture({
+      ...editable(article),
+      editorBody: {
+        version: 2,
+        blocks: [
+          {
+            type: 'paragraph',
+            content: [{ type: 'text', text: 'different', marks: [] }],
+          },
+        ],
+      },
+    }),
+  ).rejects.toMatchObject({ code: 'INPUT_UNSUPPORTED' });
+  body.blocks[1] = { type: 'paragraph', content: [] };
+  expect(snapshot.editorBody.blocks[1]).toMatchObject({
+    content: [{ text: 'body', marks: ['bold'] }],
+  });
+});
+
+it('preserves the historical V1 byte hash golden fixture without upgrading its body first', () => {
+  const snapshot = makeDraftTask().snapshot;
+  expect(createDraftSnapshotDigest(snapshot.article)).toBe(
+    '969beecdc737c33128d150497398f9100706a4796e1a8974ed7ac6432525162e',
+  );
+  expect(() => verifyDraftSnapshotIntegrity(snapshot)).not.toThrow();
+});
+
+it.each(['null', 'V1'] as const)(
+  'keeps 10 legacy paragraphs of 19999 LF plus one character compact under 2MiB when capturing %s layout',
+  async (source) => {
+    const article = makeDraftTask().snapshot.article;
+    article.body = Array.from({ length: 10 }, () => ({
+      type: 'paragraph' as const,
+      text: '\n'.repeat(19999) + '字',
+    }));
+    const editorBody =
+      source === 'null'
+        ? null
+        : {
+            version: 1 as const,
+            blocks: article.body.map((block) => {
+              if (block.type !== 'paragraph') throw Error('paragraph fixture');
+              return block;
+            }),
+          };
+    const port = createDraftSnapshotPort({} as AssetStore);
+    const snapshot = await port.capture({
+      article,
+      articleRevision: 1,
+      editorBody,
+    });
+    expect(snapshot.version).toBe(2);
+    if (snapshot.version !== 2) throw Error('V2 required');
+    expect(snapshot.editorBody.blocks).toHaveLength(10);
+    expect(snapshot.editorBody.blocks[0]).toEqual({
+      type: 'paragraph',
+      content: [{ type: 'text', text: '\n'.repeat(19999) + '字', marks: [] }],
+    });
+    expect(
+      Buffer.byteLength(JSON.stringify(snapshot), 'utf8'),
+    ).toBeLessThanOrEqual(2 * 1024 * 1024);
+    await expect(port.verify(snapshot)).resolves.toBeUndefined();
+    const old = {
+      version: 1 as const,
+      article,
+      digest: createDraftSnapshotDigest(article),
+    };
+    expect(submissionContentEquivalent(old, snapshot)).toBe('equal');
+  },
+);

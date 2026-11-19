@@ -1,3 +1,5 @@
+import { matchesRichContentTitle } from './rich-content-evidence';
+import { snapshotBodyLength } from '../../../contracts/draft-task';
 import type { CoverReport } from '../../../contracts/cover-task';
 import { effectiveCoverPolicy } from '../../../domain/cover-task';
 import type {
@@ -13,6 +15,17 @@ export type ObservedBlock =
 export const emptyEditorPlaceholderSelector =
   'p:has(> span.syl-placeholder.ProseMirror-widget[ignoreel="true"][contenteditable="false"]:first-child):has(> img.ProseMirror-separator[alt=""]:not([src]):nth-child(2)):has(> br.ProseMirror-trailingBreak:nth-child(3):last-child)';
 export interface EditorEvidence {
+  /** Live operation ownership only. Never a content/semantic digest. */
+  operation?: {
+    taskId: string;
+    rootKey: string;
+    coverKey: string | null;
+    saving: boolean;
+  };
+  rich?: {
+    formatKnown: boolean;
+    blocks: import('./rich-content-evidence').ObservedRichBlock[];
+  };
   store: StoreBinding | null;
   remote: RemoteRef | null;
   isDraft: boolean;
@@ -33,6 +46,86 @@ export interface EditorEvidence {
     items: { position: number; resourceKey: string; loaded: boolean }[];
     pendingUploads: boolean;
   };
+}
+
+/** Admission during writing: source block indexes identify durable image
+ * evidence, while current DOM images are compared as ordered occurrences.
+ * Text, marks and platform caret paragraphs are deliberately not admission. */
+export function matchesOperationContent(
+  task: DraftTask,
+  observed: EditorEvidence,
+  count = snapshotBodyLength(task.snapshot),
+): boolean {
+  if (
+    !DraftEvidenceSchema.safeParse(task.evidence).success ||
+    !observed.known ||
+    !sameStore(observed.store, task.store) ||
+    observed.pendingUploads ||
+    (observed.localCover?.pendingUploads &&
+      (!!observed.operation ||
+        (!!task.coverPlan && task.coverPlan.snapshot.mode !== 'none'))) ||
+    observed.remote ||
+    observed.title !== task.snapshot.article.title ||
+    (observed.operation &&
+      (observed.operation.taskId !== task.taskId || observed.operation.saving))
+  )
+    return false;
+  const body =
+    task.snapshot.version === 2
+      ? task.snapshot.editorBody.blocks
+      : task.snapshot.article.body;
+  const expected = body
+    .slice(0, count)
+    .map((block, bodyIndex) => ({ block, bodyIndex }))
+    .filter((entry) => entry.block.type === 'image');
+  const images = (
+    observed.rich && !observed.operation
+      ? observed.rich.blocks
+      : observed.blocks
+  ).filter((block) => block.type === 'image');
+  if (
+    images.length !== expected.length ||
+    task.evidence.images.length !== expected.length
+  )
+    return false;
+  return expected.every(({ block, bodyIndex }, index) => {
+    if (block.type !== 'image') return false;
+    const imageId = 'imageId' in block ? block.imageId : block.image_id;
+    const proof = task.evidence.images[index];
+    const image = images[index];
+    return (
+      !!proof &&
+      proof.bodyIndex === bodyIndex &&
+      proof.imageId === imageId &&
+      image?.loaded &&
+      !!image.resourceKey &&
+      image.resourceKey === proof.resourceKey &&
+      task.snapshot.article.assets.some(
+        (asset) =>
+          asset.imageId === imageId && asset.assetKey === proof.assetKey,
+      )
+    );
+  });
+}
+
+export function sameOperationEditor(
+  before: EditorEvidence,
+  after: EditorEvidence,
+): boolean {
+  return (
+    before.known &&
+    after.known &&
+    !!before.contextKey &&
+    before.contextKey === after.contextKey &&
+    !!before.editorUrl &&
+    before.editorUrl === after.editorUrl &&
+    !!before.store &&
+    sameStore(after.store, before.store) &&
+    before.title === after.title &&
+    before.operation?.taskId === after.operation?.taskId &&
+    before.operation?.rootKey === after.operation?.rootKey &&
+    before.operation?.coverKey === after.operation?.coverKey
+  );
 }
 /** Unknown observations are never persistence/success evidence. An empty image
  * resourceKey explicitly means no stable resource association has been proved. */
@@ -131,7 +224,7 @@ export function titleEditApplies(
 export function matchesContent(
   task: DraftTask,
   observed: EditorEvidence,
-  count = task.snapshot.article.body.length,
+  count = snapshotBodyLength(task.snapshot),
 ): boolean {
   return matchesContentTitle(
     task,
@@ -146,6 +239,8 @@ function matchesContentTitle(
   count: number,
   expectedTitle: string,
 ): boolean {
+  if (task.snapshot.version === 2)
+    return matchesRichContentTitle(task, observed, count, expectedTitle);
   if (
     !DraftEvidenceSchema.safeParse(task.evidence).success ||
     !observed.known ||
@@ -211,7 +306,7 @@ function verifyContentTitle(
     matchesContentTitle(
       task,
       observed,
-      task.snapshot.article.body.length,
+      snapshotBodyLength(task.snapshot),
       expectedTitle,
     ) &&
     observed.isDraft &&

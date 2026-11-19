@@ -17,7 +17,7 @@ export interface WebPasteImageReader {
   ): Promise<ManualImage>;
 }
 export interface ManualPasteControllerPorts {
-  converter: WebPasteConverter;
+  converter: import('./rich-web-paste').RichWebPasteConverter;
   pasteImages: WebPasteImageReader;
   fingerprint(input: WebPasteInput | { candidateId: string }): string;
 }

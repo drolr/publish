@@ -1,3 +1,8 @@
+import {
+  observeCoverClick,
+  type CoverClickObservation,
+} from './cover-click-observation';
+import { defaultUploadWaits, type UploadWaits } from './upload-waits';
 import { coverResourceKey as resource } from './cover-resource';
 import { createHash } from 'node:crypto';
 import type { Page, ElementHandle, JSHandle, Locator } from 'playwright-core';
@@ -6,9 +11,15 @@ import type {
   CoverPageDriver,
   CoverPageObservation,
   CoverUploadFile,
+  CoverUploadTerminal,
 } from './cover-pages';
 import type { EditorEvidence } from './content-evidence';
+import { sameOperationEditor } from './content-evidence';
 import { assertSafe, fail, exceptionCategory } from './production-state';
+import {
+  captureUploadSelection,
+  type SelectionCapture,
+} from './production-upload-selection';
 
 // Candidate semantics, NOT live G1 acceptance. Triple associations and failed /
 // partial terminal states are deliberately unimplemented. The public adapter
@@ -19,13 +30,6 @@ const layerSelector =
 const modalSelector = '[role="dialog"],[aria-modal="true"],.ant-modal';
 const bodySelector = 'div[contenteditable="true"]:not([role])';
 type NodeHandle = ElementHandle<Element>;
-type SelectionCapture = {
-  files: readonly File[];
-  inputCount: number;
-  changeCount: number;
-  invalid: boolean;
-  dispose(): void;
-};
 export type OwnedCoverModalProof = Readonly<{
   page: Page;
   generation: string;
@@ -71,8 +75,38 @@ export type CoverOpenDiagnostic = Readonly<{
   elapsedMs: number;
   exceptionCategory?: ReturnType<typeof exceptionCategory>;
 }>;
+/** Bounded terminal evidence only; never filenames, resource URLs or digests. */
+export type CoverTerminalDiagnostic = Readonly<{
+  stage: 'prerequisites' | 'selection' | 'dom' | 'association';
+  prerequisites: boolean;
+  state?: 'uploading' | 'complete' | 'rejected' | 'unknown';
+  selectedFileRetained?: boolean;
+  inputConnected?: boolean;
+  inputNodeStable?: boolean;
+  nodeCount?: number;
+  busy?: boolean;
+  completionMarkerCount?: number;
+  previewCount?: number;
+  previewLoaded?: boolean;
+  previewResourceValid?: boolean;
+  previewSourceKind?:
+    | 'missing'
+    | 'invalid'
+    | 'https'
+    | 'https-fragment'
+    | 'https-credentials'
+    | 'blob'
+    | 'data'
+    | 'http'
+    | 'other';
+  previewNodeStable?: boolean;
+  associationStable?: boolean;
+}>;
 export type ProductionCoverContext = {
+  waits?: UploadWaits;
+  clickDiagnostic?(event: CoverClickObservation): void;
   openDiagnostic?(event: CoverOpenDiagnostic): void;
+  terminalDiagnostic?(event: CoverTerminalDiagnostic): void;
   stages?: CoverStageGate;
   currentPage(): Page;
   generation(): string | null;
@@ -80,12 +114,21 @@ export type ProductionCoverContext = {
   readEditor(proof?: OwnedCoverModalProof): Promise<EditorEvidence>;
   invalidateInspection(): void;
 };
-const digest = (e: EditorEvidence) =>
-  createHash('sha256')
-    .update(
-      JSON.stringify([e.contextKey, e.editorUrl, e.store, e.title, e.blocks]),
-    )
-    .digest('hex');
+function sameCoverObservation(
+  before: CoverPageObservation,
+  after: CoverPageObservation,
+): boolean {
+  return (
+    before.generation === after.generation &&
+    sameOperationEditor(before.editor, after.editor) &&
+    before.modal === after.modal &&
+    before.settlement === after.settlement &&
+    before.mode === after.mode &&
+    before.result === after.result &&
+    before.libraryChecked === after.libraryChecked &&
+    JSON.stringify(before.items) === JSON.stringify(after.items)
+  );
+}
 async function handle(locator: Locator): Promise<NodeHandle> {
   if ((await locator.count()) !== 1)
     return fail('PAGE_CHANGED', 'cover-node-not-unique');
@@ -383,12 +426,12 @@ export async function readProductionLocalCover(
 export function createProductionCoverDriver(
   context: ProductionCoverContext,
 ): CoverPageDriver {
+  const waits = context.waits ?? defaultUploadWaits;
   let proof: OwnedCoverModalProof | undefined,
     input: NodeHandle | undefined,
     fileObjects: JSHandle<readonly File[]> | undefined,
     selectionCapture: JSHandle<SelectionCapture> | undefined;
-  let inputResetAtSelection = false;
-  let editorDigest: string | undefined,
+  let editorBinding: EditorEvidence | undefined,
     generation: string | null = null,
     epoch: number | undefined;
   let titleNode: NodeHandle | undefined,
@@ -407,6 +450,8 @@ export function createProductionCoverDriver(
   let previewNode: NodeHandle | undefined;
   let associationInvalid = false;
   let terminalCheck = 'cover-terminal-unverified';
+  let terminalState: CoverTerminalDiagnostic['state'] = 'unknown';
+  let terminalHasPreview = false;
   async function disposeSelection() {
     const capture = selectionCapture,
       objects = fileObjects,
@@ -439,9 +484,11 @@ export function createProductionCoverDriver(
       fail('PAGE_CHANGED', 'cover-document');
     if (proof) await assertOwnedCoverModal(p, context.generation(), proof);
     await context.guard(proof);
-    if (editorDigest) {
+    if (editorBinding) {
       const e = await context.readEditor(proof);
-      if (!e.known || digest(e) !== editorDigest)
+      if (e.pendingUploads || e.operation?.saving)
+        fail('PAGE_CHANGED', 'cover-independent-operation-pending');
+      if (!sameOperationEditor(editorBinding, e))
         fail('PAGE_CHANGED', 'cover-editor-drift');
       await same(titleNode!, p.locator('textarea:visible'));
       await same(bodyNode!, p.locator(bodySelector + ':visible'));
@@ -480,123 +527,235 @@ export function createProductionCoverDriver(
     return box.isChecked();
   }
   async function terminal() {
-    terminalCheck = 'cover-terminal-prerequisites';
-    if (!proof || !files || !input || !fileObjects || mode !== 'single')
-      return null;
-    const p = context.currentPage();
-    const captureValid =
-      selectionCapture &&
-      (await selectionCapture.evaluate(
-        (capture) =>
-          !capture.invalid &&
-          capture.inputCount === 1 &&
-          capture.changeCount === 1,
-      ));
-    const currentInput = p.locator(modalSelector).locator('input[type=file]');
-    const connected = await input.evaluate((e) => e.isConnected);
-    if (connected) await same(input, currentInput);
-    else if ((await currentInput.count()) !== 0)
-      fail('PAGE_CHANGED', 'cover-input-replaced');
-    const retained =
-      !!captureValid &&
-      (connected
-        ? await input.evaluate(
-            (e, { original, reset }) =>
-              e instanceof HTMLInputElement &&
-              !e.disabled &&
-              (reset
-                ? e.files?.length === 0
-                : e.files?.length === original.length &&
-                  original.every((f, i) => e.files![i] === f)),
-            { original: fileObjects, reset: inputResetAtSelection },
-          )
-        : inputResetAtSelection);
-    if (!retained) {
-      terminalCheck = 'cover-selected-file-not-retained';
-      if (previewNode) associationInvalid = true;
-      return null;
-    }
-    const data = await proof.modal.evaluate((e) => {
-      if (e.querySelectorAll('*').length > 120) return null;
-      const busy = Array.from(
-        e.querySelectorAll('[role=progressbar],[aria-busy=true],progress'),
-      ).some(
-        (n) =>
-          n.getClientRects().length &&
-          getComputedStyle(n).visibility === 'visible',
-      );
-      if (busy) return null;
-      const labels = Array.from(e.querySelectorAll('*')).filter(
-        (n) =>
-          n.childElementCount === 0 &&
-          n.textContent?.trim() === '上传完成，可以拖拽调整图片顺序' &&
-          n.getClientRects().length &&
-          getComputedStyle(n).visibility === 'visible',
-      );
-      const imgs = Array.from(e.querySelectorAll('img')).filter(
-        (n) =>
-          n.getClientRects().length &&
-          getComputedStyle(n).visibility === 'visible',
-      );
-      if (labels.length !== 1 || imgs.length !== 1) return null;
-      const i = imgs[0]!;
-      if (!i.complete || i.naturalWidth <= 0 || i.naturalHeight <= 0)
-        return null;
-      try {
-        const u = new URL(i.currentSrc);
-        if (u.protocol !== 'https:' || u.username || u.password || u.hash)
-          return null;
-      } catch {
-        return null;
-      }
-      return i.currentSrc;
-    });
-    if (!data) {
-      terminalCheck = 'cover-terminal-dom-unverified';
-      if (previewNode) associationInvalid = true;
-      return null;
-    }
-    const observed: CoverPageObservation['items'] = [
-      {
-        position: 0,
-        assetKey: files[0]!.assetKey,
-        sha256: files[0]!.sha256,
-        resourceKey: resource(data),
-        loaded: true,
-      },
-    ];
+    const observation: {
+      -readonly [
+        K in keyof CoverTerminalDiagnostic
+      ]: CoverTerminalDiagnostic[K];
+    } = {
+      stage: 'prerequisites',
+      prerequisites:
+        !!proof && !!files && !!input && !!fileObjects && mode === 'single',
+    };
+    terminalState = 'unknown';
+    terminalHasPreview = false;
     try {
-      const preview = p.locator(modalSelector).locator('img:visible');
-      if (previewNode) {
-        await same(previewNode, preview);
-        if (JSON.stringify(observed) !== JSON.stringify(items))
-          fail('PAGE_CHANGED', 'cover-association-drift');
-      } else {
-        // Pin the FIRST complete causal association, before any review pause.
-        // A later observation must never assign a new remote resource to this File.
-        const node = await handle(preview);
-        if (
-          !(await node.evaluate(
-            (image, url) =>
-              image instanceof HTMLImageElement &&
-              image.isConnected &&
-              image.complete &&
-              image.naturalWidth > 0 &&
-              image.naturalHeight > 0 &&
-              image.currentSrc === url,
-            data,
-          ))
-        )
-          fail('PAGE_CHANGED', 'cover-association-drift');
-        previewNode = node;
-        items = structuredClone(observed);
+      terminalCheck = 'cover-terminal-prerequisites';
+      if (!proof || !files || !input || !fileObjects || mode !== 'single')
+        return null;
+      const p = context.currentPage();
+      const captureValid =
+        selectionCapture &&
+        (await selectionCapture.evaluate(
+          (capture) =>
+            !capture.invalid &&
+            capture.inputCount === 1 &&
+            capture.changeCount === 1,
+        ));
+      const currentInput = p.locator(modalSelector).locator('input[type=file]');
+      const connected = await input.evaluate((e) => e.isConnected);
+      observation.stage = 'selection';
+      observation.inputConnected = connected;
+      if (connected) {
+        observation.inputNodeStable = false;
+        await same(input, currentInput);
+        observation.inputNodeStable = true;
+      } else if ((await currentInput.count()) !== 0)
+        fail('PAGE_CHANGED', 'cover-input-replaced');
+      const retained =
+        !!captureValid &&
+        (connected
+          ? await input.evaluate(
+              (e, original) =>
+                e instanceof HTMLInputElement &&
+                !e.disabled &&
+                (e.files?.length === 0 ||
+                  (e.files?.length === original.length &&
+                    original.every((f, i) => e.files![i] === f))),
+              fileObjects,
+            )
+          : true);
+      observation.selectedFileRetained = retained;
+      if (!retained) {
+        terminalCheck = 'cover-selected-file-not-retained';
+        if (previewNode) associationInvalid = true;
+        return null;
       }
-    } catch (error) {
-      associationInvalid = true;
-      throw error;
+      const data = await proof.modal.evaluate((e) => {
+        const nodeCount = e.querySelectorAll('*').length;
+        if (nodeCount > 120) return { nodeCount, resource: null };
+        const busy = Array.from(
+          e.querySelectorAll('[role=progressbar],[aria-busy=true],progress'),
+        ).some(
+          (n) =>
+            n.getClientRects().length &&
+            getComputedStyle(n).visibility === 'visible',
+        );
+        const labels = Array.from(e.querySelectorAll('*')).filter(
+          (n) =>
+            n.childElementCount === 0 &&
+            n.textContent?.trim() === '上传完成，可以拖拽调整图片顺序' &&
+            n.getClientRects().length &&
+            getComputedStyle(n).visibility === 'visible',
+        );
+        const rejected = Array.from(
+          e.querySelectorAll(
+            '[role=alert],[aria-invalid=true],.ant-form-item-explain-error,.ant-upload-list-item-error',
+          ),
+        ).some(
+          (n) =>
+            n.getClientRects().length &&
+            getComputedStyle(n).visibility === 'visible',
+        );
+        const imgs = Array.from(e.querySelectorAll('img')).filter(
+          (n) =>
+            n.getClientRects().length &&
+            getComputedStyle(n).visibility === 'visible',
+        );
+        const i = imgs.length === 1 ? imgs[0] : undefined;
+        const previewLoaded =
+          !!i && i.complete && i.naturalWidth > 0 && i.naturalHeight > 0;
+        let previewResourceValid = false;
+        let previewSourceInvalid = false;
+        try {
+          const u = new URL(i?.currentSrc ?? '');
+          previewResourceValid =
+            u.protocol === 'https:' && !u.username && !u.password && !u.hash;
+        } catch {
+          // Invalid resource identity is unknown, with no URL in diagnostics.
+        }
+        let previewSourceKind: CoverTerminalDiagnostic['previewSourceKind'] =
+          'missing';
+        if (i) {
+          try {
+            const source = new URL(i.currentSrc || i.src);
+            switch (source.protocol) {
+              case 'https:':
+                previewSourceKind =
+                  source.username || source.password
+                    ? 'https-credentials'
+                    : source.hash
+                      ? 'https-fragment'
+                      : 'https';
+                break;
+              case 'http:':
+                previewSourceKind = 'http';
+                break;
+              case 'blob:':
+                previewSourceKind = 'blob';
+                break;
+              case 'data:':
+                previewSourceKind = 'data';
+                break;
+              default:
+                previewSourceKind = 'other';
+            }
+            previewSourceInvalid =
+              source.protocol !== 'https:' ||
+              !!source.username ||
+              !!source.password ||
+              !!source.hash;
+          } catch {
+            previewSourceInvalid = true;
+            if (i.currentSrc || i.src) previewSourceKind = 'invalid';
+          }
+        }
+        return {
+          nodeCount,
+          busy,
+          rejected,
+          completionMarkerCount: labels.length,
+          previewCount: imgs.length,
+          previewLoaded,
+          previewResourceValid,
+          previewSourceKind,
+          previewSourceInvalid,
+          resource:
+            !busy &&
+            !rejected &&
+            labels.length === 1 &&
+            previewLoaded &&
+            previewResourceValid
+              ? i!.currentSrc
+              : null,
+        };
+      });
+      const {
+        resource: terminalResource,
+        rejected,
+        previewSourceInvalid,
+        ...domObservation
+      } = data;
+      terminalState = rejected
+        ? 'rejected'
+        : data.busy
+          ? 'uploading'
+          : 'unknown';
+      terminalHasPreview = (data.previewCount ?? 0) > 0;
+      Object.assign(observation, { stage: 'dom', ...domObservation });
+      if (!terminalResource) {
+        terminalCheck =
+          data.completionMarkerCount === 1 && previewSourceInvalid
+            ? 'cover-terminal-resource-invalid'
+            : 'cover-terminal-dom-unverified';
+        if (previewNode) associationInvalid = true;
+        return null;
+      }
+      const observed: CoverPageObservation['items'] = [
+        {
+          position: 0,
+          assetKey: files[0]!.assetKey,
+          sha256: files[0]!.sha256,
+          resourceKey: resource(terminalResource),
+          loaded: true,
+        },
+      ];
+      try {
+        observation.stage = 'association';
+        const preview = p.locator(modalSelector).locator('img:visible');
+        if (previewNode) {
+          observation.previewNodeStable = false;
+          await same(previewNode, preview);
+          observation.previewNodeStable = true;
+          observation.associationStable =
+            JSON.stringify(observed) === JSON.stringify(items);
+          if (JSON.stringify(observed) !== JSON.stringify(items))
+            fail('PAGE_CHANGED', 'cover-association-drift');
+        } else {
+          // Pin the FIRST complete causal association, before any review pause.
+          // A later observation must never assign a new remote resource to this File.
+          const node = await handle(preview);
+          if (
+            !(await node.evaluate(
+              (image, url) =>
+                image instanceof HTMLImageElement &&
+                image.isConnected &&
+                image.complete &&
+                image.naturalWidth > 0 &&
+                image.naturalHeight > 0 &&
+                image.currentSrc === url,
+              terminalResource,
+            ))
+          )
+            fail('PAGE_CHANGED', 'cover-association-drift');
+          previewNode = node;
+          items = structuredClone(observed);
+          observation.previewNodeStable = true;
+          observation.associationStable = true;
+        }
+      } catch (error) {
+        associationInvalid = true;
+        throw error;
+      }
+      terminalState = 'complete';
+      // Neither callers nor stage observers receive the private pinned array.
+      return structuredClone(items);
+    } finally {
+      try {
+        context.terminalDiagnostic?.({ ...observation, state: terminalState });
+      } catch {
+        // Diagnostics never change the original result or exception.
+      }
     }
-    // Neither callers nor stage observers receive the private pinned array.
-    return structuredClone(items);
   }
   async function inspect(): Promise<CoverPageObservation> {
     await guard();
@@ -662,6 +821,8 @@ export function createProductionCoverDriver(
       }
       currentMode = mode ?? null;
     }
+    // Cover-layer closure cannot erase a separately observed active upload.
+    if (e.pendingUploads) settlement = 'pending';
     return {
       generation: context.generation() ?? '',
       editor: { ...e, pendingUploads: settlement !== 'settled' },
@@ -702,15 +863,42 @@ export function createProductionCoverDriver(
   }
   async function closeOwned(name: '确定' | '取消') {
     if (name === '确定') await stage('before-confirm');
+    const attached = proof
+      ? await proof.modal
+          .evaluate(
+            (element) =>
+              element.isConnected && element.getClientRects().length > 0,
+          )
+          .catch(() => false)
+      : false;
+    if (name === '取消' && proof && !attached) {
+      // The platform already took the modal away. No click is possible, but the
+      // attempt is still explicitly closed and read back before any retry.
+      if (!uploadAttempted) fail('PAGE_CHANGED', 'cover-cancel-before-upload');
+      if (cancelAttempted)
+        fail('PAGE_CHANGED', 'cover-action-already-attempted');
+      cancelAttempted = true;
+      proof = undefined;
+      closed = 'cancelled';
+      await disposeSelection();
+      const after = await inspect();
+      if (after.settlement !== 'settled')
+        fail('PAGE_CHANGED', 'cover-close-readback');
+      return;
+    }
     const before = await inspect();
-    if (
-      before.settlement !== 'settled' ||
-      before.result !== 'complete' ||
-      before.items.length !== 1
-    )
-      fail('PAGE_CHANGED', 'cover-terminal-unverified');
-    if (name === '确定' && before.libraryChecked !== false)
-      fail('PAGE_CHANGED', 'cover-library-unverified');
+    if (name === '确定') {
+      if (
+        before.settlement !== 'settled' ||
+        before.result !== 'complete' ||
+        before.items.length !== 1
+      )
+        fail('PAGE_CHANGED', 'cover-terminal-unverified');
+      if (before.libraryChecked !== false)
+        fail('PAGE_CHANGED', 'cover-library-unverified');
+    } else if (!uploadAttempted) {
+      fail('PAGE_CHANGED', 'cover-cancel-before-upload');
+    }
     if (name === '确定' ? confirmAttempted : cancelAttempted)
       fail('PAGE_CHANGED', 'cover-action-already-attempted');
     const button = await modalButton(name),
@@ -719,20 +907,20 @@ export function createProductionCoverDriver(
     // Snapshot and actual checkbox node are reread after any external stage gate.
     await context.stages?.reserve(name === '确定' ? 'confirm' : 'cancel');
     const fresh = await inspect();
-    if (JSON.stringify(fresh) !== JSON.stringify(before))
+    if (!sameCoverObservation(before, fresh))
       fail('PAGE_CHANGED', 'cover-confirm-drift');
     await same(buttonNode, await modalButton(name));
     if (name === '确定') confirmAttempted = true;
     else cancelAttempted = true;
     context.invalidateInspection();
-    await buttonNode.click({ timeout: 5000 });
+    await buttonNode.click({ timeout: waits.imageAction });
     await context
       .currentPage()
       .waitForFunction(
         ({ modal, wrapper, mask }) =>
           ![modal, wrapper, mask].some((n) => n.isConnected),
         { modal: owned.modal, wrapper: owned.wrapper, mask: owned.mask },
-        { timeout: 10000 },
+        { timeout: waits.settleImage },
       );
     proof = undefined;
     closed = name === '确定' ? 'confirmed' : 'cancelled';
@@ -751,6 +939,8 @@ export function createProductionCoverDriver(
     async open(nextMode) {
       const started = performance.now();
       let openPhase: CoverOpenPhase = 'guard';
+      let finishClickObservation:
+        Awaited<ReturnType<typeof observeCoverClick>> | undefined;
       const record = (
         status: CoverOpenDiagnostic['status'],
         error?: unknown,
@@ -775,7 +965,31 @@ export function createProductionCoverDriver(
       };
       record('start');
       try {
-        if (opened) fail('PAGE_CHANGED', 'cover-open-already-attempted');
+        if (opened) {
+          if (closed !== 'cancelled')
+            fail('PAGE_CHANGED', 'cover-open-already-attempted');
+          // A cancelled attempt may be retried once. Per-attempt evidence is
+          // discarded; the editor identity captured by the first open survives.
+          try {
+            await previewNode?.dispose();
+            await libraryNode?.dispose();
+          } catch {
+            /* A stale preview handle is already detached. */
+          }
+          previewNode = undefined;
+          libraryNode = undefined;
+          opened = false;
+          uploadAttempted = false;
+          confirmAttempted = false;
+          cancelAttempted = false;
+          uncheckAttempted = false;
+          closed = undefined;
+          proof = undefined;
+          files = undefined;
+          items = [];
+          associationInvalid = false;
+          terminalCheck = 'cover-terminal-unverified';
+        }
         await guard();
         const p = context.currentPage();
         generation = context.generation();
@@ -791,7 +1005,7 @@ export function createProductionCoverDriver(
           e.pendingUploads
         )
           fail('PAGE_CHANGED', 'cover-editor-unknown');
-        editorDigest = digest(e);
+        editorBinding = structuredClone(e);
         next('capture-nodes');
         titleNode = await handle(p.locator('textarea:visible'));
         bodyNode = await handle(p.locator(bodySelector + ':visible'));
@@ -811,7 +1025,7 @@ export function createProductionCoverDriver(
           await context.stages?.reserve('mode');
           await guard();
           await same(retained, target);
-          await retained.click({ timeout: 5000 });
+          await retained.click({ timeout: waits.imageAction });
           mode = nextMode;
           await guard();
         }
@@ -825,10 +1039,25 @@ export function createProductionCoverDriver(
         opened = true;
         context.invalidateInspection();
         next('slot-click');
-        await slotNode.click({ timeout: 5000 });
+        if (context.clickDiagnostic)
+          finishClickObservation = await observeCoverClick(
+            slotNode,
+            modalSelector,
+            context.clickDiagnostic,
+          );
+        try {
+          await slotNode.click({ timeout: waits.imageAction });
+        } catch (error) {
+          if (exceptionCategory(error) !== 'timeout') throw error;
+          // A dispatched click can lose its acknowledgement. Observe only;
+          // never replay the single-use open action. Ordinary structure and
+          // ownership checks below still precede every further platform action.
+          const currentModal = p.locator(modalSelector + ':visible');
+          if ((await currentModal.count()) !== 1) throw error;
+        }
         next('modal-visible');
         const modal = p.locator(modalSelector + ':visible');
-        await modal.waitFor({ state: 'visible', timeout: 5000 });
+        await modal.waitFor({ state: 'visible', timeout: waits.imageAction });
         next('modal-structure');
         if (
           (await modal.getByText('上传图片', { exact: true }).count()) !== 1 ||
@@ -857,7 +1086,9 @@ export function createProductionCoverDriver(
         next('inspect');
         await inspect();
         record('returned');
+        await finishClickObservation?.(false).catch(() => {});
       } catch (error) {
+        await finishClickObservation?.(true).catch(() => {});
         record('failed', error);
         throw error;
       }
@@ -880,7 +1111,7 @@ export function createProductionCoverDriver(
       if (before.settlement !== 'settled') fail('PAGE_CHANGED');
       await context.stages?.reserve('upload');
       const fresh = await inspect();
-      if (JSON.stringify(fresh) !== JSON.stringify(before))
+      if (!sameCoverObservation(before, fresh))
         fail('PAGE_CHANGED', 'cover-upload-drift');
       files = parsed.data!.files.map((f) => ({
         ...f,
@@ -890,57 +1121,14 @@ export function createProductionCoverDriver(
       context.invalidateInspection();
       // Capture the actual File objects before the platform's change handler
       // clears/unmounts its input. This observer never changes the selection.
-      selectionCapture = await input!.evaluateHandle((node) => {
-        if (
-          !(node instanceof HTMLInputElement) ||
-          node.disabled ||
-          !node.isConnected
-        )
-          throw Error('cover-input-unavailable');
-        const capture: SelectionCapture = {
-          files: [],
-          inputCount: 0,
-          changeCount: 0,
-          invalid: false,
-          dispose: () => {},
-        };
-        const observedEvents = new WeakSet<Event>();
-        const observe = (event: Event) => {
-          if (event.target !== node || observedEvents.has(event)) return;
-          observedEvents.add(event);
-          if (event.type === 'input') capture.inputCount++;
-          else capture.changeCount++;
-          const current = Array.from(node.files ?? []);
-          if (
-            capture.inputCount > 1 ||
-            capture.changeCount > 1 ||
-            current.length !== 1
-          ) {
-            capture.invalid = true;
-            return;
-          }
-          if (!capture.files.length) capture.files = Object.freeze(current);
-          else if (current.some((file, index) => file !== capture.files[index]))
-            capture.invalid = true;
-        };
-        node.addEventListener('input', observe, true);
-        node.addEventListener('change', observe, true);
-        node.ownerDocument.addEventListener('input', observe, true);
-        node.ownerDocument.addEventListener('change', observe, true);
-        capture.dispose = () => {
-          node.removeEventListener('input', observe, true);
-          node.removeEventListener('change', observe, true);
-          node.ownerDocument.removeEventListener('input', observe, true);
-          node.ownerDocument.removeEventListener('change', observe, true);
-        };
-        return capture;
-      });
+      selectionCapture = await captureUploadSelection(input!);
       await input!.setInputFiles(
         files.map((f) => ({
           name: f.assetKey + (f.mime === 'image/png' ? '.png' : '.jpg'),
           mimeType: f.mime,
           buffer: Buffer.from(f.bytes),
         })),
+        { timeout: waits.imageAction },
       );
       fileObjects = await selectionCapture.evaluateHandle(
         (capture) => capture.files,
@@ -979,88 +1167,42 @@ export function createProductionCoverDriver(
         ))
       )
         fail('PAGE_CHANGED', 'cover-selected-file-mismatch');
-      inputResetAtSelection = await input!.evaluate(
-        (e) => e instanceof HTMLInputElement && e.files?.length === 0,
-      );
-      if (inputResetAtSelection)
-        proof = Object.freeze({ ...proof!, selectedFileVerified: true });
+      // The captured File bytes are verified. A later reset/unmount is not
+      // another selection; the observer stays live to reject second signals.
+      proof = Object.freeze({ ...proof!, selectedFileVerified: true });
       await guard();
       await stage('after-selection');
     },
-    async waitForUpload() {
-      await guard();
-      const modal = context.currentPage().locator(modalSelector);
-      // File selection is not upload completion. Observe the owned modal's
-      // completion signal before checking its preview; never select again.
-      try {
-        await modal
-          .getByText('上传完成，可以拖拽调整图片顺序', { exact: true })
-          .waitFor({ state: 'visible', timeout: 10000 });
-      } catch {
-        fail('PAGE_CHANGED', 'cover-upload-completion-timeout');
-      }
-      await guard();
-      const preview = modal.locator('img');
-      // Loading an already identified preview is asynchronous. Wait only on this
-      // exact node and URL; a timeout or a changed resource is never completion.
-      if (
-        (await preview.count()) === 1 &&
-        (await modal
-          .getByText('上传完成，可以拖拽调整图片顺序', { exact: true })
-          .count()) === 1
-      ) {
-        const node = await handle(preview);
-        try {
-          const pendingUrl = await node.evaluate((e) => {
-            if (!(e instanceof HTMLImageElement) || e.complete) return null;
-            try {
-              const u = new URL(e.currentSrc || e.src);
-              return u.protocol === 'https:' &&
-                !u.username &&
-                !u.password &&
-                !u.hash
-                ? u.href
-                : null;
-            } catch {
-              return null;
-            }
-          });
-          if (pendingUrl) {
-            await node.evaluate(
-              (e) =>
-                new Promise<void>((resolve) => {
-                  const done = () => {
-                    clearTimeout(timer);
-                    e.removeEventListener('load', done);
-                    e.removeEventListener('error', done);
-                    resolve();
-                  };
-                  const timer = setTimeout(done, 10000);
-                  e.addEventListener('load', done, { once: true });
-                  e.addEventListener('error', done, { once: true });
-                  if (e instanceof HTMLImageElement && e.complete) done();
-                }),
-            );
-            await guard();
-            await same(node, preview);
-            if (
-              !(await node.evaluate(
-                (e, url) =>
-                  e instanceof HTMLImageElement &&
-                  (e.currentSrc || e.src) === url,
-                pendingUrl,
-              ))
-            )
-              fail('PAGE_CHANGED', 'cover-association-drift');
-          }
-        } finally {
-          await node.dispose();
+    async waitForUpload(): Promise<CoverUploadTerminal> {
+      if (!proof) fail('PAGE_CHANGED', 'cover-upload-not-open');
+      // Completion copy, progress teardown and preview mounting/loading may
+      // arrive in any order. Keep all predicates in one bounded observation loop
+      // and pin identity only at the first fully evidenced association.
+      const deadline = Date.now() + waits.cover;
+      for (;;) {
+        await guard();
+        const attached = await proof!.modal
+          .evaluate(
+            (element) =>
+              element.isConnected && element.getClientRects().length > 0,
+          )
+          .catch(() => false);
+        if (!attached) return 'incomplete';
+        const value = await inspect();
+        if (
+          terminalCheck === 'cover-selected-file-not-retained' ||
+          terminalCheck === 'cover-terminal-resource-invalid'
+        )
+          fail('PAGE_CHANGED', terminalCheck);
+        if (terminalState === 'rejected') return 'rejected';
+        if (value.settlement === 'settled' && value.result === 'complete') {
+          await stage('after-upload-review');
+          return 'complete';
         }
+        if (Date.now() >= deadline)
+          return terminalHasPreview ? 'incomplete' : 'timeout';
+        await new Promise<void>((resolve) => setTimeout(resolve, 1000));
       }
-      const value = await inspect();
-      if (value.settlement !== 'settled' || value.result !== 'complete')
-        fail('PAGE_CHANGED', terminalCheck);
-      await stage('after-upload-review');
     },
     async uncheckLibrary() {
       if (uncheckAttempted) fail('PAGE_CHANGED');
@@ -1074,11 +1216,11 @@ export function createProductionCoverDriver(
         fail('PAGE_CHANGED', 'cover-library-unverified');
       await context.stages?.reserve('uncheck');
       const fresh = await inspect();
-      if (JSON.stringify(fresh) !== JSON.stringify(state))
+      if (!sameCoverObservation(state, fresh))
         fail('PAGE_CHANGED', 'cover-library-drift');
       uncheckAttempted = true;
       context.invalidateInspection();
-      await libraryNode!.setChecked(false, { timeout: 5000 });
+      await libraryNode!.setChecked(false, { timeout: waits.imageAction });
       if ((await library()) !== false)
         fail('PAGE_CHANGED', 'cover-library-unverified');
       await stage('after-library-review');

@@ -128,7 +128,7 @@ async function mount(page: Page, scenario = 'normal') {
               ? { state: 'unavailable', code: 'INITIALIZATION_FAILED' }
               : {
                   state: 'ready',
-                  schemaVersion: 14,
+                  schemaVersion: 15,
                   appVersion: '1',
                 },
           startArticleImport: async () => {
@@ -232,6 +232,29 @@ async function mount(page: Page, scenario = 'normal') {
             status: 'ok',
             article: {
               ...summary,
+              editorBody: {
+                version: 2,
+                blocks: [
+                  {
+                    type: 'paragraph',
+                    content: [
+                      {
+                        type: 'text',
+                        text: '<script>window.bad=true</script>\n原始正文',
+                        marks: [],
+                      },
+                    ],
+                  },
+                  { type: 'image', imageId: 'one' },
+                  {
+                    type: 'paragraph',
+                    content: [
+                      { type: 'text', text: '图片之间的段落', marks: [] },
+                    ],
+                  },
+                  { type: 'image', imageId: 'one' },
+                ],
+              },
               body: [
                 {
                   type: 'paragraph',
@@ -318,9 +341,10 @@ test('empty library imports and selects literal ordered preview', async ({
   await expect(
     page.getByRole('heading', { name: '一篇汽车文章' }),
   ).toBeFocused();
-  await expect(
-    page.getByText('<script>window.bad=true</script>\n原始正文'),
-  ).toBeVisible();
+  const literal = page.locator('p.body-text').filter({ hasText: '原始正文' });
+  await expect(literal).toBeVisible();
+  await expect(literal).toHaveText('<script>window.bad=true</script>原始正文');
+  await expect(literal.locator('br')).toHaveCount(1);
   await expect(page.getByRole('img')).toHaveCount(1);
   await page.screenshot({ path: resolve('.tmp/library-renderer-1000.png') });
   await page.getByRole('button', { name: '查看第 2 张图片' }).click();
@@ -330,6 +354,141 @@ test('empty library imports and selects literal ordered preview', async ({
     await page.evaluate(() => Reflect.get(window, 'testState').revoked),
   ).toBeGreaterThan(0);
 });
+
+test('T5 top and bottom pagers share page state and selection', async ({
+  page,
+}) => {
+  await mount(page, 'paging');
+  const top = page.getByRole('navigation', {
+    name: '文章顶部分页',
+    exact: true,
+  });
+  const bottom = page.getByRole('navigation', {
+    name: '文章分页',
+    exact: true,
+  });
+  await expect(top.getByRole('button', { name: '上一页' })).toBeDisabled();
+  await page.getByRole('checkbox', { name: '全选本页', exact: true }).check();
+  await top.getByRole('button', { name: '下一页' }).click();
+  await expect(top).toContainText('第 2 页');
+  await expect(bottom).toContainText('第 2 页');
+  await bottom.getByRole('button', { name: '上一页' }).click();
+  await expect(top).toContainText('第 1 页');
+  await expect(
+    page.getByRole('checkbox', { name: '全选本页', exact: true }),
+  ).toBeChecked();
+});
+
+test('T5 Judongche preview hides declaration operations and redundant metadata', async ({
+  page,
+}) => {
+  await mount(page);
+  await page.getByRole('button', { name: /^一篇汽车文章 文章编号/ }).click();
+  await expect(page.getByLabel('文章声明', { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole('button', { name: /设为原创|设为转载|保存声明/ }),
+  ).toHaveCount(0);
+  await expect(page.locator('.preview-meta')).not.toContainText(/原创|转载/);
+  await expect(page.locator('.article-rows')).not.toContainText(/原创|转载/);
+});
+
+test('T5 routine import help supports hover, keyboard focus and Escape at narrow width', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 800, height: 600 });
+  await mount(page);
+  const help = page.getByRole('button', { name: '导入文章帮助', exact: true });
+  const tip = page.getByRole('tooltip');
+  await expect(tip).not.toBeVisible();
+  await help.hover();
+  await expect(tip).toContainText('本地图片需保留相对目录');
+  await tip.hover();
+  await expect(tip).toBeVisible();
+  await page.mouse.move(0, 0);
+  await expect(tip).not.toBeVisible();
+  await help.focus();
+  await expect(tip).toBeVisible();
+  await expect(help).toHaveAttribute(
+    'aria-describedby',
+    (await tip.getAttribute('id'))!,
+  );
+  await page.screenshot({
+    path: resolve(
+      '.superpowers/sdd/2026-11-08-operator-recovery-ui/t5-import-help-800.png',
+    ),
+    fullPage: true,
+  });
+  await page.keyboard.press('Escape');
+  await expect(tip).not.toBeVisible();
+  await expect(help).toBeFocused();
+});
+
+test('T5 hover help closes with Escape while keyboard focus remains elsewhere', async ({
+  page,
+}) => {
+  await mount(page);
+  const focused = page.getByRole('button', { name: '导入文章', exact: true });
+  const help = page.getByRole('button', { name: '导入文章帮助', exact: true });
+  const tip = page.getByRole('tooltip');
+  await focused.focus();
+  await help.hover();
+  await expect(tip).toBeVisible();
+  await expect(focused).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(tip).not.toBeVisible();
+  await expect(focused).toBeFocused();
+  // The pointer remains over the trigger; a second key must not reopen help.
+  await page.keyboard.press('ArrowRight');
+  await expect(tip).not.toBeVisible();
+  await expect(focused).toBeFocused();
+  await focused.evaluate((element) => {
+    element.addEventListener('keydown', (event) => {
+      if ((event as KeyboardEvent).key === 'Escape')
+        element.setAttribute('data-escape-received', 'true');
+    });
+  });
+  await page.keyboard.press('Escape');
+  await expect(focused).toHaveAttribute('data-escape-received', 'true');
+  await page.mouse.move(0, 0);
+  await help.hover();
+  await expect(tip).toBeVisible();
+});
+
+for (const width of [1280, 800, 480]) {
+  test(`T5 shared pagination remains reachable without horizontal overflow at ${width}`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 720 });
+    await mount(page, 'paging');
+    const top = page.getByRole('navigation', {
+      name: '文章顶部分页',
+      exact: true,
+    });
+    const bottom = page.getByRole('navigation', {
+      name: '文章分页',
+      exact: true,
+    });
+    await top.getByRole('button', { name: '下一页' }).click();
+    await bottom.getByRole('button', { name: '上一页' }).click();
+    await top.getByRole('button', { name: '下一页' }).focus();
+    const box = (await top
+      .getByRole('button', { name: '下一页' })
+      .boundingBox())!;
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(width);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    await page.screenshot({
+      path: resolve(
+        `.superpowers/sdd/2026-11-08-operator-recovery-ui/t5-library-${width}.png`,
+      ),
+      fullPage: true,
+    });
+  });
+}
 test('recovers unknown status without resubmission and polls serially', async ({
   page,
 }) => {
@@ -360,11 +519,17 @@ test('cursor back stack and compact viewport remain usable', async ({
 }) => {
   await page.setViewportSize({ width: 800, height: 600 });
   await mount(page, 'paging');
-  await page.getByRole('button', { name: '下一页' }).click();
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '下一页' })
+    .click();
   await expect(
     page.getByRole('button', { name: /^第二页文章 文章编号/ }),
   ).toBeVisible();
-  await page.getByRole('button', { name: '上一页' }).click();
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '上一页' })
+    .click();
   await page.getByRole('button', { name: /^一篇汽车文章 文章编号/ }).click();
   await expect(
     page.getByRole('heading', { name: '一篇汽车文章' }),
@@ -559,195 +724,77 @@ test('unreadable preview never displays partial text or requests image bytes', a
   ).toBe(0);
 });
 
-test('single declaration edit updates persisted projection and disables unchanged save', async ({
-  page,
-}) => {
-  await mount(page);
-  await page.getByRole('button', { name: /^一篇汽车文章 文章编号/ }).click();
-  await expect(
-    page.getByRole('button', { name: '保存声明', exact: true }),
-  ).toBeDisabled();
-  await page.getByLabel('文章声明', { exact: true }).selectOption('repost');
-  await page.getByRole('button', { name: '保存声明', exact: true }).click();
-  await expect(
-    page.getByRole('status').filter({ hasText: '已更新' }),
-  ).toContainText('已更新 1 篇，0 篇原本已是该属性');
-  await expect(
-    page.getByRole('button', { name: /^一篇汽车文章 文章编号/ }),
-  ).toContainText('转载');
-});
-
-async function declarationFixture(page: Page, mode = 'normal') {
-  await mount(page);
-  await expect(
-    page.getByRole('button', { name: '导入文章', exact: true }),
-  ).toBeEnabled();
-  await page.evaluate(
-    ({ mode }) => {
-      const items = Array.from({ length: 105 }, (_, index) => ({
-        articleKey: `11111111-1111-4111-8111-${String(index + 1).padStart(12, '0')}`,
-        externalId: `article-${index + 1}`,
-        title: `文章 ${index + 1}`,
-        contentDeclaration:
-          index % 2 ? ('repost' as const) : ('original' as const),
-        createdAt: '2026-09-16T00:00:00.000Z',
-        imageCount: 0,
-        articleRevision: 1,
-      }));
-      const state = { writes: 0, reads: 0 };
-      Object.assign(window, { declarationState: state });
-      Object.assign(window.desktopApi, {
-        listArticles: async (cursor?: { articleKey: string }) => {
-          if (mode === 'refreshfail' && state.writes)
-            return { status: 'unavailable' };
-          const start = cursor ? Number(cursor.articleKey.slice(-12)) : 0;
-          return {
-            status: 'ok',
-            page: {
-              totalCount: items.length,
-              membershipRevision: 0,
-              pageNumber: Math.floor(start / 10) + 1,
-              totalPages: 11,
-              items: items
-                .slice(start, start + 10)
-                .map((item) => ({ ...item })),
-              ...(start + 10 < items.length
-                ? {
-                    nextCursor: {
-                      articleKey: items[start + 9].articleKey,
-                      createdAt: items[start + 9].createdAt,
-                      membershipRevision: 0,
-                      pageNumber: Math.floor(start / 10) + 2,
-                    },
-                  }
-                : {}),
-            },
-          };
-        },
-        getArticleDeclarations: async (keys: string[]) => {
-          state.reads++;
-          if (mode === 'readfail') return { status: 'unavailable' };
-          if (mode === 'fresh') items[0].contentDeclaration = 'repost';
-          return {
-            status: 'ok',
-            items: items
-              .filter((item) => keys.includes(item.articleKey))
-              .map(({ articleKey, title, externalId, contentDeclaration }) => ({
-                articleKey,
-                title,
-                externalId,
-                contentDeclaration,
-              })),
-          };
-        },
-        getArticlePreview: async (key: string) =>
-          mode === 'brokenpreview'
-            ? { status: 'unavailable' }
-            : {
-                status: 'ok',
-                article: {
-                  ...items.find((item) => item.articleKey === key),
-                  body: [{ type: 'paragraph', text: '正文' }],
-                  assets: [],
-                },
-              },
-        setArticleDeclarations: async (change: {
-          targets: {
-            articleKey: string;
-            expectedDeclaration: 'original' | 'repost';
-          }[];
-          declaration: 'original' | 'repost';
-        }) => {
-          state.writes++;
-          if (mode === 'conflict')
-            return {
-              status: 'conflict',
-              articleKeys: [change.targets[0].articleKey],
-            };
-          if (mode === 'pending')
-            await new Promise<void>((resolve) =>
-              Object.assign(window, { releaseSave: resolve }),
-            );
-          const targets = items.filter((item) =>
-            change.targets.some(
-              (target) => target.articleKey === item.articleKey,
-            ),
-          );
-          const changedCount = targets.filter(
-            (item) => item.contentDeclaration !== change.declaration,
-          ).length;
-          targets.forEach((item) => {
-            item.contentDeclaration = change.declaration;
-          });
-          if (mode === 'unknown') throw new Error('private transport details');
-          return {
-            status: 'updated',
-            changedCount,
-            unchangedCount: targets.length - changedCount,
-            items: targets.map(
-              ({ articleKey, title, externalId, contentDeclaration }) => ({
-                articleKey,
-                title,
-                externalId,
-                contentDeclaration,
-              }),
-            ),
-          };
-        },
-      });
-    },
-    { mode },
-  );
-  // Existing next page causes an ordinary read of the fixture without reopening the app.
-  await page
-    .getByRole('checkbox', { name: '选择 一篇汽车文章', exact: true })
-    .check();
-  await page.getByRole('button', { name: '设为原创', exact: true }).click();
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
-  await page.getByRole('button', { name: '清空选择', exact: true }).click();
-  await expect(
-    page.getByRole('checkbox', { name: '选择 文章 1', exact: true }),
-  ).toBeVisible();
+// Declaration editing has left the Judongche UI; backend contract tests retain that API coverage.
+async function pagingFixture(page: Page) {
+  await mount(page, 'paging');
+  await page.evaluate(() => {
+    const items = Array.from({ length: 105 }, (_, index) => ({
+      articleKey: `11111111-1111-4111-8111-${String(index + 1).padStart(12, '0')}`,
+      externalId: `article-${index + 1}`,
+      title: `文章 ${index + 1}`,
+      contentDeclaration: index % 2 ? 'repost' : 'original',
+      createdAt: '2026-09-16T00:00:00.000Z',
+      imageCount: 0,
+      articleRevision: 1,
+    }));
+    Object.assign(window.desktopApi, {
+      listArticles: async (cursor?: { articleKey: string }) => {
+        const start = cursor ? Number(cursor.articleKey.slice(-12)) : 0;
+        return {
+          status: 'ok',
+          page: {
+            totalCount: items.length,
+            membershipRevision: 0,
+            pageNumber: Math.floor(start / 10) + 1,
+            totalPages: 11,
+            items: items.slice(start, start + 10),
+            ...(start + 10 < items.length
+              ? {
+                  nextCursor: {
+                    articleKey: items[start + 9].articleKey,
+                    createdAt: items[start + 9].createdAt,
+                    membershipRevision: 0,
+                    pageNumber: Math.floor(start / 10) + 2,
+                  },
+                }
+              : {}),
+          },
+        };
+      },
+    });
+  });
+  const bottom = page.getByRole('navigation', {
+    name: '文章分页',
+    exact: true,
+  });
+  await bottom.getByRole('button', { name: '下一页' }).click();
+  await bottom.getByRole('button', { name: '上一页' }).click();
 }
 
-test('cross page batch confirmation uses all selected current values and counts unchanged', async ({
+test('T5 cross-page selection cap is 100 and clearing restores controls', async ({
   page,
 }) => {
-  await declarationFixture(page);
-  await page
-    .getByRole('checkbox', { name: '选择 文章 1', exact: true })
-    .check();
-  await page.getByRole('button', { name: '下一页' }).click();
-  await page
-    .getByRole('checkbox', { name: '选择 文章 12', exact: true })
-    .check();
-  await page.getByRole('button', { name: '设为原创', exact: true }).click();
-  const dialog = page.getByRole('dialog');
-  await expect(
-    dialog.getByText('文章编号 article-1', { exact: true }),
-  ).toBeVisible();
-  await expect(
-    dialog.getByText('文章编号 article-12', { exact: true }),
-  ).toBeVisible();
-  await dialog.getByRole('button', { name: '确认修改' }).click();
-  await expect(
-    page.getByRole('status').filter({ hasText: '已更新' }),
-  ).toContainText('已更新 1 篇，1 篇原本已是该属性');
-  await expect(page.getByText('已选择 0 篇', { exact: true })).toBeVisible();
-});
-
-test('page selection cap is 100 and clearing selection restores all controls', async ({
-  page,
-}) => {
-  await declarationFixture(page);
+  await pagingFixture(page);
+  const top = page.getByRole('navigation', {
+    name: '文章顶部分页',
+    exact: true,
+  });
+  const bottom = page.getByRole('navigation', {
+    name: '文章分页',
+    exact: true,
+  });
   for (let i = 0; i < 10; i++) {
     await page.getByRole('checkbox', { name: '全选本页', exact: true }).check();
-    await page.getByRole('button', { name: '下一页' }).click();
+    await (i % 2 ? top : bottom)
+      .getByRole('button', { name: '下一页' })
+      .click();
   }
   await expect(page.getByText('已选择 100 篇', { exact: true })).toBeVisible();
   await expect(
     page.getByRole('checkbox', { name: '选择 文章 101', exact: true }),
   ).toBeDisabled();
+  await expect(top.getByRole('button', { name: '下一页' })).toBeDisabled();
+  await expect(bottom.getByRole('button', { name: '下一页' })).toBeDisabled();
   await expect(page.getByText('已达上限，每次最多选择 100 篇')).toBeVisible();
   await page.getByRole('button', { name: '清空选择' }).click();
   await expect(
@@ -755,231 +802,71 @@ test('page selection cap is 100 and clearing selection restores all controls', a
   ).toBeEnabled();
 });
 
-test('dialog reads current values, traps focus, closes with Escape and restores trigger at 800', async ({
+test('T5 both pagers block during reads and recover stale cursors through the same first page', async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 800, height: 600 });
-  await declarationFixture(page, 'fresh');
-  await page
-    .getByRole('checkbox', { name: '选择 文章 1', exact: true })
-    .check();
-  const trigger = page.getByRole('button', { name: '设为原创', exact: true });
-  await trigger.click();
-  await expect(page.getByRole('dialog')).toContainText(
-    '当前：转载 → 目标：原创',
-  );
-  await expect(
-    page.getByRole('button', { name: '导入文章', exact: true }),
-  ).toBeDisabled();
-  await page.screenshot({ path: resolve('.tmp/declaration-800.png') });
-  await page.keyboard.press('Escape');
-  await expect(page.getByRole('dialog')).not.toBeVisible();
-  await expect(trigger).toBeFocused();
-  expect(
-    await page.evaluate(() => Reflect.get(window, 'declarationState').writes),
-  ).toBe(0);
-});
-
-test('unconfirmed write only reconciles and never reports inferred success', async ({
-  page,
-}) => {
-  await declarationFixture(page, 'unknown');
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await page.getByLabel('文章声明', { exact: true }).selectOption('repost');
-  await page.getByRole('button', { name: '保存声明', exact: true }).click();
-  await expect(page.getByRole('alert')).toHaveText(
-    '保存结果暂时无法确认，请核对当前属性',
-  );
-  await expect(
-    page.getByRole('button', { name: '保存声明', exact: true }),
-  ).toBeDisabled();
-  await expect(
-    page.getByRole('button', { name: '导入文章', exact: true }),
-  ).toBeDisabled();
-  await page.getByRole('button', { name: '核对当前属性' }).click();
-  await expect(
-    page.getByRole('status').filter({ hasText: '已核对' }),
-  ).toBeVisible();
-  await expect(page.getByLabel('文章声明', { exact: true })).toHaveValue(
-    'repost',
-  );
-  expect(
-    await page.evaluate(() => Reflect.get(window, 'declarationState').writes),
-  ).toBe(1);
-  await expect(page.getByText(/已更新/)).toHaveCount(0);
-});
-
-test('conflict prevents success and preserves bulk selection', async ({
-  page,
-}) => {
-  await declarationFixture(page, 'conflict');
-  await page
-    .getByRole('checkbox', { name: '选择 文章 1', exact: true })
-    .check();
-  await page.getByRole('button', { name: '设为转载', exact: true }).click();
-  await page.getByRole('button', { name: '确认修改' }).click();
-  await expect(page.getByRole('alert')).toHaveText(
-    '文章属性已变化，请刷新后重新确认',
-  );
-  await expect(page.getByText('已选择 1 篇', { exact: true })).toBeVisible();
-});
-
-test('declaration save succeeds even when article preview is unreadable', async ({
-  page,
-}) => {
-  await declarationFixture(page, 'brokenpreview');
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await expect(page.getByRole('alert')).toContainText('文章素材无法读取');
-  await page.getByLabel('文章声明', { exact: true }).selectOption('repost');
-  await page.getByRole('button', { name: '保存声明', exact: true }).click();
-  await expect(
-    page.getByRole('status').filter({ hasText: '已更新' }),
-  ).toBeVisible();
-  await expect(page.getByRole('alert')).toContainText('文章素材无法读取');
-});
-
-test('committed declaration result survives failed list refresh', async ({
-  page,
-}) => {
-  await declarationFixture(page, 'refreshfail');
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await page.getByLabel('文章声明', { exact: true }).selectOption('repost');
-  await page.getByRole('button', { name: '保存声明', exact: true }).click();
-  await expect(
-    page.getByRole('status').filter({ hasText: '已更新' }),
-  ).toBeVisible();
-  await expect(page.getByRole('alert')).toContainText('列表暂时无法刷新');
-});
-
-test('saving blocks repeated writes, selection, paging and import until resolution', async ({
-  page,
-}) => {
-  await declarationFixture(page, 'pending');
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await page.getByLabel('文章声明', { exact: true }).selectOption('repost');
-  await page
-    .getByRole('button', { name: '保存声明', exact: true })
-    .dblclick({ force: true });
-  await expect(
-    page.getByRole('status').filter({ hasText: '正在保存声明' }),
-  ).toBeVisible();
-  await expect(page.getByRole('button', { name: '下一页' })).toBeDisabled();
-  await expect(page.getByRole('checkbox', { name: '全选本页' })).toBeDisabled();
-  await expect(
-    page.getByRole('button', { name: '导入文章', exact: true }),
-  ).toBeDisabled();
-  await page.evaluate(() => Reflect.get(window, 'releaseSave')());
-  await expect(
-    page.getByRole('status').filter({ hasText: '已更新' }),
-  ).toBeVisible();
-  expect(
-    await page.evaluate(() => Reflect.get(window, 'declarationState').writes),
-  ).toBe(1);
-});
-
-test('read failure blocks confirmation and preserves selection', async ({
-  page,
-}) => {
-  await declarationFixture(page, 'readfail');
-  await page
-    .getByRole('checkbox', { name: '选择 文章 1', exact: true })
-    .check();
-  await page.getByRole('button', { name: '设为转载', exact: true }).click();
-  await expect(page.getByRole('button', { name: '确认修改' })).toBeDisabled();
-  await expect(page.getByRole('dialog')).toContainText('无法读取当前声明');
-  await page.keyboard.press('Escape');
-  await expect(page.getByText('已选择 1 篇', { exact: true })).toBeVisible();
-  expect(
-    await page.evaluate(() => Reflect.get(window, 'declarationState').writes),
-  ).toBe(0);
-});
-
-test('unknown uncommitted response resets draft after reading unchanged persisted value', async ({
-  page,
-}) => {
-  await declarationFixture(page);
-  await page.evaluate(() =>
-    Object.assign(window.desktopApi, {
-      setArticleDeclarations: async () => {
-        throw new Error('transport');
-      },
-    }),
-  );
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await page.getByLabel('文章声明', { exact: true }).selectOption('repost');
-  await page.getByRole('button', { name: '保存声明', exact: true }).click();
-  await page.getByRole('button', { name: '核对当前属性' }).click();
-  await expect(page.getByLabel('文章声明', { exact: true })).toHaveValue(
-    'original',
-  );
-  await expect(
-    page.getByRole('button', { name: '保存声明', exact: true }),
-  ).toBeDisabled();
-});
-
-test('switching preview discards unsaved edits and reload clears temporary selection', async ({
-  page,
-}) => {
-  await declarationFixture(page);
-  await page
-    .getByRole('checkbox', { name: '选择 文章 1', exact: true })
-    .check();
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await page.getByLabel('文章声明', { exact: true }).selectOption('repost');
-  await page.getByRole('button', { name: /^文章 2 文章编号/ }).click();
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await expect(page.getByLabel('文章声明', { exact: true })).toHaveValue(
-    'original',
-  );
-  await page.reload();
-  await expect(page.getByText('已选择 0 篇', { exact: true })).toBeVisible();
-  await expect(page.getByLabel('文章声明', { exact: true })).toHaveCount(0);
-});
-
-test('late preview cannot replace saved declaration and single save preserves batch selection', async ({
-  page,
-}) => {
-  await declarationFixture(page);
+  await mount(page, 'paging');
+  const top = page.getByRole('navigation', {
+    name: '文章顶部分页',
+    exact: true,
+  });
+  const bottom = page.getByRole('navigation', {
+    name: '文章分页',
+    exact: true,
+  });
   await page.evaluate(() => {
-    const original = window.desktopApi.getArticlePreview;
-    let calls = 0;
+    const original = window.desktopApi.listArticles;
     Object.assign(window.desktopApi, {
-      getArticlePreview: async (key: string) => {
-        const result = await original(key);
-        if (++calls === 1)
+      listArticles: async (cursor: unknown) => {
+        if (cursor) {
           await new Promise<void>((resolve) =>
-            Object.assign(window, { releasePreview: resolve }),
+            Object.assign(window, { releasePage: resolve }),
           );
-        return result;
+          return { status: 'stale_cursor' };
+        }
+        return original();
       },
     });
   });
-  await page
-    .getByRole('checkbox', { name: '选择 文章 1', exact: true })
-    .check();
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await expect
-    .poll(() => page.evaluate(() => Object.hasOwn(window, 'releasePreview')))
-    .toBe(true);
-  await page.getByLabel('文章声明', { exact: true }).selectOption('repost');
-  await page.getByRole('button', { name: '保存声明', exact: true }).click();
-  await expect(
-    page.getByRole('status').filter({ hasText: '已更新' }),
-  ).toBeVisible();
-  await page.evaluate(() => Reflect.get(window, 'releasePreview')());
-  await expect(
-    page.getByRole('heading', { name: '文章 1', exact: true }),
-  ).toBeVisible();
-  await expect(page.getByLabel('文章声明', { exact: true })).toHaveValue(
-    'repost',
-  );
-  await expect(page.locator('.preview-meta')).toContainText('转载');
-  await expect(page.getByText('已选择 1 篇', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '设为原创', exact: true }).click();
-  await expect(page.getByRole('dialog')).toContainText('当前：转载');
+  await top.getByRole('button', { name: '下一页' }).click();
+  for (const pager of [top, bottom]) {
+    await expect(pager.getByRole('button', { name: '下一页' })).toBeDisabled();
+    await expect(pager.getByRole('button', { name: '上一页' })).toBeDisabled();
+    await expect(pager).toContainText('正在读取页码');
+  }
+  await page.evaluate(() => Reflect.get(window, 'releasePage')());
+  for (const pager of [top, bottom]) {
+    await expect(pager).toContainText('第 1 页');
+    await expect(pager.getByRole('button', { name: '上一页' })).toBeDisabled();
+  }
 });
 
-test('active import and unknown import status disable declaration edits', async ({
+test('T5 failed page read keeps recovery and errors visible with both pagers disabled', async ({
+  page,
+}) => {
+  await mount(page, 'paging');
+  await page.evaluate(() =>
+    Object.assign(window.desktopApi, {
+      listArticles: async () => ({ status: 'unavailable' }),
+    }),
+  );
+  await page
+    .getByRole('navigation', { name: '文章顶部分页', exact: true })
+    .getByRole('button', { name: '下一页' })
+    .click();
+  await expect(page.getByRole('alert')).toContainText('列表暂时无法刷新');
+  await expect(
+    page.getByRole('button', { name: '重新加载', exact: true }),
+  ).toBeVisible();
+  for (const name of ['文章顶部分页', '文章分页']) {
+    const pager = page.getByRole('navigation', { name, exact: true });
+    await expect(pager).toContainText('页码暂时无法读取');
+    await expect(pager.getByRole('button', { name: '上一页' })).toBeDisabled();
+    await expect(pager.getByRole('button', { name: '下一页' })).toBeDisabled();
+  }
+});
+
+test('T5 unknown import keeps operational state visible and selection blocked', async ({
   page,
 }) => {
   await mount(page, 'recover');
@@ -987,66 +874,129 @@ test('active import and unknown import status disable declaration edits', async 
   await expect(
     page.getByRole('checkbox', { name: '选择 一篇汽车文章', exact: true }),
   ).toBeDisabled();
-  await page.getByRole('button', { name: /^一篇汽车文章 文章编号/ }).click();
-  await expect(page.getByLabel('文章声明', { exact: true })).toBeDisabled();
-  await expect(
-    page.getByRole('button', { name: '设为转载', exact: true }),
-  ).toBeDisabled();
+  await expect(page.getByLabel('文章声明', { exact: true })).toHaveCount(0);
 });
 
-test('dialog return focus survives delayed list and preview refresh with an open preview', async ({
-  page,
-}) => {
-  await declarationFixture(page);
-  await page
-    .getByRole('checkbox', { name: '选择 文章 1', exact: true })
-    .check();
-  await page.getByRole('button', { name: /^文章 1 文章编号/ }).click();
-  await expect(
-    page.getByRole('heading', { name: '文章 1', exact: true }),
-  ).toBeVisible();
-  const trigger = page.getByRole('button', { name: '设为原创', exact: true });
-  await trigger.click();
-  await expect(page.getByRole('button', { name: '确认修改' })).toBeEnabled();
-  await page.getByRole('button', { name: '确认修改' }).focus();
-  await page.keyboard.press('Tab');
-  await expect(
-    page.getByRole('button', { name: '关闭', exact: true }),
-  ).toBeFocused();
-  await page.keyboard.press('Shift+Tab');
-  await expect(page.getByRole('button', { name: '确认修改' })).toBeFocused();
-  await page.evaluate(() => {
-    const list = window.desktopApi.listArticles;
-    const preview = window.desktopApi.getArticlePreview;
-    Object.assign(window.desktopApi, {
-      listArticles: async () => {
-        await new Promise<void>((resolve) =>
-          Object.assign(window, { releaseList: resolve }),
-        );
-        return list();
-      },
-      getArticlePreview: async (key: string) => {
-        await new Promise<void>((resolve) =>
-          Object.assign(window, { releaseFocusPreview: resolve }),
-        );
-        return preview(key);
-      },
-    });
-  });
-  await page.keyboard.press('Escape');
-  await expect
-    .poll(() => page.evaluate(() => Object.hasOwn(window, 'releaseList')))
-    .toBe(true);
-  await page.evaluate(() => Reflect.get(window, 'releaseList')());
-  await expect(trigger).toBeFocused();
-  await expect
-    .poll(() =>
-      page.evaluate(() => Object.hasOwn(window, 'releaseFocusPreview')),
-    )
-    .toBe(true);
-  await page.evaluate(() => Reflect.get(window, 'releaseFocusPreview')());
-  await expect(
-    page.getByRole('heading', { name: '文章 1', exact: true }),
-  ).toBeVisible();
-  await expect(trigger).toBeFocused();
-});
+for (const { start, count, explicit } of [
+  { start: 2147483648, count: 2, explicit: true },
+  { start: Number.MAX_SAFE_INTEGER, count: 1, explicit: true },
+  { start: 2147483647, count: 2, explicit: true },
+  { start: 3, count: 2, explicit: false },
+])
+  test(
+    'ordered preview actual numbering ' + start + ' count ' + count,
+    async ({ page }) => {
+      await page.setViewportSize({ width: 800, height: 600 });
+      await mount(page);
+      await page.evaluate(
+        ({ start, count }) => {
+          const original = window.desktopApi.getArticlePreview;
+          Object.assign(window.desktopApi, {
+            getArticlePreview: async (key: string) => {
+              const result = await original(key);
+              if (result.status !== 'ok') return result;
+              const items = Array.from({ length: count }, (_, i) => ({
+                type: 'paragraph' as const,
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: '正文' + (i + 1) + 'LongWord'.repeat(30),
+                    marks: ['bold' as const],
+                  },
+                ],
+              }));
+              const editorBody = {
+                version: 2 as const,
+                blocks: [
+                  {
+                    type: 'list' as const,
+                    kind: 'ordered' as const,
+                    start,
+                    items,
+                  },
+                ],
+              };
+              Reflect.set(
+                window,
+                'numberedPreviewBody',
+                structuredClone(editorBody),
+              );
+              return {
+                ...result,
+                article: {
+                  ...result.article,
+                  imageCount: 0,
+                  assets: [],
+                  body: items.map((p) => ({
+                    type: 'paragraph' as const,
+                    text: p.content[0].text,
+                  })),
+                  editorBody,
+                },
+              };
+            },
+          });
+        },
+        { start, count },
+      );
+      await page
+        .getByRole('button', { name: /^一篇汽车文章 文章编号/ })
+        .click();
+      const list = page.locator('article ol');
+      await expect(list).toBeVisible();
+      const expected = Array.from(
+        { length: count },
+        (_, i) => String(start + i) + '.',
+      );
+      const cdp = await page.context().newCDPSession(page);
+      const ax = await cdp.send('Accessibility.getFullAXTree');
+      const nativeMarkers = ax.nodes
+        .filter((n) => n.role?.value === 'ListMarker')
+        .map((n) => String(n.name?.value).trim());
+      if (explicit) {
+        await expect(list.locator(':scope > li > span')).toHaveText(expected);
+        for (const label of expected)
+          await expect(list.getByText(label, { exact: true })).toBeVisible();
+        const accessible = await list.ariaSnapshot();
+        for (const label of expected) expect(accessible).toContain(label);
+        expect(accessible).toContain('listitem');
+        expect(nativeMarkers).toEqual([]);
+      } else {
+        expect(
+          await list.evaluate((el) => (el as HTMLOListElement).start),
+        ).toBe(start);
+        expect(nativeMarkers).toEqual(expected);
+        await expect(list.locator(':scope > li > span')).toHaveCount(0);
+      }
+      const bounds = await list.evaluate((el) => ({
+        client: el.clientWidth,
+        scroll: el.scrollWidth,
+        document: document.documentElement.clientWidth,
+        documentScroll: document.documentElement.scrollWidth,
+      }));
+      expect(bounds.scroll).toBeLessThanOrEqual(bounds.client);
+      expect(bounds.documentScroll).toBeLessThanOrEqual(bounds.document);
+      expect(
+        await page.evaluate(
+          () =>
+            Reflect.get(window, 'numberedPreviewBody').blocks[0].items[0]
+              .content[0].text,
+        ),
+      ).toMatch(/^正文1LongWord/);
+      await page.screenshot({
+        path: resolve('.tmp/preview-numbering-' + start + '-' + count + '.png'),
+      });
+      console.log(
+        JSON.stringify({
+          start,
+          count,
+          explicit,
+          visibleMarkers: explicit
+            ? await list.locator(':scope > li > span').allTextContents()
+            : nativeMarkers,
+          bounds,
+        }),
+      );
+      await cdp.detach();
+    },
+  );

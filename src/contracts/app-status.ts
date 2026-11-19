@@ -1,3 +1,5 @@
+import type { UploadWaitSettingsApi } from './upload-wait-settings';
+import type { BrowserHealthApi } from './browser-health';
 import type { BatchApi } from './draft-batch';
 import type { ArticleCoverApi } from './article-cover';
 import type { OperationControlApi } from './operation-control';
@@ -24,6 +26,8 @@ export const AppStatusSchema = z.discriminatedUnion('state', [
 export type AppStatus = z.infer<typeof AppStatusSchema>;
 export interface DesktopApi
   extends
+    BrowserHealthApi,
+    UploadWaitSettingsApi,
     OperationControlApi,
     ArticleLibraryApi,
     ArticleDeletionApi,

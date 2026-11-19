@@ -2,20 +2,48 @@ import { Worker } from 'node:worker_threads';
 import {
   WebPasteInputSchema,
   webPasteLimits,
-  type ConvertedPaste,
+  type PasteErrorCode,
   type WebPasteInput,
 } from '../../contracts/web-paste';
-import { WebPasteWorkerReplySchema } from '../../contracts/web-paste-worker';
+import {
+  RichWebPasteWorkerReplySchema,
+  WebPasteWorkerReplySchema,
+} from '../../contracts/web-paste-worker';
+import type { RichWebPasteConverter } from '../../domain/ports/rich-web-paste';
 import type { WebPasteConverter } from '../../domain/ports/web-paste';
 import { WebPasteFailure } from '../../domain/web-paste-error';
 
 /** Path is injected by main from fixed app resources, never accepted over IPC. */
 export function createWebPasteConverter(workerPath: string): WebPasteConverter {
+  return createConverter(
+    workerPath,
+    WebPasteWorkerReplySchema,
+    (input) => input,
+  );
+}
+export function createRichWebPasteConverter(
+  workerPath: string,
+): RichWebPasteConverter {
+  return createConverter(
+    workerPath,
+    RichWebPasteWorkerReplySchema,
+    (input) => ({ version: 2, input }),
+  );
+}
+function createConverter<T>(
+  workerPath: string,
+  replySchema: {
+    safeParse(message: unknown):
+      | {
+          success: true;
+          data: { ok: true; result: T } | { ok: false; code: PasteErrorCode };
+        }
+      | { success: false };
+  },
+  request: (input: WebPasteInput) => unknown,
+) {
   return {
-    async convert(
-      input: WebPasteInput,
-      signal: AbortSignal,
-    ): Promise<ConvertedPaste> {
+    async convert(input: WebPasteInput, signal: AbortSignal): Promise<T> {
       if (signal.aborted) throw new WebPasteFailure('CANCELLED');
       const validated = WebPasteInputSchema.safeParse(input);
       if (!validated.success) throw new WebPasteFailure('INPUT_LIMIT');
@@ -29,10 +57,7 @@ export function createWebPasteConverter(workerPath: string): WebPasteConverter {
         const onAbort = () => {
           void finish(undefined, new WebPasteFailure('CANCELLED'));
         };
-        const finish = async (
-          result?: ConvertedPaste,
-          failure?: WebPasteFailure,
-        ) => {
+        const finish = async (result?: T, failure?: WebPasteFailure) => {
           if (settling) return;
           settling = true;
           clearTimeout(timer);
@@ -50,7 +75,7 @@ export function createWebPasteConverter(workerPath: string): WebPasteConverter {
         try {
           worker = new Worker(workerPath);
           worker.on('message', (message: unknown) => {
-            const reply = WebPasteWorkerReplySchema.safeParse(message);
+            const reply = replySchema.safeParse(message);
             if (!reply.success)
               void finish(undefined, new WebPasteFailure('INVALID_FRAGMENT'));
             else if (!reply.data.ok)
@@ -65,7 +90,7 @@ export function createWebPasteConverter(workerPath: string): WebPasteConverter {
           });
           signal.addEventListener('abort', onAbort, { once: true });
           if (signal.aborted) onAbort();
-          else worker.postMessage(validated.data);
+          else worker.postMessage(request(validated.data));
         } catch {
           void finish(undefined, new WebPasteFailure('INVALID_FRAGMENT'));
         }

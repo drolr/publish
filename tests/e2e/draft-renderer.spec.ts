@@ -1,3 +1,10 @@
+import type { BrowserHealthView } from '../../src/contracts/browser-health';
+import {
+  ManualStateSchema,
+  type ManualState,
+  type ManualDraft,
+} from '../../src/contracts/manual-article';
+import type { DocumentCommand } from '../../src/contracts/manual-edit';
 import { installCoverBridge } from './cover-renderer-fixture';
 import { test, expect, type Page } from '@playwright/test';
 import webpack from 'webpack';
@@ -68,7 +75,12 @@ const initial: DraftView = DraftViewSchema.parse({
     canOpenDraft: false,
   },
 });
-async function mount(page: Page, view = initial, secondArticle = false) {
+async function mount(
+  page: Page,
+  view = initial,
+  secondArticle = false,
+  browserHealth?: BrowserHealthView,
+) {
   await page.context().route('**/*', async (route) => {
     const url = new URL(route.request().url());
     if (url.origin !== 'http://draft.test') return route.abort();
@@ -124,7 +136,7 @@ async function mount(page: Page, view = initial, secondArticle = false) {
           onManualCloseRequest: () => () => undefined,
           getAppStatus: async () => ({
             state: 'ready',
-            schemaVersion: 14,
+            schemaVersion: 15,
             appVersion: '1',
           }),
           getManualArticleState: async () => ({ state: 'idle', revision: 0 }),
@@ -158,6 +170,23 @@ async function mount(page: Page, view = initial, secondArticle = false) {
             status: 'ok',
             article: {
               ...summary,
+              editorBody: {
+                version: 2,
+                blocks: [
+                  {
+                    type: 'paragraph',
+                    content: [{ type: 'text', text: '第一段正文', marks: [] }],
+                  },
+                  { type: 'image', imageId: 'one' },
+                  {
+                    type: 'paragraph',
+                    content: [
+                      { type: 'text', text: '图片后的正文', marks: [] },
+                    ],
+                  },
+                  { type: 'image', imageId: 'one' },
+                ],
+              },
               body: [
                 { type: 'paragraph', text: '第一段正文' },
                 { type: 'image', image_id: 'one' },
@@ -296,11 +325,11 @@ async function mount(page: Page, view = initial, secondArticle = false) {
     },
     { view: DraftViewSchema.parse(view), key, secondArticle },
   );
-  await installCoverBridge(page);
+  await installCoverBridge(page, { browserHealth });
   await page.goto('http://draft.test');
 }
 const panel = (page: Page) => page.getByRole('region', { name: '巨懂车草稿' });
-test('ambiguous remote effect blocks start and offers only read-only reconciliation', async ({
+test('ambiguous remote effect blocks start and retains read-only reconciliation', async ({
   page,
 }) => {
   await mount(page);
@@ -438,9 +467,7 @@ test('single preview uses operator store reminder and full summary; double start
     panel(page).getByRole('button', { name: '确认此门店，检查文章' }),
   ).toHaveCount(0);
   await expect(panel(page)).toContainText('正文图片出现 2 次');
-  await expect(panel(page)).toContainText(
-    '原创/转载仅记录在本地，巨懂车草稿无需填写此项',
-  );
+  await expect(panel(page)).not.toContainText(/原创|转载|本地声明/);
   await expect(panel(page).getByText('第一段正文')).toBeVisible();
   await expect(panel(page).getByRole('img')).toBeVisible();
   const start = panel(page).getByRole('button', {
@@ -566,6 +593,195 @@ test('command timeout keeps read-only polling without resubmitting', async ({
     await page.evaluate(() => Reflect.get(window, 'testDraft').commands),
   ).toEqual(['prepareDraft', 'startDraft']);
 });
+
+for (const outcome of [
+  'ready',
+  'LOGIN_REQUIRED',
+  'VERIFICATION_REQUIRED',
+  'PAGE_CHANGED',
+  'rejected',
+  'unmounted',
+] as const) {
+  test(`first open late ${outcome} refreshes after an overlapping stale state read without a second click`, async ({
+    page,
+  }) => {
+    await page.clock.install();
+    await mount(page, {
+      ...ready,
+      session: {
+        status: 'closed',
+        bindingToken: null,
+        storeName: null,
+        reason: null,
+      },
+    });
+    const browser = page.getByRole('region', {
+      name: '专用浏览器',
+      exact: true,
+    });
+    await expect(
+      browser.getByRole('button', { name: '打开专用浏览器' }),
+    ).toBeEnabled();
+    await page.evaluate((outcome) => {
+      const state = Reflect.get(window, 'testDraft');
+      let staleRead = true;
+      Reflect.set(window, 'openRefreshReads', 0);
+      window.desktopApi.getDraftState = async () => {
+        Reflect.set(
+          window,
+          'openRefreshReads',
+          Reflect.get(window, 'openRefreshReads') + 1,
+        );
+        if (staleRead) {
+          staleRead = false;
+          const old = state.get();
+          return new Promise((resolve) =>
+            Reflect.set(window, 'releaseClosedRead', () => resolve(old)),
+          );
+        }
+        return state.get();
+      };
+      window.desktopApi.openDraftSession = async () => {
+        state.commands.push('openDraftSession');
+        return new Promise((resolve, reject) =>
+          Reflect.set(window, 'releaseFirstOpen', () => {
+            const next = state.get();
+            next.session =
+              outcome === 'ready' || outcome === 'unmounted'
+                ? {
+                    status: 'ready',
+                    bindingToken: '11111111-1111-4111-8111-111111111111',
+                    storeName: '首次连接门店',
+                    reason: null,
+                  }
+                : {
+                    status: 'blocked',
+                    bindingToken: null,
+                    storeName: null,
+                    reason:
+                      outcome === 'rejected' ? 'BROWSER_UNAVAILABLE' : outcome,
+                  };
+            state.set(next);
+            if (outcome === 'rejected') reject(new Error('open reply lost'));
+            else
+              resolve(
+                outcome === 'ready' || outcome === 'unmounted'
+                  ? { status: 'ok', view: next }
+                  : { status: 'blocked', reason: outcome, view: next },
+              );
+          }),
+        );
+      };
+    }, outcome);
+    await browser.getByRole('button', { name: '打开专用浏览器' }).click();
+    await page.clock.fastForward(11000);
+    await page.clock.fastForward(1000);
+    await expect
+      .poll(() =>
+        page.evaluate(() => Object.hasOwn(window, 'releaseClosedRead')),
+      )
+      .toBe(true);
+    await page.evaluate(() => Reflect.get(window, 'releaseFirstOpen')());
+    if (outcome === 'unmounted')
+      await page.evaluate(() =>
+        Reflect.get(window, 'draftRendererHarness').unmount(),
+      );
+    await page.evaluate(() => Reflect.get(window, 'releaseClosedRead')());
+    if (outcome === 'unmounted') {
+      await page.clock.fastForward(2000);
+      expect(
+        await page.evaluate(() => Reflect.get(window, 'openRefreshReads')),
+      ).toBe(1);
+    } else if (outcome === 'ready')
+      await expect(browser).toContainText('首次连接门店');
+    else {
+      await expect(
+        browser.getByRole('button', { name: '检查登录状态' }),
+      ).toBeEnabled();
+      await expect(
+        browser.getByRole('button', { name: '关闭专用浏览器' }),
+      ).toBeVisible();
+      await expect(browser).not.toContainText('首次连接门店');
+    }
+    expect(
+      await page.evaluate(() => Reflect.get(window, 'testDraft').commands),
+    ).toEqual(['openDraftSession']);
+  });
+}
+test('stop and reset retire an outstanding open reply and its overlapping read', async ({
+  page,
+}) => {
+  await page.clock.install();
+  await mount(page, {
+    ...ready,
+    session: {
+      status: 'closed',
+      bindingToken: null,
+      storeName: null,
+      reason: null,
+    },
+  });
+  const browser = page.getByRole('region', { name: '专用浏览器', exact: true });
+  await expect(
+    browser.getByRole('button', { name: '打开专用浏览器' }),
+  ).toBeEnabled();
+  await page.evaluate(() => {
+    const state = Reflect.get(window, 'testDraft');
+    let holdRead = true;
+    const obsolete = state.get();
+    obsolete.session = {
+      status: 'ready',
+      bindingToken: '11111111-1111-4111-8111-111111111111',
+      storeName: '过期连接门店',
+      reason: null,
+    };
+    window.desktopApi.getDraftState = async () => {
+      if (holdRead) {
+        holdRead = false;
+        return new Promise((resolve) =>
+          Reflect.set(window, 'releaseRetiredRead', () => resolve(obsolete)),
+        );
+      }
+      return state.get();
+    };
+    window.desktopApi.openDraftSession = async () =>
+      new Promise((resolve) =>
+        Reflect.set(window, 'releaseRetiredOpen', () =>
+          resolve({ status: 'ok', view: obsolete }),
+        ),
+      );
+    window.desktopApi.requestStopAll = async () => ({
+      revision: 1,
+      phase: 'stopped',
+      owners: [],
+    });
+  });
+  await browser.getByRole('button', { name: '打开专用浏览器' }).click();
+  await page.clock.fastForward(11000);
+  await page.clock.fastForward(1000);
+  await expect
+    .poll(() =>
+      page.evaluate(() => Object.hasOwn(window, 'releaseRetiredRead')),
+    )
+    .toBe(true);
+  await page
+    .getByRole('region', { name: '全局操作状态' })
+    .getByRole('button', { name: '停止并初始化', exact: true })
+    .click();
+  await expect(
+    browser.getByRole('button', { name: '打开专用浏览器' }),
+  ).toBeEnabled();
+  await page.evaluate(() => {
+    Reflect.get(window, 'releaseRetiredOpen')();
+    Reflect.get(window, 'releaseRetiredRead')();
+  });
+  await page.clock.fastForward(2000);
+  await expect(browser).not.toContainText('过期连接门店');
+  await expect(
+    browser.getByRole('button', { name: '检查登录状态' }),
+  ).toBeDisabled();
+});
+
 test('timed-out start keeps known task visible and permits safe stop without a second start', async ({
   page,
 }) => {
@@ -716,54 +932,194 @@ test('closed login and unverified store stay blocked; no fallback binding is inv
 test('task remains visible during manual editor mount and after discard; selection is independent', async ({
   page,
 }) => {
-  await mount(page);
-  await page.evaluate(() => {
-    const id = '11111111-1111-4111-8111-111111111111';
-    Object.assign(window.desktopApi, {
-      beginManualArticle: async () => ({
-        status: 'ok',
-        snapshot: {
-          state: 'editing',
-          revision: 1,
-          sessionId: id,
-          nextPasteCommandId: id,
-          nextEditCommandId: id,
-          nextClientSequence: 1,
-          nextSaveOperationId: id,
-          target: { kind: 'new' },
-          documentRevision: 0,
-          acknowledgedEdit: null,
-          candidates: [],
-          externalId: 'manual-' + id,
-          dirty: false,
-          draft: {
-            title: '',
-            contentDeclaration: 'repost',
-            blocks: [{ blockKey: id, type: 'paragraph', text: '' }],
-          },
-          images: [],
-        },
-      }),
-      closeManualEditor: async () => ({
-        status: 'ok',
-        snapshot: { state: 'idle', revision: 2 },
-      }),
-    });
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await mount(page, initial, true);
+  const selected = page.getByRole('checkbox', {
+    name: '选择 测试文章',
+    exact: true,
   });
+  await selected.check();
+  const fixture = ManualStateSchema.parse({
+    state: 'editing',
+    revision: 1,
+    sessionId: key,
+    nextPasteCommandId: key,
+    nextEditCommandId: key,
+    nextClientSequence: 1,
+    nextSaveOperationId: key,
+    target: { kind: 'new' },
+    documentRevision: 0,
+    acknowledgedEdit: null,
+    candidates: [],
+    externalId: 'manual-' + key,
+    dirty: false,
+    draft: {
+      bodyVersion: 2,
+      title: '',
+      contentDeclaration: 'repost',
+      blocks: [{ blockKey: key, type: 'paragraph', content: [] }],
+    },
+    images: [],
+  });
+  await page.evaluate((fixture) => {
+    let state: ManualState = { state: 'idle', revision: 0 };
+    const calls: string[] = [];
+    const reply = () => ({ status: 'ok', snapshot: structuredClone(state) });
+    Object.assign(window, { manualMountProbe: { calls } });
+    Object.assign(window.desktopApi, {
+      getManualArticleState: async () => structuredClone(state),
+      beginManualArticle: async () => {
+        calls.push('begin');
+        state = structuredClone(fixture);
+        return reply();
+      },
+      applyManualEdit: async (command: DocumentCommand, draft: ManualDraft) => {
+        if (
+          state.state !== 'editing' ||
+          command.sessionId !== state.sessionId ||
+          command.expectedDocumentRevision !== state.documentRevision ||
+          command.clientSequence !== state.nextClientSequence ||
+          command.commandId !== state.nextEditCommandId
+        )
+          throw Error('Unexpected edit ticket');
+        calls.push('edit');
+        state = {
+          ...state,
+          draft: structuredClone(draft),
+          dirty: true,
+          revision: state.revision + 1,
+          documentRevision: state.documentRevision + 1,
+          nextClientSequence: state.nextClientSequence + 1,
+          nextEditCommandId:
+            '00000000-0000-4000-8000-' +
+            String(state.nextClientSequence + 1).padStart(12, '0'),
+          acknowledgedEdit: {
+            commandId: command.commandId,
+            clientSequence: command.clientSequence,
+          },
+        };
+        return reply();
+      },
+      closeManualEditor: async (command: DocumentCommand, choice: string) => {
+        if (
+          choice !== 'discard' ||
+          state.state !== 'editing' ||
+          command.sessionId !== state.sessionId ||
+          command.expectedDocumentRevision !== state.documentRevision ||
+          command.clientSequence !== state.nextClientSequence ||
+          command.commandId !== state.nextEditCommandId
+        )
+          throw Error('Unexpected discard ticket');
+        calls.push('discard');
+        state = { state: 'idle', revision: state.revision + 1 };
+        return reply();
+      },
+    });
+  }, fixture);
   await page.getByRole('button', { name: '新建文章', exact: true }).click();
+  const title = page.getByRole('textbox', { name: '文章标题', exact: true });
+  await expect(title).toBeVisible();
+  const global = page.getByRole('region', {
+    name: '全局操作状态',
+    exact: true,
+  });
+  await expect(global).toContainText('平台已暂停');
   await expect(
-    page.getByRole('textbox', { name: '文章标题', exact: true }),
+    global.getByRole('button', { name: '返回工作区处理', exact: true }),
   ).toBeVisible();
+  await expect(panel(page)).toBeHidden();
+  // A hidden mounted panel still retains its submission lock; it is never clicked here.
+  await expect(
+    page
+      .getByRole('region', { name: '巨懂车草稿', includeHidden: true })
+      .getByRole('button', {
+        name: '存到巨懂车草稿',
+        exact: true,
+        includeHidden: true,
+      }),
+  ).toBeDisabled();
+  expect(await page.evaluate(() => window.desktopApi.getDraftState())).toEqual(
+    initial,
+  );
+  await title.fill('未保存的本机标题');
+  await page
+    .getByRole('textbox', { name: '文章正文', exact: true })
+    .fill('未保存的本机正文');
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        window.desktopApi
+          .getManualArticleState()
+          .then(
+            (s) =>
+              s.state === 'editing' &&
+              s.dirty &&
+              s.draft.title === '未保存的本机标题' &&
+              s.draft.blocks.length === 1 &&
+              s.draft.blocks[0].type === 'paragraph' &&
+              s.draft.blocks[0].content.map((run) => run.text).join('') ===
+                '未保存的本机正文',
+          ),
+      ),
+    )
+    .toBe(true);
+  const dirty = ManualStateSchema.parse(
+    await page.evaluate(() => window.desktopApi.getManualArticleState()),
+  );
+  expect(dirty).toMatchObject({
+    state: 'editing',
+    dirty: true,
+    draft: {
+      bodyVersion: 2,
+      title: '未保存的本机标题',
+      blocks: [{ content: [{ text: '未保存的本机正文' }] }],
+    },
+  });
+  await page.getByRole('button', { name: '返回文章池', exact: true }).click();
+  const dialog = page.getByRole('dialog', {
+    name: '离开当前编辑？',
+    exact: true,
+  });
+  await expect(dialog).toBeVisible();
+  await expect(global).toContainText('平台已暂停');
+  await dialog.getByRole('button', { name: '放弃修改', exact: true }).click();
   await expect(panel(page)).toContainText('任务尚未核实，请先核对后台草稿');
   await expect(
     panel(page).getByRole('button', { name: '存到巨懂车草稿', exact: true }),
   ).toBeDisabled();
-  await page.getByRole('button', { name: '放弃录入' }).click();
+  await expect(title).toBeHidden();
+  expect(
+    ManualStateSchema.parse(
+      await page.evaluate(() => window.desktopApi.getManualArticleState()),
+    ),
+  ).toMatchObject({ state: 'idle' });
+  await expect(selected).toBeChecked();
+  const other = page.getByRole('button', { name: /第二篇文章 文章编号/ });
+  await other.click();
+  await expect(other).toHaveAttribute('aria-pressed', 'true');
+  await expect(selected).toBeChecked();
+  await expect(panel(page)).toContainText('当前任务：测试文章');
   await expect(panel(page)).toContainText('任务尚未核实，请先核对后台草稿');
+  await expect(
+    panel(page).getByRole('button', { name: '存到巨懂车草稿', exact: true }),
+  ).toBeDisabled();
+  expect(await page.evaluate(() => window.desktopApi.getDraftState())).toEqual(
+    initial,
+  );
   expect(
     await page.evaluate(() => Reflect.get(window, 'testDraft').commands),
   ).toEqual([]);
+  const calls: string[] = await page.evaluate(
+    () => Reflect.get(window, 'manualMountProbe').calls,
+  );
+  expect(calls[0]).toBe('begin');
+  expect(calls.filter((c) => c === 'edit').length).toBeGreaterThan(0);
+  expect(calls.filter((c) => c === 'discard')).toHaveLength(1);
+  expect(calls.at(-1)).toBe('discard');
+  expect(errors).toEqual([]);
 });
+
 test('slow polls never overlap and lower revision command cannot replace current state', async ({
   page,
 }) => {
@@ -1071,7 +1427,7 @@ for (const review of ['none', 'empty-editor', 'unsaved-body'] as const) {
   });
 }
 
-test('manual ambiguous task exposes only existing read-only reconciliation', async ({
+test('manual ambiguous task retains existing read-only reconciliation', async ({
   page,
 }) => {
   await mount(page, {
@@ -1248,4 +1604,331 @@ test('late READY for A with a retired new-attempt intent stays non-actionable af
       name: '我已核对门店和图文内容，仅存草稿',
     }),
   ).not.toBeChecked();
+});
+
+const closedDraft = () => ({
+  ...initial,
+  session: {
+    status: 'closed' as const,
+    bindingToken: null,
+    storeName: null,
+    reason: null,
+  },
+  preparation: null,
+  task: null,
+});
+const healthView = (
+  status: BrowserHealthView['status'],
+  reason: BrowserHealthView['reason'] = null,
+  version: string | null = null,
+): BrowserHealthView => ({ status, reason, version, stage: null });
+test('browser health unchecked has no invented version and keyboard check stays separate from platform login', async ({
+  page,
+}) => {
+  await mount(page, closedDraft());
+  const card = page.getByRole('region', { name: '浏览器基础检查' });
+  await expect(card.getByText('尚未检查浏览器')).toBeVisible();
+  await expect(card.getByText(/Edge 版本/)).toHaveCount(0);
+  const check = card.getByRole('button', { name: '检查浏览器', exact: true });
+  await check.focus();
+  await page.keyboard.press('Enter');
+  await expect(
+    card.getByText('浏览器基础检查通过', { exact: true }),
+  ).toBeVisible();
+  await expect(card.getByText('Edge 版本：156.0.0.0')).toBeVisible();
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'testDraft').commands),
+  ).toEqual([]);
+  await expect(
+    page.getByRole('button', { name: '检查登录状态', exact: true }),
+  ).toBeDisabled();
+  await expect(card.getByText(/不代表已登录/)).toBeVisible();
+  await card.screenshot({
+    path: '.tmp/browser-health/task-2-health-passed.png',
+  });
+});
+test('checking is accessible and duplicate requests stay disabled through promise settlement', async ({
+  page,
+}) => {
+  await mount(page, closedDraft());
+  await page.evaluate(() => Reflect.get(window, 'healthFixture').hold());
+  const card = page.getByRole('region', { name: '浏览器基础检查' });
+  await card.getByRole('button', { name: '检查浏览器', exact: true }).click();
+  await expect(card).toHaveAttribute('aria-busy', 'true');
+  await expect(
+    card.getByRole('button', { name: '检查浏览器', exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole('button', { name: '打开专用浏览器', exact: true }),
+  ).toBeDisabled();
+  await page.evaluate(() => Reflect.get(window, 'healthFixture').release());
+  await expect(
+    card.getByText('浏览器基础检查通过', { exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'healthFixture').commands),
+  ).toEqual(['check']);
+});
+for (const [status, reason, text] of [
+  ['missing', null, '未找到 Microsoft Edge'],
+  ['unknown_version', null, '无法识别 Edge 版本'],
+  ['too_old', null, 'Edge 版本过旧'],
+  ['check_failed', 'capability_failed', '请联系维护者发布新版助手'],
+  ['busy', 'business_open', '请先手动关闭专用浏览器'],
+  ['busy', 'task_busy', '请先处理当前任务'],
+  ['busy', 'ownership_unconfirmed', '浏览器占用尚未确认'],
+  [
+    'unavailable',
+    'update_unavailable',
+    'Edge 菜单 → 帮助和反馈 → 关于 Microsoft Edge',
+  ],
+] as const)
+  test(`browser recovery ${status}/${reason} gives a concrete next step`, async ({
+    page,
+  }) => {
+    await mount(
+      page,
+      closedDraft(),
+      false,
+      healthView(
+        status,
+        reason,
+        status === 'check_failed' ? '160.1.2.3' : null,
+      ),
+    );
+    const card = page.getByRole('region', { name: '浏览器基础检查' });
+    await expect(card.getByText(text, { exact: false })).toBeVisible();
+    expect(
+      await page.evaluate(() => Reflect.get(window, 'testDraft').commands),
+    ).toEqual([]);
+  });
+test('maintenance remains disabled after opening until close is observed and narrow card wraps', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 480, height: 900 });
+  await mount(page, closedDraft());
+  const card = page.getByRole('region', { name: '浏览器基础检查' });
+  await card
+    .getByRole('button', { name: '打开 Edge 更新页', exact: true })
+    .click();
+  await expect(card.getByText(/已打开 Edge 更新页/)).toBeVisible();
+  await expect(
+    card.getByRole('button', { name: '检查浏览器', exact: true }),
+  ).toBeDisabled();
+  await expect(
+    card.getByRole('button', { name: '打开 Edge 更新页', exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole('button', { name: '打开专用浏览器', exact: true }),
+  ).toBeDisabled();
+  expect(await card.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(
+    true,
+  );
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await card.screenshot({
+    path: '.tmp/browser-health/task-2-health-narrow-update.png',
+  });
+  await page.evaluate(() =>
+    Reflect.get(window, 'healthFixture').set({
+      status: 'unchecked',
+      version: null,
+      stage: null,
+      reason: null,
+    }),
+  );
+  await expect(
+    card.getByRole('button', { name: '检查浏览器', exact: true }),
+  ).toBeEnabled();
+});
+
+test('unconfirmed ownership disables health commands but confirmed close cleanup failure permits an explicit retry', async ({
+  page,
+}) => {
+  await mount(
+    page,
+    closedDraft(),
+    false,
+    healthView('busy', 'ownership_unconfirmed'),
+  );
+  const card = page.getByRole('region', { name: '浏览器基础检查' });
+  await expect(card.getByText(/浏览器占用尚未确认/)).toBeVisible();
+  await expect(
+    card.getByRole('button', { name: '检查浏览器', exact: true }),
+  ).toBeDisabled();
+  await expect(
+    card.getByRole('button', { name: '打开 Edge 更新页', exact: true }),
+  ).toBeDisabled();
+  await page.evaluate(() =>
+    Reflect.get(window, 'healthFixture').set({
+      status: 'check_failed',
+      reason: 'cleanup_failed',
+      version: null,
+      stage: 'cleanup',
+    }),
+  );
+  await expect(
+    card.getByRole('button', { name: '检查浏览器', exact: true }),
+  ).toBeEnabled();
+  await expect(card.getByText(/已关闭.*清理/)).toBeVisible();
+});
+
+test('StrictMode keeps a single read-only health polling loop', async ({
+  page,
+}) => {
+  await mount(page, closedDraft());
+  const card = page.getByRole('region', { name: '浏览器基础检查' });
+  await expect(card.getByText('尚未检查浏览器')).toBeVisible();
+  await page.evaluate(() => {
+    const original = window.desktopApi.getBrowserHealth;
+    let reads = 0;
+    window.desktopApi.getBrowserHealth = async () => {
+      reads++;
+      return original();
+    };
+    Object.assign(window, { healthPollCount: () => reads });
+  });
+  await page.waitForTimeout(2300);
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'healthPollCount')()),
+  ).toBeLessThanOrEqual(2);
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'testDraft').commands),
+  ).toEqual([]);
+});
+
+test('a business browser blocks health commands while preserving platform login checks', async ({
+  page,
+}) => {
+  await mount(
+    page,
+    { ...initial, task: null },
+    false,
+    healthView('busy', 'business_open'),
+  );
+  const card = page.getByRole('region', { name: '浏览器基础检查' });
+  await expect(card.getByText(/请先手动关闭专用浏览器/)).toBeVisible();
+  await expect(
+    card.getByRole('button', { name: '检查浏览器', exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole('button', { name: '检查登录状态', exact: true }),
+  ).toBeEnabled();
+});
+
+test('stuck single article can finish by the normal typed command and preserves uncertainty', async ({
+  page,
+}) => {
+  await mount(page);
+  await page.evaluate(() => {
+    const state = Reflect.get(window, 'testDraft');
+    window.desktopApi.finishHandledTask = async (input) => {
+      Reflect.set(window, 'finishHandledInput', input);
+      await new Promise<void>((resolve) =>
+        Reflect.set(window, 'releaseHandled', resolve),
+      );
+      const view = state.get();
+      const next = {
+        ...view,
+        session: {
+          status: 'closed',
+          bindingToken: null,
+          storeName: null,
+          reason: null,
+        },
+        task: {
+          ...view.task,
+          revision: view.task.revision + 2,
+          state: 'stopped_by_user',
+          stage: 'settled',
+          stopRequested: true,
+          platformPaused: false,
+        },
+      };
+      state.set(next);
+      return { status: 'ok', view: next };
+    };
+  });
+  await panel(page)
+    .getByRole('button', { name: '人工处理完成，结束这篇' })
+    .click();
+  await expect(
+    panel(page).getByRole('button', { name: '人工处理完成，结束这篇' }),
+  ).toBeDisabled();
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'finishHandledInput')),
+  ).toEqual({ taskId: key, expectedRevision: 3 });
+  await page.evaluate(() => Reflect.get(window, 'releaseHandled')());
+  await expect(
+    panel(page).getByRole('button', { name: '人工处理完成，结束这篇' }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole('button', { name: '打开专用浏览器' }),
+  ).toBeEnabled();
+});
+
+test('ArticleWorkspace keeps bound recovery reachable while paused task and batch block normal entry', async ({
+  page,
+}) => {
+  await mount(page);
+  await page.evaluate((key) => {
+    const api = window.desktopApi.batch;
+    const view = {
+      id: key,
+      revision: 12,
+      state: 'paused' as const,
+      storeName: '测试门店',
+      stopRequested: false,
+      reason: 'RESULT_AMBIGUOUS' as const,
+      counts: {
+        total: 1,
+        saved: 0,
+        attempted: 0,
+        failed: 0,
+        skipped: 0,
+        pending: 0,
+        needsHuman: 1,
+        stopped: 0,
+      },
+      items: [
+        {
+          articleKey: key,
+          title: '测试文章',
+          contentDeclaration: 'original' as const,
+          coverSummary: null,
+          taskId: key,
+          state: 'needs_human' as const,
+          reason: 'RESULT_AMBIGUOUS' as const,
+          saveAttempted: true,
+        },
+      ],
+    };
+    api.getCurrent = async () => view;
+    api.skipCurrentAndContinue = async (input) => {
+      Reflect.set(window, 'parentRecoveryInput', input);
+      return { status: 'blocked', reason: 'LOGIN_REQUIRED', view };
+    };
+  }, key);
+  await expect(
+    page.getByText(
+      '批次正在执行、等待处理或状态待核对，请先处理后再开始单篇任务。',
+    ),
+  ).toBeVisible();
+  await expect(
+    panel(page).getByRole('button', { name: '人工处理完成，结束这篇' }),
+  ).toBeDisabled();
+  await page.getByRole('tab', { name: '批量存草稿' }).click();
+  await expect(
+    page.getByRole('button', { name: '检查批量草稿摘要' }),
+  ).toBeDisabled();
+  await page.getByRole('button', { name: '跳过这篇，继续上传' }).click();
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'parentRecoveryInput')),
+  ).toEqual({ batchId: key, expectedRevision: 12, taskId: key });
+  await expect(
+    page.getByText('请在专用浏览器中登录，再检查登录状态。'),
+  ).toBeVisible();
 });

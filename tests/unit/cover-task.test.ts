@@ -34,6 +34,10 @@ it('stale_cover_preparation rejects a cover changed while the body is captured',
     }),
   } as unknown as SnapshotPort;
   const service = createDraftPreparation({
+    contentCapabilities: () => ({
+      revision: 'judongche-rich-unknown-v1',
+      features: {},
+    }),
     repository: {
       loadEditableArticle: () => ({
         article: task.snapshot.article,

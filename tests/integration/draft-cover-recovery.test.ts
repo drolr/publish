@@ -1,5 +1,13 @@
+import {
+  canonicalDraftArticle,
+  createDraftSnapshotDigest,
+} from '../../src/infrastructure/draft-snapshot-integrity';
+import {
+  upgradeEditorBody,
+  richBodyEquals,
+} from '../../src/domain/rich-text-body';
 import { JudongcheCoverRequiredError } from '../../src/infrastructure/platforms/judongche/production-state';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { unlinkSync } from 'node:fs';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -83,14 +91,7 @@ async function setup(
         generation,
         contextKey: p.observed.contextKey!,
         storeKey: p.task.store.storeKey,
-        bodyDigest: createHash('sha256')
-          .update(
-            JSON.stringify({
-              title: p.observed.title,
-              blocks: p.observed.blocks,
-            }),
-          )
-          .digest('hex'),
+        editorUrl: p.observed.editorUrl!,
         modalClosed: true,
         uploadsSettled: true,
       },
@@ -120,14 +121,7 @@ async function setup(
           generation,
           contextKey: p.observed.contextKey!,
           storeKey: p.task.store.storeKey,
-          bodyDigest: createHash('sha256')
-            .update(
-              JSON.stringify({
-                title: p.observed.title,
-                blocks: p.observed.blocks,
-              }),
-            )
-            .digest('hex'),
+          editorUrl: p.observed.editorUrl!,
           modalClosed: true,
           uploadsSettled: true,
         },
@@ -174,11 +168,30 @@ async function setup(
       };
     return observed;
   };
+  // These legacy cover/restart fixtures exercise immutable V1 history, not the closed V2 writer.
+  snapshots.capture = async (editable) => {
+    if (
+      !richBodyEquals(
+        upgradeEditorBody(editable.editorBody, editable.article.body),
+        upgradeEditorBody(null, editable.article.body),
+      )
+    )
+      throw Error('Legacy fixture must be lossless plain');
+    const article = canonicalDraftArticle(editable.article);
+    const snapshot = {
+      version: 1 as const,
+      article,
+      digest: createDraftSnapshotDigest(article),
+    };
+    await snapshots.verify(snapshot);
+    return snapshot;
+  };
   const events: string[] = [];
   let interruptedAtConfirmed = false;
   let api: DraftController;
   const controller = () =>
     createDraftController({
+      invalidateBrowserHealth: () => {},
       tasks: {
         ...h.tasks,
         apply: (...args) => {
@@ -199,6 +212,10 @@ async function setup(
         },
       },
       preparation: createDraftPreparation({
+        contentCapabilities: () => ({
+          revision: 'judongche-rich-unknown-v1',
+          features: {},
+        }),
         repository: h.articles,
         covers: h.articles,
         snapshots,

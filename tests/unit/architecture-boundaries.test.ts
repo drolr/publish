@@ -85,6 +85,50 @@ const browserSyntax = [
   "const p = require('playwright-core')",
   "const p = import('playwright-core')",
 ];
+it('permits exact Electron original-fs only in desktop main', () => {
+  for (const source of [
+    "import { readFileSync } from 'original-fs'",
+    "const fs = require('original-fs')",
+    "const fs = import('original-fs')",
+  ])
+    expect(
+      checkBoundaries([
+        { path: 'src/desktop/main/runtime-identity.ts', source },
+      ]),
+    ).toEqual([]);
+});
+it.each([
+  'desktop/preload',
+  'desktop/renderer',
+  'desktop/main-lookalike',
+  'domain',
+  'application',
+  'renderer',
+  'infrastructure',
+  'contracts',
+])('rejects Electron original-fs outside main: %s', (layer) => {
+  expect(
+    checkBoundaries([
+      {
+        path: `src/${layer}/a.ts`,
+        source: "import { readFileSync } from 'original-fs'",
+      },
+    ]),
+  ).not.toEqual([]);
+});
+it.each(['original-fs/promises', 'original-fs-extra'])(
+  'rejects original-fs lookalikes even in main: %s',
+  (specifier) => {
+    expect(
+      checkBoundaries([
+        {
+          path: 'src/desktop/main/a.ts',
+          source: `import fs from '${specifier}'`,
+        },
+      ]),
+    ).not.toEqual([]);
+  },
+);
 it.each([
   'application',
   'contracts',

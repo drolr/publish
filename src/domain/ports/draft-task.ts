@@ -1,4 +1,5 @@
-import type { StoredArticle } from '../../contracts/stored-article';
+import type { EditableArticle } from '../../contracts/article-revision';
+import type { DraftContentCapabilities } from '../../contracts/draft-content';
 import type {
   ReserveInput,
   ReserveResult,
@@ -44,7 +45,7 @@ export interface DraftTaskRepository {
   close(): void;
 }
 export interface SnapshotPort {
-  capture(article: StoredArticle): Promise<DraftSnapshot>;
+  capture(editable: EditableArticle): Promise<DraftSnapshot>;
   captureCover(configuration: StoredCoverConfiguration): CoverTaskSnapshot;
   readCoverImage(
     snapshot: CoverTaskSnapshot,
@@ -64,10 +65,22 @@ export interface ExecutionHooks {
   readImage(assetKey: string): Promise<Uint8Array>;
 }
 export interface DraftPlatform {
+  contentCapabilities(): DraftContentCapabilities;
   openSession(): Promise<SessionProbe>;
   /** Internal startup recheck may request context only; execution checks safety. */
   checkSession(contextOnly?: boolean): Promise<SessionProbe>;
   closeSession(): Promise<void>;
+  /** Internal queued-task admission; captures existing session ownership only. */
+  bindTaskForContinuation?(task: DraftTask, generation: string): void;
+  /** Synchronously captures this explicit skip's history boundary before drain. */
+  captureHandledTaskContinuation?(
+    task: DraftTask,
+  ): (cancelled: () => boolean) => Promise<SessionProbe>;
+  /** Same live session only, after the application writer and evidence have drained. */
+  returnHomeAfterHandledTask?(
+    task: DraftTask,
+    cancelled: () => boolean,
+  ): Promise<SessionProbe>;
   execute(task: DraftTask, hooks: ExecutionHooks): Promise<AdapterOutcome>;
   reconcile(task: DraftTask): Promise<AdapterOutcome>;
   checkAbsence(task: DraftTask): Promise<DraftAbsenceResult>;

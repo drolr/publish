@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react';
+import type { RichInline, RichTextBlock } from '../../contracts/rich-text-body';
 import type {
   ArticlePreview,
   ImageResult,
@@ -25,7 +26,7 @@ export function Preview({
   focus: boolean;
 }) {
   const [expanded, setExpanded] = useState(() =>
-    article.body.findIndex((block) => block.type === 'image'),
+    article.editorBody.blocks.findIndex((block) => block.type === 'image'),
   );
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
@@ -38,21 +39,19 @@ export function Preview({
         {article.title}
       </h2>
       <p className="preview-meta">
-        {article.contentDeclaration === 'original' ? '原创' : '转载'} ·{' '}
         {article.imageCount} 张独立图片 · 正文共{' '}
-        {article.body.filter((block) => block.type === 'image').length}{' '}
+        {
+          article.editorBody.blocks.filter((block) => block.type === 'image')
+            .length
+        }{' '}
         个图片位置
       </p>
-      {article.body.map((block, index) => {
-        if (block.type === 'paragraph')
-          return (
-            <p className="body-text" key={index}>
-              {block.text}
-            </p>
-          );
+      {article.editorBody.blocks.map((block, index) => {
+        if (block.type !== 'image')
+          return <RichText key={index} block={block} />;
         const ordinal = ++number;
         const asset = article.assets.find(
-          (item) => item.imageId === block.image_id,
+          (item) => item.imageId === block.imageId,
         );
         return (
           <figure key={index}>
@@ -77,6 +76,88 @@ export function Preview({
       })}
     </article>
   );
+}
+function inline(content: RichInline[]): ReactNode {
+  if (!content.length) return <br />;
+  return content.map((run, index) => {
+    let node: ReactNode = run.text.split('\n').map((text, line) => (
+      <Fragment key={line}>
+        {line > 0 && <br />}
+        {text}
+      </Fragment>
+    ));
+    if (run.marks.includes('underline')) node = <u>{node}</u>;
+    if (run.marks.includes('italic')) node = <em>{node}</em>;
+    if (run.marks.includes('bold')) node = <strong>{node}</strong>;
+    return <Fragment key={index}>{node}</Fragment>;
+  });
+}
+function RichText({ block }: { block: RichTextBlock }) {
+  switch (block.type) {
+    case 'paragraph':
+      return <p className="body-text">{inline(block.content)}</p>;
+    case 'heading':
+      return <h2 className="body-text">{inline(block.content)}</h2>;
+    case 'blockquote':
+      return (
+        <blockquote>
+          {block.paragraphs.map((p, i) => (
+            <p className="body-text" key={i}>
+              {inline(p.content)}
+            </p>
+          ))}
+        </blockquote>
+      );
+    case 'list': {
+      // Native HTML list numbering is a signed 32-bit long. Preserve larger
+      // accepted ordinals as visible, accessible presentation text only.
+      if (
+        block.kind === 'ordered' &&
+        block.start + (block.items.length - 1) > 2147483647
+      ) {
+        return (
+          <ol
+            role="list"
+            style={{
+              listStyleType: 'none',
+              paddingInlineStart: 0,
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+            }}
+          >
+            {block.items.map((paragraph, index) => (
+              <li
+                key={index}
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(0, max-content) minmax(0, 1fr)',
+                  columnGap: '0.5em',
+                }}
+              >
+                <span>{String(block.start + index)}.</span>
+                <div style={{ minWidth: 0 }}>{inline(paragraph.content)}</div>
+              </li>
+            ))}
+          </ol>
+        );
+      }
+      const items = block.items.map((p, i) => (
+        <li key={i}>{inline(p.content)}</li>
+      ));
+      return block.kind === 'ordered' ? (
+        <ol
+          start={block.start}
+          style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}
+        >
+          {items}
+        </ol>
+      ) : (
+        <ul style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+          {items}
+        </ul>
+      );
+    }
+  }
 }
 function ArticleImage({
   articleKey,

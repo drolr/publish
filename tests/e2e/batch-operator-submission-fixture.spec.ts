@@ -1,3 +1,4 @@
+import { legacyFixtureSnapshotCapture } from '../fixtures/legacy-snapshot-capture';
 import { test, expect, type BrowserContext, type Page } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
@@ -10,6 +11,177 @@ import { createDraftController } from '../../src/application/draft-controller';
 import { createBatchController } from '../../src/application/batch-controller';
 import { createJudongcheAdapter } from '../../src/infrastructure/platforms/judongche/draft-adapter';
 import { createJudongchePages } from '../../src/infrastructure/platforms/judongche/page-contract';
+
+test('handled entry failure closes its old context and one reopen permits a new task then another batch', async ({
+  browser,
+  context,
+  page,
+}) => {
+  await denyExternalNetwork(context);
+  const originalFixture = await installProductionFixture(context);
+  await context.addInitScript(() => {
+    document.addEventListener('DOMContentLoaded', () => {
+      if (location.pathname.endsWith('/Article'))
+        setTimeout(() => {
+          document.querySelector('textarea')!.value =
+            'old restored title without notice';
+        }, 200);
+    });
+  });
+  await page.goto(originalFixture.home);
+  let business: BrowserContext | undefined = context;
+  let generation = randomUUID();
+  let opens = 0;
+  let reopenedFixture:
+    Awaited<ReturnType<typeof installProductionFixture>> | undefined;
+  const session = {
+    open: async () => {
+      opens++;
+      if (!business) {
+        business = await browser.newContext();
+        await denyExternalNetwork(business);
+        reopenedFixture = await installProductionFixture(business, {
+          batchHistory: true,
+        });
+        const primary = await business.newPage();
+        await primary.goto(reopenedFixture.home);
+        generation = randomUUID();
+      }
+      return business;
+    },
+    current: () => business,
+    generation: () => generation,
+    close: async () => {
+      await business?.close();
+      business = undefined;
+    },
+  };
+  const h = await createDraftHarness(0, {
+    title: 'Entry failure old task',
+    contentDeclaration: 'repost',
+  });
+  const adapter = createJudongcheAdapter(session, undefined, {
+    manualReview: true,
+    batchSubmissionReview: 'operator',
+    ownerConfirmedPilot: { dealerId: '123456', storeName: '合成门店' },
+  });
+  legacyFixtureSnapshotCapture(h.snapshots);
+  const preparation = createDraftPreparation({
+    contentCapabilities: () => adapter.contentCapabilities(),
+    repository: h.articles,
+    covers: h.articles,
+    tasks: h.tasks,
+    snapshots: h.snapshots,
+    newId: randomUUID,
+  });
+  const draft = createDraftController({
+    invalidateBrowserHealth: () => {},
+    tasks: h.tasks,
+    snapshots: h.snapshots,
+    preparation,
+    platform: adapter,
+    newId: randomUUID,
+    now: () => new Date().toISOString(),
+    gate: () => 'ready',
+    controlledPilot: { storeIdentity: '123456' },
+  });
+  const repository = openDraftBatchRepository(
+    h.path,
+    resolve('src/infrastructure/persistence/migrations'),
+  );
+  const batch = createBatchController({
+    repository,
+    draft,
+    preparation,
+    articles: h.articles,
+    snapshots: h.snapshots,
+    newId: randomUUID,
+    now: () => new Date().toISOString(),
+    gate: () => 'ready',
+  });
+  try {
+    const opened = await draft.openDraftSession();
+    const offered = await draft.prepareDraft(
+      h.articleKey,
+      opened.view.session.bindingToken!,
+    );
+    if (offered.status !== 'ready') throw Error('old task not prepared');
+    await draft.startDraft(offered.preparation.preparationId);
+    await expect.poll(() => draft.isActive()).toBe(false);
+    const old = h.tasks.latest()!;
+    expect(old).toMatchObject({
+      state: 'needs_human',
+      reason: 'EDITOR_NOT_EMPTY',
+      saveAttempted: false,
+    });
+    expect(
+      (
+        await draft.finishHandledTask({
+          taskId: old.taskId,
+          expectedRevision: old.revision,
+        })
+      ).status,
+    ).toBe('ok');
+    expect((await draft.getDraftState()).session.status).toBe('closed');
+    expect(await adapter.checkSession()).toMatchObject({
+      status: 'blocked',
+      reason: 'BROWSER_UNAVAILABLE',
+    });
+    const fresh = await draft.openDraftSession();
+    expect(fresh.view.session.status).toBe('ready');
+    expect(opens).toBe(2);
+    const next = await h.addArticle('New task after handled entry');
+    const nextOffer = await draft.prepareDraft(
+      next,
+      fresh.view.session.bindingToken!,
+    );
+    if (nextOffer.status !== 'ready') throw Error('new task not prepared');
+    await draft.startDraft(nextOffer.preparation.preparationId);
+    await expect.poll(() => draft.isActive(), { timeout: 12000 }).toBe(false);
+    expect(h.tasks.latest()).toMatchObject({
+      articleKey: next,
+      state: 'submission_recorded',
+      saveAttempted: true,
+    });
+    const previous = structuredClone(h.tasks.latest());
+    const keys = [
+      await h.addArticle('Next batch first article'),
+      await h.addArticle('Next batch second article'),
+    ];
+    const batchOffer = await batch.prepare({
+      articleKeys: keys,
+      bindingToken: (await draft.getDraftState()).session.bindingToken!,
+    });
+    if (batchOffer.status !== 'ready')
+      throw Error('batch not prepared: ' + JSON.stringify(batchOffer));
+    await batch.start({
+      preparationId: batchOffer.preparation.preparationId,
+      requestId: randomUUID(),
+    });
+    await batch.waitForIdle();
+    expect(await batch.getCurrent()).toMatchObject({
+      state: 'completed',
+      items: [
+        { articleKey: keys[0], state: 'submission_recorded' },
+        { articleKey: keys[1], state: 'submission_recorded' },
+      ],
+    });
+    expect(h.tasks.get(previous!.taskId)).toEqual(previous);
+    expect(h.tasks.get(old.taskId)).toMatchObject({
+      state: 'stopped_by_user',
+      holdsPlatform: false,
+      saveAttempted: false,
+    });
+    expect(originalFixture.saves()).toBe(0);
+    expect(reopenedFixture!.saves()).toBe(3);
+    expect(opens).toBe(2);
+  } finally {
+    await batch.stopAndWait();
+    await session.close();
+    repository.close();
+    await h.close();
+  }
+});
 
 async function operatorEditor(context: BrowserContext, page: Page) {
   await denyExternalNetwork(context);
@@ -40,11 +212,19 @@ function interceptFinalRead(
 ) {
   const evaluate = page.evaluate.bind(page);
   const getByRole = page.getByRole.bind(page);
-  let busyReads = 0;
   let intercepted = false;
+  let submitted = false;
+  const observeCreate = (request: import('@playwright/test').Request) => {
+    if (
+      new URL(request.url()).pathname.endsWith('/article/create') &&
+      request.method() === 'POST'
+    )
+      submitted = true;
+  };
+  page.on('request', observeCreate);
   const intercept = (work: Promise<unknown>) =>
     work.then(async (value) => {
-      if (!intercepted) {
+      if (submitted && !intercepted) {
         intercepted = true;
         await afterRead();
       }
@@ -74,7 +254,7 @@ function interceptFinalRead(
                 readReceiver,
                 readArgs,
               ) as Promise<unknown>;
-              return ++busyReads === 2 ? intercept(work) : work;
+              return intercept(work);
             },
           });
         }
@@ -82,6 +262,7 @@ function interceptFinalRead(
       },
     });
   return () => {
+    page.off('request', observeCreate);
     page.evaluate = evaluate;
     page.getByRole = getByRole;
   };
@@ -578,7 +759,10 @@ for (const observation of ['acknowledged', 'rejected', 'unknown'] as const) {
           ownerConfirmedPilot: { dealerId: '123456', storeName: '合成门店' },
         },
       );
+      // evidenceV1: preserve legacy production-page regression; V2 remains closed.
+      legacyFixtureSnapshotCapture(h.snapshots);
       const preparation = createDraftPreparation({
+        contentCapabilities: () => adapter.contentCapabilities(),
         repository: h.articles,
         covers: h.articles,
         tasks: h.tasks,
@@ -586,6 +770,7 @@ for (const observation of ['acknowledged', 'rejected', 'unknown'] as const) {
         newId: randomUUID,
       });
       const draft = createDraftController({
+        invalidateBrowserHealth: () => {},
         tasks: h.tasks,
         snapshots: h.snapshots,
         preparation,
@@ -840,7 +1025,10 @@ for (const fault of [
         ownerConfirmedPilot: { dealerId: '123456', storeName: '合成门店' },
       },
     );
+    // evidenceV1: preserve legacy production-page regression; V2 remains closed.
+    legacyFixtureSnapshotCapture(h.snapshots);
     const preparation = createDraftPreparation({
+      contentCapabilities: () => adapter.contentCapabilities(),
       repository: h.articles,
       covers: h.articles,
       tasks: h.tasks,
@@ -848,6 +1036,7 @@ for (const fault of [
       newId: randomUUID,
     });
     const draft = createDraftController({
+      invalidateBrowserHealth: () => {},
       tasks: h.tasks,
       snapshots: h.snapshots,
       preparation,

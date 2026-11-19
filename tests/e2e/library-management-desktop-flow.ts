@@ -1,3 +1,4 @@
+import { returnToArticlePool } from './focused-editor-navigation';
 import { _electron as electron, expect } from '@playwright/test';
 import {
   mkdtempSync,
@@ -69,20 +70,7 @@ export async function checkLibraryManagement(
           if (/^https?:/.test(request.url()))
             remoteRequests.push(request.url());
         });
-        const closeEditor = async () => {
-          const end = page.getByRole('button', {
-            name: '结束编辑',
-            exact: true,
-          });
-          if (await end.isVisible()) await end.click();
-          await expect
-            .poll(() =>
-              page.evaluate(() =>
-                window.desktopApi.getManualArticleState().then((s) => s.state),
-              ),
-            )
-            .toBe('idle');
-        };
+        const closeEditor = () => returnToArticlePool(page);
         if (run === 0) {
           await expect(
             page.getByText('本机文章共 0 篇', { exact: true }),
@@ -119,15 +107,15 @@ export async function checkLibraryManagement(
               .click();
             await expect
               .poll(() =>
-                page.evaluate(() =>
-                  window.desktopApi
-                    .getImportStatus()
-                    .then((s) =>
-                      s.state === 'finished' ? s.result.status : s.state,
-                    ),
-                ),
+                page.evaluate(() => window.desktopApi.getImportStatus()),
               )
-              .toBe('imported');
+              .toMatchObject({
+                state: 'finished',
+                result: { status: 'imported', title: `本机管理验证 ${i}` },
+              });
+            await expect(
+              page.getByRole('textbox', { name: '文章标题', exact: true }),
+            ).toHaveValue(`本机管理验证 ${i}`);
             await closeEditor();
           }
           await expect(
@@ -135,7 +123,9 @@ export async function checkLibraryManagement(
           ).toBeVisible();
           await expect(page.locator('.article-rows > li')).toHaveCount(10);
           await expect(
-            page.getByText('第 1 页 / 共 2 页', { exact: true }),
+            page
+              .getByRole('navigation', { name: '文章分页', exact: true })
+              .getByText('第 1 页 / 共 2 页', { exact: true }),
           ).toBeVisible();
           const first = await page.evaluate(() =>
             window.desktopApi.listArticles(),
@@ -159,6 +149,7 @@ export async function checkLibraryManagement(
           deletedTitle = second.page.items[0].title;
           retainedAssets = treeHashes(join(root, 'assets'));
           await page
+            .getByRole('navigation', { name: '文章分页', exact: true })
             .getByRole('button', { name: '下一页', exact: true })
             .click();
           await expect(page.locator('.article-rows > li')).toHaveCount(1);
@@ -192,7 +183,9 @@ export async function checkLibraryManagement(
             page.getByText('本机文章共 10 篇', { exact: true }),
           ).toBeVisible();
           await expect(
-            page.getByText('第 1 页 / 共 1 页', { exact: true }),
+            page
+              .getByRole('navigation', { name: '文章分页', exact: true })
+              .getByText('第 1 页 / 共 1 页', { exact: true }),
           ).toBeVisible();
           await expect(page.locator('.article-rows > li')).toHaveCount(10);
           await expect(
@@ -336,7 +329,7 @@ export async function checkHistoricalLibraryUpgrade(
         ).toBeVisible();
         expect(
           await page.evaluate(() => window.desktopApi.getAppStatus()),
-        ).toMatchObject({ state: 'ready', schemaVersion: 14 });
+        ).toMatchObject({ state: 'ready', schemaVersion: 15 });
         const list = await page.evaluate(() =>
           window.desktopApi.listArticles(),
         );
@@ -362,12 +355,16 @@ export async function checkHistoricalLibraryUpgrade(
           .first()
           .scrollIntoViewIfNeeded();
         await expect(
-          page.locator('.article-preview img').first(),
+          page
+            .getByRole('textbox', { name: '文章正文', exact: true })
+            .locator('img')
+            .first(),
         ).toBeVisible();
         await expect
           .poll(() =>
             page
-              .locator('.article-preview img')
+              .getByRole('textbox', { name: '文章正文', exact: true })
+              .locator('img')
               .first()
               .evaluate(
                 (image: HTMLImageElement) =>
@@ -377,9 +374,7 @@ export async function checkHistoricalLibraryUpgrade(
               ),
           )
           .toBe(true);
-        await page
-          .getByRole('button', { name: '结束编辑', exact: true })
-          .click();
+        await returnToArticlePool(page);
         expect(existsSync(join(root, 'profiles'))).toBe(false);
         expect(
           await page.evaluate(() => window.desktopApi.getDraftState()),

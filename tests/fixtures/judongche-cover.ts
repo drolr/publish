@@ -108,13 +108,20 @@ export async function installCoverFixture(
       );
     },
     async waitForUpload() {
-      await page.waitForFunction(
-        () =>
-          (window as unknown as { uploadResult: unknown }).uploadResult !==
-          null,
-        {},
-        { timeout: 3000 },
-      );
+      const deadline = Date.now() + 3000;
+      for (;;) {
+        const result = await page.evaluate(
+          () =>
+            (
+              window as unknown as {
+                uploadResult: 'complete' | 'incomplete' | 'rejected' | null;
+              }
+            ).uploadResult,
+        );
+        if (result) return result;
+        if (Date.now() >= deadline) return 'timeout';
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
     },
     async uncheckLibrary() {
       if (await page.locator('#library').isEnabled())

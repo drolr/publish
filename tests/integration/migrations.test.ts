@@ -49,10 +49,10 @@ it('initializes and reopens the approved schema without duplicate migrations', (
   store = openBaselineStore(db, migrations);
   const secondVersion = store.getSchemaVersion();
   store.close();
-  expect(firstVersion).toBe(14);
-  expect(secondVersion).toBe(14);
+  expect(firstVersion).toBe(15);
+  expect(secondVersion).toBe(15);
   expect(inspectDatabase(db)).toEqual({
-    versions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    versions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     tables: [
       'article_assets',
       'article_cover_heads',
@@ -133,7 +133,7 @@ it.each([2, 6, 7])(
     for (let start = 0; start < 2; start++) {
       const store = openArticleRepository(db, migrations);
       try {
-        expect(store.getSchemaVersion()).toBe(14);
+        expect(store.getSchemaVersion()).toBe(15);
         expect(store.loadEditableArticle(articleKey)).toEqual({
           article,
           articleRevision: 1,
@@ -175,7 +175,7 @@ it.each([2, 6, 7])(
       expect(inspectDatabase(db).tables).toContain('judongche_task_closures');
       expect(hash(readFileSync(image))).toBe(hash(bytes));
       expect(inspectDatabase(db).versions).toEqual([
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
       ]);
     }
   },

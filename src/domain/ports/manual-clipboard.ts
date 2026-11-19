@@ -1,4 +1,5 @@
-import type { ManualDraft, ManualImage } from '../../contracts/manual-article';
+import type { ManualFragmentV2 } from '../../contracts/manual-rich-draft';
+import type { ManualImage } from '../../contracts/manual-article';
 /** Atomic write of the bounded, main-generated fragment plus normal selected text. */
 export interface ClipboardFragmentPort {
   write(grantId: string, selectedText: string): Promise<void>;
@@ -12,7 +13,7 @@ export interface ManualClipboard {
   isReady(): boolean;
   copy(
     sessionId: string,
-    blocks: ManualDraft['blocks'],
+    fragment: ManualFragmentV2,
     images: readonly ManualImage[],
     signal: AbortSignal,
   ): Promise<void>;
@@ -22,6 +23,6 @@ export interface ManualClipboard {
     signal: AbortSignal,
     retainedTokens: readonly string[],
     capacity?: ManualPasteCapacity,
-  ): Promise<{ blocks: ManualDraft['blocks']; images: ManualImage[] }>;
+  ): Promise<{ fragment: ManualFragmentV2; images: ManualImage[] }>;
   drain(): Promise<void>;
 }

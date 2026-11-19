@@ -5,16 +5,17 @@ import {
   StoredArticleSchema,
   StoredAssetSchema,
 } from './stored-article';
+import { ArticleRevisionSchema } from './manual-edit';
 import {
-  ArticleRevisionSchema,
-  PersistedEditorBodyV1Schema,
-} from './manual-edit';
+  PersistedEditorBodySchema,
+  PersistedEditorBodyV2Schema,
+} from './rich-text-body';
 import { RevisionSchema, textWithin, webPasteLimits } from './web-paste';
 export const DigestSchema = z.string().regex(/^[a-f0-9]{64}$/);
 export const EditableArticleSchema = z.strictObject({
   article: StoredArticleSchema,
   articleRevision: ArticleRevisionSchema,
-  editorBody: PersistedEditorBodyV1Schema.nullable(),
+  editorBody: PersistedEditorBodySchema.nullable(),
 });
 export type EditableArticle = z.output<typeof EditableArticleSchema>;
 export const SaveReceiptSchema = z.strictObject({
@@ -92,7 +93,7 @@ export const EditorCompatibilityLeaseSchema =
 const ContentFields = {
   title: textWithin(webPasteLimits.titleCodePoints),
   contentDeclaration: z.enum(['original', 'repost']),
-  editorBody: PersistedEditorBodyV1Schema,
+  editorBody: PersistedEditorBodyV2Schema,
   images: z.array(RevisionImageSourceSchema).max(webPasteLimits.images),
 };
 export const RevisionSaveInputSchema = z.discriminatedUnion('kind', [
@@ -192,7 +193,7 @@ export type RevisionOperationPatch = z.output<
 export const RevisionProposalSchema = z.strictObject({
   intent: RevisionIntentSchema,
   nextArticle: StoredArticleSchema,
-  editorBody: PersistedEditorBodyV1Schema,
+  editorBody: PersistedEditorBodySchema,
   compatibilityLease: EditorCompatibilityLeaseSchema.optional(),
 });
 export type RevisionProposal = z.output<typeof RevisionProposalSchema>;

@@ -191,6 +191,10 @@ export function checkBoundaries(
       }
       const builtin =
         specifier.startsWith('node:') || builtinModules.includes(specifier);
+      // Electron's physical ASAR reader is a privileged main-process seam,
+      // never a general desktop dependency or a Node builtin exemption.
+      if (specifier === 'original-fs' && path.startsWith('src/desktop/main/'))
+        return;
       if (specifier === 'sharp' || specifier.startsWith('sharp/')) {
         if (!path.startsWith('src/infrastructure/assets/'))
           fail('Image decoder outside assets');

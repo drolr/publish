@@ -1,3 +1,7 @@
+import type {
+  BrowserHealthApi,
+  BrowserHealthView,
+} from '../../src/contracts/browser-health';
 import type { BatchApi } from '../../src/contracts/draft-batch';
 import type {
   StoredCoverConfiguration,
@@ -18,6 +22,21 @@ import type { SnapshotPort } from '../../src/domain/ports/draft-task';
 import type { ArticleCoverRepository } from '../../src/domain/ports/article-cover';
 import { coverConfigurationDigest } from '../../src/infrastructure/persistence/article-cover-repository';
 const h = vi.hoisted(() => ({
+  healthApi: undefined as BrowserHealthApi | undefined,
+  healthListener: undefined as ((view: BrowserHealthView) => void) | undefined,
+  browserOccupied: false,
+  businessOpen: false,
+  browserEpoch: undefined as (() => number) | undefined,
+  invalidateHealth: vi.fn(),
+  healthCheck: vi.fn(async () => ({
+    status: 'ok' as const,
+    view: {
+      status: 'passed' as const,
+      version: '153.0.0.0',
+      reason: null,
+      stage: null,
+    },
+  })),
   batchApi: undefined as BatchApi | undefined,
   batchActive: false,
   batchBlocked: false,
@@ -98,6 +117,8 @@ const h = vi.hoisted(() => ({
   recover: vi.fn(),
   open: vi.fn(),
   start: vi.fn(),
+  skipRecovery: vi.fn(async () => ({ status: 'ok', view: null })),
+  finishHandled: vi.fn(async () => ({ status: 'ok', view: null })),
   prepare: vi.fn(),
   stop: vi.fn(),
   importStart: vi.fn(),
@@ -116,8 +137,33 @@ vi.mock('electron', () => ({
   },
 }));
 vi.mock('node:fs', () => ({ mkdirSync: vi.fn() }));
+// Electron supplies this built-in; this Node-only composition uses dev mode.
+vi.mock('original-fs', () => ({
+  readFileSync: () => {
+    throw Error('development composition must not read an ASAR');
+  },
+}));
 vi.mock('../../src/desktop/main/window', () => ({
   createWindow: () => h.window,
+}));
+vi.mock('../../src/desktop/main/upload-wait-settings', () => ({
+  registerUploadWaitSettings: () => () => ({
+    编辑页等待秒数: 30,
+    正文光标点击秒数: 3,
+    图片按钮和选文件秒数: 5,
+    正文图片预览秒数: 30,
+    图片插入和弹窗关闭秒数: 10,
+    封面上传完成秒数: 90,
+  }),
+}));
+vi.mock('../../src/desktop/main/browser-health-ipc', () => ({
+  registerBrowserHealthHandlers: (
+    _w: unknown,
+    _u: unknown,
+    api: BrowserHealthApi,
+  ) => {
+    h.healthApi = api;
+  },
 }));
 vi.mock('../../src/desktop/main/ipc', () => ({
   registerStatusHandler: vi.fn(),
@@ -385,11 +431,39 @@ vi.mock('../../src/application/draft-preparation', () => ({
   },
 }));
 vi.mock('../../src/infrastructure/automation/browser-session', () => ({
-  createBrowserSession: (profile: string) => {
+  createBrowserSession: (
+    profile: string,
+    options: { operationEpoch: () => number },
+  ) => {
+    h.browserEpoch = options.operationEpoch;
     h.profile = profile;
     h.order.push('browser-created');
     if (h.browserFails) throw Error('private browser');
-    return { close: h.browserClose, open: h.open };
+    return {
+      close: h.browserClose,
+      open: h.open,
+      isOccupied: () => h.browserOccupied,
+      hasBusinessSession: () => h.businessOpen,
+      invalidateHealth: h.invalidateHealth,
+      checkHealth: h.healthCheck,
+      openUpdate: async () => {
+        h.browserOccupied = true;
+        const view = {
+          status: 'update_open' as const,
+          version: null,
+          stage: null,
+          reason: null,
+        };
+        h.healthListener?.(view);
+        return { status: 'ok' as const, view };
+      },
+      subscribeHealth: (fn: (v: BrowserHealthView) => void) => {
+        h.healthListener = fn;
+        return () => {
+          h.healthListener = undefined;
+        };
+      },
+    };
   },
 }));
 vi.mock('../../src/infrastructure/platforms/judongche/draft-adapter', () => ({
@@ -403,6 +477,7 @@ vi.mock('../../src/application/draft-controller', () => ({
       isActive: () => h.draftActive,
       isBlocked: () => h.draftBlocked || h.persistedHold,
       startDraft: h.start,
+      finishHandledTask: h.finishHandled,
       prepareDraft: h.prepare,
       openDraftSession: h.open,
       stopAndWait: h.stop,
@@ -424,6 +499,11 @@ beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   Object.assign(h, {
+    healthApi: undefined,
+    healthListener: undefined,
+    browserOccupied: false,
+    businessOpen: false,
+    browserEpoch: undefined,
     batchApi: undefined,
     batchActive: false,
     batchBlocked: false,
@@ -1122,6 +1202,7 @@ vi.mock('../../src/application/batch-controller', () => ({
   createBatchController: (deps: { gate(): string }) => {
     h.batchGate = deps.gate;
     return {
+      skipCurrentAndContinue: h.skipRecovery,
       isActive: () => h.batchActive,
       isBlocked: () => h.batchBlocked,
       requestStop: () => h.runtimeStops('batch'),
@@ -1227,4 +1308,135 @@ it('restart flush only opens the pending text-edit lane while all normal writes 
       'stopped',
     ),
   );
+});
+
+it('maintenance_remains_exclusive_after_open_promise_resolves across all browser entry points', async () => {
+  await boot();
+  expect((await h.healthApi!.openBrowserUpdate()).status).toBe('ok');
+  expect(h.draftGate!()).toBe('busy');
+  expect(h.batchGate!()).toBe('busy');
+  for (const call of [
+    () => h.draftApi!.openDraftSession(),
+    () => h.draftApi!.startDraft('id'),
+    () => h.draftApi!.prepareDraft('id', 'id'),
+  ])
+    expect(await call()).toMatchObject({
+      status: 'blocked',
+      reason: 'PLATFORM_BUSY',
+    });
+  expect(await h.batchApi!.prepare({} as never)).toMatchObject({
+    status: 'blocked',
+    reason: 'PLATFORM_BUSY',
+  });
+  expect(await h.batchApi!.start({} as never)).toMatchObject({
+    status: 'blocked',
+    reason: 'PLATFORM_BUSY',
+  });
+  expect(h.open).not.toHaveBeenCalled();
+  expect(h.start).not.toHaveBeenCalled();
+  expect(h.prepare).not.toHaveBeenCalled();
+  expect((await h.healthApi!.checkBrowserHealth()).view.reason).toBe(
+    'maintenance_open',
+  );
+  h.healthListener?.({
+    status: 'check_failed',
+    reason: 'cleanup_failed',
+    stage: 'cleanup',
+    version: null,
+  });
+  expect(h.draftGate!()).toBe('busy');
+  expect((await h.draftApi!.getDraftState()).session.status).toBe('closed');
+  h.browserOccupied = false;
+  h.healthListener?.({
+    status: 'unchecked',
+    reason: null,
+    stage: null,
+    version: null,
+  });
+  expect(h.draftGate!()).toBe('ready');
+});
+it.each([
+  'draftActive',
+  'draftBlocked',
+  'batchActive',
+  'batchBlocked',
+  'persistedHold',
+  'businessOpen',
+  'revisionReady',
+  'clipboardReady',
+] as const)(
+  'health commands never drain or mutate tasks during %s',
+  async (flag) => {
+    await boot();
+    h[flag] = !['revisionReady', 'clipboardReady'].includes(flag);
+    for (const call of [
+      () => h.healthApi!.checkBrowserHealth(),
+      () => h.healthApi!.openBrowserUpdate(),
+    ])
+      expect(await call()).toMatchObject({
+        status: 'blocked',
+        view: {
+          reason: flag === 'businessOpen' ? 'business_open' : 'task_busy',
+        },
+      });
+    expect(h.healthCheck).not.toHaveBeenCalled();
+    expect(h.open).not.toHaveBeenCalled();
+    expect(h.stop).not.toHaveBeenCalled();
+    expect(h.runtimeStops).not.toHaveBeenCalled();
+  },
+);
+it('health_pass_is_not_platform_ready and invalidation advances the runtime epoch', async () => {
+  await boot();
+  expect(h.browserEpoch!()).toBe(0);
+  expect((await h.healthApi!.checkBrowserHealth()).view.status).toBe('passed');
+  expect(h.browserEpoch!()).toBe(1);
+  expect(h.invalidateHealth).toHaveBeenCalledOnce();
+  expect(await h.draftApi!.getDraftState()).toMatchObject({
+    session: { status: 'closed', bindingToken: null },
+    preparation: null,
+  });
+  expect(h.open).not.toHaveBeenCalled();
+  expect(h.start).not.toHaveBeenCalled();
+  expect(h.prepare).not.toHaveBeenCalled();
+});
+
+it('routes bound batch recovery while preserving other batch and maintenance admission', async () => {
+  await boot();
+  h.batchBlocked = true;
+  const input = {
+    batchId: '11111111-1111-4111-8111-111111111111',
+    expectedRevision: 3,
+    taskId: '22222222-2222-4222-8222-222222222222',
+  };
+  expect((await h.batchApi!.skipCurrentAndContinue(input)).status).toBe('ok');
+  expect(h.skipRecovery).toHaveBeenCalledWith(input);
+  expect(await h.draftApi!.openDraftSession()).toMatchObject({
+    status: 'blocked',
+    reason: 'PLATFORM_BUSY',
+  });
+  expect(
+    await h.draftApi!.finishHandledTask({
+      taskId: input.taskId,
+      expectedRevision: 1,
+    }),
+  ).toMatchObject({ status: 'blocked', reason: 'PLATFORM_BUSY' });
+  expect(h.finishHandled).not.toHaveBeenCalled();
+  h.browserOccupied = true;
+  const calls = h.skipRecovery.mock.calls.length;
+  expect(await h.batchApi!.skipCurrentAndContinue(input)).toMatchObject({
+    status: 'blocked',
+    reason: 'PLATFORM_BUSY',
+  });
+  expect(h.skipRecovery).toHaveBeenCalledTimes(calls);
+  h.browserOccupied = false;
+  h.batchBlocked = false;
+  expect(
+    (
+      await h.draftApi!.finishHandledTask({
+        taskId: input.taskId,
+        expectedRevision: 1,
+      })
+    ).status,
+  ).toBe('ok');
+  expect(h.finishHandled).toHaveBeenCalledOnce();
 });

@@ -3,7 +3,7 @@ import { coverRepository } from './article-cover-repository';
 import type { ArticleDeletionRepository } from '../../domain/ports/article-delete';
 import { deletionRepository } from './article-delete-repository';
 import { SaveReceiptSchema } from '../../contracts/article-revision';
-import { PersistedEditorBodyV1Schema } from '../../contracts/manual-edit';
+import { PersistedEditorBodySchema } from '../../contracts/rich-text-body';
 import type { ArticleRevisionRepository } from '../../domain/ports/article-revision';
 import { editorProjectionMatches } from '../../domain/article-edit';
 import {
@@ -278,7 +278,7 @@ export function openArticleRepository(
               const parsedAttempt = ImportAttemptSchema.parse(attempt);
               const article = StoredArticleSchema.parse(input);
               const editorBody = context
-                ? PersistedEditorBodyV1Schema.parse(context.editorBody)
+                ? PersistedEditorBodySchema.parse(context.editorBody)
                 : null;
               const receipt = context
                 ? SaveReceiptSchema.parse(context.receipt)

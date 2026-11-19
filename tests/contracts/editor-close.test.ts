@@ -5,8 +5,8 @@ import {
   manualResponses,
 } from '../../src/contracts/manual-article';
 import { ManualCloseRequestSchema } from '../../src/contracts/manual-edit';
-it('exposes exactly nineteen bounded requests and no generic clipboard bridge', () => {
-  expect(Object.keys(manualChannels)).toHaveLength(19);
+it('exposes exactly twenty-three bounded requests and no generic clipboard bridge', () => {
+  expect(Object.keys(manualChannels)).toHaveLength(23);
   expect(Object.keys(manualRequests).sort()).toEqual(
     Object.keys(manualChannels).sort(),
   );

@@ -107,6 +107,7 @@ export async function checkBatchRecovery(executablePath?: string) {
             'finish',
             'getCurrent',
             'prepare',
+            'skipCurrentAndContinue',
             'start',
             'stop',
           ]);

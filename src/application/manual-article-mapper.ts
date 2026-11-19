@@ -1,5 +1,8 @@
 import type { ArticlePackageV1 } from '../contracts/article-package';
-import type { ManualState } from '../contracts/manual-article';
+import {
+  ManualDraftSchema,
+  type ManualState,
+} from '../contracts/manual-article';
 import { ImportFailure } from '../domain/import-error';
 import type { SaveCommand } from '../contracts/manual-edit';
 import type {
@@ -9,7 +12,9 @@ import type {
   EditorCompatibilityLease,
 } from '../contracts/article-revision';
 import { WebPasteFailure } from '../domain/web-paste-error';
-import { deriveEditorBody } from '../domain/article-edit';
+import { requireLegacyManualDraft } from '../domain/manual-draft-version';
+import { PersistedEditorBodyV2Schema } from '../contracts/rich-text-body';
+import { upgradeEditorBody } from '../domain/rich-text-body';
 import type { StoredArticle } from '../contracts/stored-article';
 export type ManualSession = Extract<ManualState, { sessionId: string }>;
 
@@ -23,7 +28,7 @@ export function manualSessionFromEditable(
   imageIds: ReadonlyMap<string, string>;
   assets: StoredArticle['assets'];
 } {
-  const layout = editable.editorBody ?? deriveEditorBody(editable.article.body);
+  const layout = upgradeEditorBody(editable.editorBody, editable.article.body);
   const referenced = new Set(
     layout.blocks.flatMap((b) => (b.type === 'image' ? [b.imageId] : [])),
   );
@@ -54,19 +59,36 @@ export function manualSessionFromEditable(
       nextClientSequence: 1,
       nextSaveOperationId: newId(),
       nextPasteCommandId: newId(),
-      draft: {
+      draft: ManualDraftSchema.parse({
+        bodyVersion: 2,
         title: editable.article.title,
         contentDeclaration: editable.article.contentDeclaration,
-        blocks: layout.blocks.map((b) =>
-          b.type === 'paragraph'
-            ? { ...b, blockKey: newId() }
-            : {
-                type: 'image',
+        blocks: layout.blocks.map((b) => {
+          const blockKey = newId();
+          if (b.type === 'image')
+            return {
+              type: 'image',
+              blockKey,
+              imageToken: imageIds.get(b.imageId)!,
+            };
+          if (b.type === 'list')
+            return {
+              ...b,
+              blockKey,
+              items: b.items.map((p) => ({ ...p, blockKey: newId() })),
+            };
+          if (b.type === 'blockquote')
+            return {
+              ...b,
+              blockKey,
+              paragraphs: b.paragraphs.map((p) => ({
+                ...p,
                 blockKey: newId(),
-                imageToken: imageIds.get(b.imageId)!,
-              },
-        ),
-      },
+              })),
+            };
+          return { ...b, blockKey };
+        }),
+      }),
       images: assets.map((a) => ({
         imageToken: imageIds.get(a.imageId)!,
         mime: a.mime,
@@ -110,18 +132,29 @@ export function manualRevisionInput(
     );
   });
   const byToken = new Map(tokens.map((token, n) => [token, images[n]]));
-  const editorBody = {
-    version: 1 as const,
-    blocks: session.draft.blocks.map((b) => {
-      if (b.type === 'paragraph')
-        return { type: 'paragraph' as const, text: b.text };
-      if (b.type !== 'image') throw new WebPasteFailure('INPUT_LIMIT');
-      return {
-        type: 'image' as const,
-        imageId: byToken.get(b.imageToken)!.imageId,
-      };
+  const draft = ManualDraftSchema.parse(session.draft);
+  const editorBody = PersistedEditorBodyV2Schema.parse({
+    version: 2,
+    blocks: draft.blocks.map((b) => {
+      if (b.type === 'image')
+        return { type: 'image', imageId: byToken.get(b.imageToken)!.imageId };
+      if (b.type === 'image-pending') throw new WebPasteFailure('INPUT_LIMIT');
+      const leaf = (p: { content: unknown }) => ({
+        type: 'paragraph',
+        content: p.content,
+      });
+      if (b.type === 'list')
+        return {
+          type: b.type,
+          kind: b.kind,
+          ...('start' in b ? { start: b.start } : {}),
+          items: b.items.map(leaf),
+        };
+      if (b.type === 'blockquote')
+        return { type: b.type, paragraphs: b.paragraphs.map(leaf) };
+      return { type: b.type, content: b.content };
     }),
-  };
+  });
   const content = {
     title: session.draft.title,
     contentDeclaration: session.draft.contentDeclaration,
@@ -177,9 +210,11 @@ export function manualRevisionInput(
 
 /** Formal v1 input references only source-issued local capabilities. */
 export function manualArticleInput(session: ManualSession): ArticlePackageV1 {
+  // No-documents fallback is deliberately lossless-only.
+  const draft = requireLegacyManualDraft(session.draft);
   const tokens = [
     ...new Set(
-      session.draft.blocks.flatMap((block) =>
+      draft.blocks.flatMap((block) =>
         block.type === 'image' ? [block.imageToken] : [],
       ),
     ),
@@ -189,7 +224,7 @@ export function manualArticleInput(session: ManualSession): ArticlePackageV1 {
     article_id: session.externalId,
     title: session.draft.title,
     content_declaration: session.draft.contentDeclaration,
-    body: session.draft.blocks.map((block) => {
+    body: draft.blocks.map((block) => {
       if (block.type === 'paragraph')
         return { type: 'paragraph' as const, text: block.text };
       if (

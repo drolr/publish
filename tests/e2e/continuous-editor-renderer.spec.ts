@@ -1,693 +1,13 @@
-import { installCoverBridge } from './cover-renderer-fixture';
-import { test, expect, type Page } from '@playwright/test';
-import webpack from 'webpack';
-import MiniCssExtractPlugin from 'mini-css-extract-plugin';
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { ManualDraft } from '../../src/contracts/manual-article';
-import type {
-  DocumentCommand,
-  DraftRange,
-} from '../../src/contracts/manual-edit';
-test.beforeAll(async () => {
-  await new Promise<void>((done, reject) =>
-    webpack(
-      {
-        mode: 'development',
-        entry: resolve('src/renderer/main.tsx'),
-        output: {
-          path: resolve('.tmp/continuous-renderer'),
-          filename: 'app.js',
-        },
-        module: {
-          rules: [
-            {
-              test: /\.tsx?$/,
-              loader: 'ts-loader',
-              options: {
-                transpileOnly: true,
-                compilerOptions: { noEmit: false },
-              },
-            },
-            {
-              test: /\.css$/,
-              use: [MiniCssExtractPlugin.loader, 'css-loader'],
-            },
-          ],
-        },
-        plugins: [new MiniCssExtractPlugin({ filename: 'app.css' })],
-        resolve: { extensions: ['.tsx', '.ts', '.js'] },
-        devtool: false,
-      },
-      (error, stats) =>
-        error || stats?.hasErrors()
-          ? reject(error ?? Error(stats?.toString()))
-          : done(),
-    ),
-  );
-});
-const rendererErrors = new WeakMap<Page, string[]>();
-test.beforeEach(({ page }) => {
-  const errors: string[] = [];
-  rendererErrors.set(page, errors);
-  page.on('pageerror', (error) => errors.push(error.message));
-});
-test.afterEach(({ page }) => {
-  expect(rendererErrors.get(page), 'uncaught renderer errors').toEqual([]);
-});
-async function mount(page: Page, scenario = 'normal') {
-  await page.route('**/*', async (route) => {
-    const url = new URL(route.request().url());
-    if (
-      url.origin !== 'http://localhost' ||
-      !['/', '/app.js', '/app.css'].includes(url.pathname)
-    )
-      return route.abort();
-    await route.fulfill(
-      url.pathname === '/'
-        ? {
-            contentType: 'text/html; charset=utf-8',
-            body: '<html><head><link rel="stylesheet" href="/app.css"></head><body><div id="root"></div><script src="/app.js"></script></body></html>',
-          }
-        : {
-            contentType: url.pathname.endsWith('js')
-              ? 'text/javascript'
-              : 'text/css',
-            body: readFileSync(
-              resolve('.tmp/continuous-renderer', url.pathname.slice(1)),
-            ),
-          },
-    );
-  });
-  await page.addInitScript(
-    ({ scenario }) => {
-      const id = '11111111-1111-4111-8111-111111111111';
-      const imageKey = '22222222-2222-4222-8222-222222222222';
-      const lastKey = '33333333-3333-4333-8333-333333333333';
-      let state = JSON.parse(
-        sessionStorage.getItem('manual') ?? '{"state":"idle","revision":0}',
-      );
-      let closeListener: ((r: { requestId: string }) => void) | undefined;
-      let calls = 0;
-      const log = (name: string, value: unknown) => {
-        const logs = JSON.parse(sessionStorage.getItem(name) ?? '[]');
-        logs.push(value);
-        sessionStorage.setItem(name, JSON.stringify(logs));
-      };
-      const remember = () => {
-        sessionStorage.setItem('manual', JSON.stringify(state));
-        return structuredClone(state);
-      };
-      const reply = (status = 'ok') => ({ status, snapshot: remember() });
-      const ticket = (c: DocumentCommand) => {
-        log('commands', c);
-        if (
-          c.clientSequence !== state.nextClientSequence ||
-          c.commandId !== state.nextEditCommandId ||
-          c.expectedDocumentRevision !== state.documentRevision
-        )
-          throw Error('wrong ticket');
-        state.nextClientSequence++;
-        state.nextEditCommandId = crypto.randomUUID();
-      };
-      const confirm = (c: DocumentCommand, draft: ManualDraft) => {
-        state = {
-          ...state,
-          draft,
-          revision: state.revision + 1,
-          documentRevision: state.documentRevision + 1,
-          acknowledgedEdit: {
-            clientSequence: c.clientSequence,
-            commandId: c.commandId,
-          },
-          dirty: true,
-          issues: undefined,
-          result: undefined,
-          saveOutcome: undefined,
-        };
-        return reply();
-      };
-      const base = () => ({
-        state: 'editing',
-        revision: state.revision + 1,
-        sessionId: id,
-        nextPasteCommandId: crypto.randomUUID(),
-        nextEditCommandId: crypto.randomUUID(),
-        nextClientSequence: 7,
-        nextSaveOperationId: crypto.randomUUID(),
-        target: { kind: 'new' },
-        documentRevision: 0,
-        acknowledgedEdit: null,
-        externalId: 'manual-' + id,
-        dirty: false,
-        candidates: [],
-        images: [],
-        draft: {
-          title: '',
-          contentDeclaration: 'repost',
-          blocks: [{ type: 'paragraph', blockKey: id, text: '' }],
-        },
-      });
-      const png = Uint8Array.from(
-        atob(
-          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jL1sAAAAASUVORK5CYII=',
-        ),
-        (c) => c.charCodeAt(0),
-      );
-      const image = (key = imageKey) => ({
-        imageToken: key,
-        mime: 'image/png',
-        width: 1,
-        height: 1,
-        byteSize: png.length,
-      });
-      Object.assign(window, {
-        fixtureClose: () => closeListener?.({ requestId: lastKey }),
-        fixturePatch: (patch: Record<string, unknown>) => {
-          state = { ...state, ...patch, revision: state.revision + 1 };
-          remember();
-        },
-        fixtureRead: () => remember(),
-      });
-      if (
-        scenario === 'existing' ||
-        scenario === 'held-focus' ||
-        scenario === 'images' ||
-        scenario === 'late-image' ||
-        scenario === 'bytes' ||
-        scenario === 'pixels' ||
-        scenario === 'pending' ||
-        scenario === 'stopping-image' ||
-        scenario === 'busy-image'
-      ) {
-        state = base();
-        state.target = {
-          kind: 'existing',
-          articleKey: id,
-          externalId: 'manual-' + id,
-          importId: id,
-          baseArticleRevision: 1,
-        };
-        state.draft.title = '已保存文章';
-        state.draft.blocks = [
-          { type: 'paragraph', blockKey: id, text: '前文😀' },
-          { type: 'image', blockKey: imageKey, imageToken: imageKey },
-          { type: 'paragraph', blockKey: lastKey, text: '后文' },
-        ];
-        state.images = [image()];
-        if (scenario === 'held-focus') {
-          state.draft.blocks[0].text = 'Alpha paragraph';
-          state.draft.blocks[2].text = 'Omega paragraph';
-        }
-        if (scenario === 'images') {
-          state.draft.blocks = Array.from({ length: 12 }, () => ({
-            type: 'image',
-            blockKey: crypto.randomUUID(),
-            imageToken: crypto.randomUUID(),
-          }));
-          state.images = state.draft.blocks.map((b: { imageToken: string }) =>
-            image(b.imageToken),
-          );
-        }
-        if (scenario === 'bytes' || scenario === 'pixels') {
-          state.draft.blocks = Array.from({ length: 6 }, () => ({
-            type: 'image',
-            blockKey: crypto.randomUUID(),
-            imageToken: crypto.randomUUID(),
-          }));
-          state.images = state.draft.blocks.map(
-            (b: { imageToken: string }) => ({
-              ...image(b.imageToken),
-              width: scenario === 'pixels' ? 5000 : 1,
-              height: scenario === 'pixels' ? 5000 : 1,
-              byteSize: scenario === 'bytes' ? 8 * 1024 * 1024 : png.length,
-            }),
-          );
-        }
-        if (scenario === 'pending' || scenario === 'stopping-image') {
-          state.draft.blocks[1] = {
-            type: 'image-pending',
-            blockKey: imageKey,
-            candidateId: imageKey,
-          };
-          state.images = [];
-          state.candidates = [
-            {
-              candidateId: imageKey,
-              blockKey: imageKey,
-              state: scenario === 'stopping-image' ? 'fetching' : 'failed',
-              retryable: scenario !== 'stopping-image',
-              reason:
-                scenario === 'stopping-image' ? undefined : 'IMAGE_NETWORK',
-            },
-          ];
-          if (scenario === 'stopping-image') {
-            state.dirty = true; // Canonical paste has already admitted new positions.
-            state.state = 'pasting';
-            state.jobId = lastKey;
-            state.operationKind = 'paste';
-            state.pasteProgress = {
-              jobId: lastKey,
-              kind: 'paste',
-              phase: 'images',
-              admitted: true,
-              current: 1,
-              total: 1,
-            };
-          }
-          Object.assign(window, {
-            fixtureReady: () => {
-              state = {
-                ...state,
-                revision: state.revision + 1,
-                images: [image()],
-                candidates: [],
-                draft: {
-                  ...state.draft,
-                  blocks: state.draft.blocks.map((b: { type: string }) =>
-                    b.type === 'image-pending'
-                      ? {
-                          type: 'image',
-                          blockKey: imageKey,
-                          imageToken: imageKey,
-                        }
-                      : b,
-                  ),
-                },
-              };
-              remember();
-            },
-          });
-        }
-        remember();
-      }
-      const api = {
-        getAppStatus: async () => ({
-          state: 'ready',
-          appVersion: '1',
-          schemaVersion: 14,
-        }),
-        getImportStatus: async () => ({ state: 'idle', revision: 0 }),
-        getDraftState: async () => ({
-          session: {
-            status: 'closed',
-            bindingToken: null,
-            storeName: null,
-            reason: null,
-          },
-          preparation: null,
-          task: null,
-        }),
-        listArticles: async () => ({
-          status: 'ok',
-          page: {
-            items: [],
-            totalCount: 0,
-            membershipRevision: 0,
-            pageNumber: 1,
-            totalPages: 1,
-          },
-        }),
-        getArticleDeclarations: async () => ({ status: 'ok', items: [] }),
-        setArticleDeclarations: async () => ({ status: 'unavailable' }),
-        startArticleImport: async () => ({ status: 'unavailable' }),
-        cancelArticleImport: async () => ({ state: 'idle', revision: 0 }),
-        getArticlePreview: async () => ({ status: 'not_found' }),
-        getArticleImage: async () => ({ status: 'not_found' }),
-        getManualArticleState: async () => remember(),
-        beginManualArticle: async () => {
-          state = base();
-          return reply();
-        },
-        // Legacy fixture lets RED reach the old UI, but any GREEN use fails.
-        updateManualDraft: async (
-          _s: string,
-          _r: number,
-          draft: ManualDraft,
-        ) => {
-          log('legacy', true);
-          state.draft = draft;
-          return reply();
-        },
-        applyManualEdit: async (c: DocumentCommand, draft: ManualDraft) => {
-          log('edits', draft);
-          ticket(c);
-          calls++;
-          if (scenario === 'slow') await new Promise((r) => setTimeout(r, 400));
-          if (scenario === 'sync-failure' && calls === 1)
-            throw Error('transport');
-          if (scenario === 'invalid-sync') return reply('invalid');
-          const answer = confirm(c, draft);
-          if (scenario === 'lost-edit' && calls === 1) throw Error('lost');
-          return answer;
-        },
-        spliceManualPaste: async (
-          c: DocumentCommand,
-          range: DraftRange,
-          input: {
-            html?: string;
-            plain?: string;
-            kind?: string;
-            grantId?: string;
-          },
-        ) => {
-          ticket(c);
-          log('pastes', { range, input });
-          if (scenario === 'held-focus')
-            await new Promise<void>((release) =>
-              Object.assign(window, { releaseOperation: release }),
-            );
-          if (scenario === 'rejected' || input.kind === 'internal')
-            return reply('invalid');
-          if (scenario === 'cancelled') {
-            state = {
-              ...state,
-              state: 'pasting',
-              jobId: lastKey,
-              operationKind: 'paste',
-              revision: state.revision + 1,
-            };
-            return reply('started');
-          }
-          const blocks = state.draft.blocks as ManualDraft['blocks'];
-          const ai = blocks.findIndex(
-              (b) => b.blockKey === range.anchor.blockKey,
-            ),
-            hi = blocks.findIndex((b) => b.blockKey === range.head.blockKey);
-          const a = blocks[ai],
-            h = blocks[hi];
-          const prefix =
-            a?.type === 'paragraph' && range.anchor.kind === 'text'
-              ? a.text.slice(0, range.anchor.offset)
-              : '';
-          const suffix =
-            h?.type === 'paragraph' && range.head.kind === 'text'
-              ? h.text.slice(range.head.offset)
-              : '';
-          const replacement = [
-            {
-              type: 'paragraph' as const,
-              blockKey:
-                a?.type === 'paragraph' && range.anchor.kind === 'text'
-                  ? a.blockKey
-                  : crypto.randomUUID(),
-              text: prefix + (input.plain ?? '') + suffix,
-            },
-          ];
-          const draft = {
-            ...state.draft,
-            blocks: [
-              ...blocks.slice(0, ai),
-              ...replacement,
-              ...blocks.slice(hi + 1),
-            ],
-          };
-          return confirm(c, draft);
-        },
-        insertManualImage: async (c: DocumentCommand, range: DraftRange) => {
-          ticket(c);
-          log('pickers', range);
-          if (scenario === 'cancel-picker') return reply();
-          state.images.push(image());
-          const blocks = state.draft.blocks;
-          const index = blocks.findIndex(
-            (b: { blockKey: string }) => b.blockKey === range.head.blockKey,
-          );
-          return confirm(c, {
-            ...state.draft,
-            blocks: [
-              ...blocks.slice(0, index + 1),
-              { type: 'image', blockKey: imageKey, imageToken: imageKey },
-              ...blocks.slice(index + 1),
-            ],
-          });
-        },
-        retryManualPasteImage: async (
-          retryCommand: {
-            sessionId: string;
-            expectedRevision: number;
-            commandId: string;
-          },
-          candidateId: string,
-        ) => {
-          if (scenario === 'stopping-image') {
-            if (
-              retryCommand.sessionId !== state.sessionId ||
-              retryCommand.expectedRevision !== state.revision ||
-              retryCommand.commandId !== state.nextPasteCommandId
-            )
-              throw Error('wrong retry ticket');
-            Reflect.get(window, 'fixtureReady')();
-          }
-          log('retries', candidateId);
-          if (scenario === 'lost-retry') {
-            Reflect.get(window, 'fixtureReady')();
-            throw Error('lost retry');
-          }
-          return reply();
-        },
-        cancelManualOperation: async () => {
-          if (scenario === 'stopping-image') {
-            state.candidates[0] = {
-              ...state.candidates[0],
-              state: 'cancelled',
-              retryable: true,
-              reason: 'CANCELLED',
-            };
-            delete state.pasteProgress;
-          }
-          state = {
-            ...state,
-            state: 'editing',
-            jobId: undefined,
-            operationKind: undefined,
-            revision: state.revision + 1,
-            result: { status: 'cancelled' },
-          };
-          return reply();
-        },
-        commitManualDocument: async (c: {
-          operationId: string;
-          expectedDocumentRevision: number;
-        }) => {
-          log('saves', c);
-          if (scenario === 'save-unknown') throw Error('unknown commit');
-          if (scenario === 'cleanup') {
-            state = {
-              ...state,
-              saveOutcome: {
-                kind: 'created',
-                articleKey: id,
-                articleRevision: 1,
-                operationId: c.operationId,
-              },
-              dirty: false,
-              result: {
-                status: 'failed',
-                code: 'RECOVERY_REQUIRED',
-                message: '文章已保存到本机，清理状态需要核对。',
-              },
-              issues: [{ message: '请关闭应用后核对' }],
-            };
-            return reply('unavailable');
-          }
-          if (c.expectedDocumentRevision !== state.documentRevision)
-            throw Error('stale save');
-          if (
-            !state.draft.title.trim() ||
-            state.draft.title !== state.draft.title.trim()
-          ) {
-            state.issues = [{ message: '请填写有效标题，保留原输入供修改。' }];
-            state.nextSaveOperationId = crypto.randomUUID();
-            return reply('invalid');
-          }
-          if (scenario === 'saving') {
-            state = {
-              ...state,
-              state: 'saving',
-              jobId: lastKey,
-              operationKind: 'save',
-              revision: state.revision + 1,
-            };
-            return reply('started');
-          }
-          state = {
-            ...state,
-            dirty: false,
-            revision: state.revision + 1,
-            target: {
-              kind: 'existing',
-              articleKey: id,
-              externalId: state.externalId,
-              importId: id,
-              baseArticleRevision: 2,
-            },
-            saveOutcome: {
-              kind: 'created',
-              articleKey: id,
-              articleRevision: 2,
-              operationId: c.operationId,
-            },
-            nextSaveOperationId: crypto.randomUUID(),
-          };
-          const answer = reply();
-          if (scenario === 'lost-save') throw Error('lost');
-          return answer;
-        },
-        getManualSaveResult: async (_s: string, operationId: string) => {
-          log('lookups', operationId);
-          if (scenario === 'save-unknown')
-            return { status: 'needs_review', operationId };
-          return { status: 'committed', receipt: { operationId } };
-        },
-        closeManualEditor: async (c: DocumentCommand, choice: string) => {
-          ticket(c);
-          log('closes', choice);
-          if (choice === 'discard')
-            state = { state: 'idle', revision: state.revision + 1 };
-          return reply();
-        },
-        copyManualSelection: async (
-          c: DocumentCommand,
-          range: DraftRange,
-          cut: boolean,
-        ) => {
-          ticket(c);
-          log('copies', { range, cut });
-          if (scenario === 'held-focus')
-            await new Promise<void>((release) =>
-              Object.assign(window, { releaseOperation: release }),
-            );
-          return reply();
-        },
-        onManualCloseRequest: (listener: typeof closeListener) => {
-          closeListener = listener;
-          return () => {
-            closeListener = undefined;
-          };
-        },
-        respondManualClose: async (
-          requestId: string,
-          sessionId: string,
-          documentRevision: number,
-          status: string,
-        ) => {
-          log('closeResponses', {
-            requestId,
-            sessionId,
-            documentRevision,
-            status,
-          });
-          return reply();
-        },
-        getManualImage: async (_s: string, token: string) => {
-          log('reads', token);
-          if (scenario === 'late-image')
-            await new Promise<void>((r) =>
-              Object.assign(window, { releaseImage: r }),
-            );
-          if (
-            scenario === 'busy-image' &&
-            JSON.parse(sessionStorage.getItem('reads') ?? '[]').length === 1
-          )
-            return { status: 'busy' };
-          const metadata = state.images.find(
-            (i: { imageToken: string }) => i.imageToken === token,
-          );
-          const bytes = new Uint8Array(metadata?.byteSize ?? png.length);
-          bytes.set(png);
-          Object.assign(window, {
-            lastReadPixels: (metadata?.width ?? 1) * (metadata?.height ?? 1),
-          });
-          return { status: 'ok', mime: 'image/png', bytes };
-        },
-      };
-      Object.assign(window, { desktopApi: api });
-      const create = URL.createObjectURL.bind(URL),
-        revoke = URL.revokeObjectURL.bind(URL);
-      let active = 0,
-        max = 0,
-        activeBytes = 0,
-        maxBytes = 0,
-        activePixels = 0,
-        maxPixels = 0;
-      const leases = new Map<string, { bytes: number; pixels: number }>();
-      URL.createObjectURL = (b) => {
-        if (!(b instanceof Blob)) throw Error('Editor previews must be Blobs');
-        active++;
-        max = Math.max(max, active);
-        activeBytes += b.size;
-        activePixels += Number(Reflect.get(window, 'lastReadPixels') ?? 1);
-        maxBytes = Math.max(maxBytes, activeBytes);
-        maxPixels = Math.max(maxPixels, activePixels);
-        const url = create(b);
-        leases.set(url, {
-          bytes: b.size,
-          pixels: Number(Reflect.get(window, 'lastReadPixels') ?? 1),
-        });
-        Object.assign(window, {
-          blobActive: active,
-          blobMax: max,
-          blobBytes: activeBytes,
-          blobMaxBytes: maxBytes,
-          blobPixels: activePixels,
-          blobMaxPixels: maxPixels,
-        });
-        return url;
-      };
-      URL.revokeObjectURL = (u) => {
-        active--;
-        const lease = leases.get(u)!;
-        activeBytes -= lease.bytes;
-        activePixels -= lease.pixels;
-        leases.delete(u);
-        Object.assign(window, { blobActive: active });
-        revoke(u);
-      };
-    },
-    { scenario },
-  );
-  await installCoverBridge(page);
-  await page.goto('http://localhost/');
-  if (
-    ![
-      'existing',
-      'held-focus',
-      'images',
-      'late-image',
-      'bytes',
-      'pixels',
-      'pending',
-      'stopping-image',
-      'busy-image',
-    ].includes(scenario)
-  )
-    await page.getByRole('button', { name: '新建文章', exact: true }).click();
-}
-async function logs(page: Page, name: string) {
-  return page.evaluate(
-    (name) => JSON.parse(sessionStorage.getItem(name) ?? '[]'),
-    name,
-  );
-}
-async function paste(page: Page, plain: string, html = '') {
-  await page.getByRole('textbox', { name: '文章正文', exact: true }).evaluate(
-    (el, { plain, html }) => {
-      const data = new DataTransfer();
-      data.setData('text/plain', plain);
-      data.setData('text/html', html);
-      el.dispatchEvent(
-        new ClipboardEvent('paste', {
-          clipboardData: data,
-          bubbles: true,
-          cancelable: true,
-        }),
-      );
-    },
-    { plain, html },
-  );
-}
-
+import type { DocumentCommand } from '../../src/contracts/manual-edit';
+import { test, expect } from '@playwright/test';
+import {
+  setupContinuousFixture,
+  mount,
+  logs,
+  paste,
+} from './continuous-editor-fixture';
+setupContinuousFixture();
 test('same_editor_new_and_existing and untouched new session remains clean', async ({
   page,
 }) => {
@@ -696,13 +16,15 @@ test('same_editor_new_and_existing and untouched new session remains clean', asy
   await expect(body).toBeEditable();
   await expect(page.getByRole('button', { name: /上移|下移/ })).toHaveCount(0);
   await expect(
-    page.getByRole('button', { name: '保存到文章池', exact: true }),
+    page.getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true }),
   ).toBeDisabled();
   expect(await logs(page, 'edits')).toHaveLength(0);
   await body.pressSequentially('自然正文😀');
   await page.getByLabel('文章标题', { exact: true }).fill('标题');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
-  await expect(page.getByText('已保存到文章池', { exact: true })).toBeVisible();
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
   await expect(body).toBeEditable();
   await body.pressSequentially('修改');
   await expect(body).toContainText('自然正文😀修改');
@@ -720,7 +42,10 @@ test('late_ack_preserves_selection and exact issued sequence after rejection', a
     offset: getSelection()?.anchorOffset,
     text: getSelection()?.anchorNode?.textContent,
   }));
-  await expect(page.getByText('输入已同步', { exact: true })).toBeVisible();
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
+  );
   const after = await page.evaluate(() => ({
     offset: getSelection()?.anchorOffset,
     text: getSelection()?.anchorNode?.textContent,
@@ -743,7 +68,10 @@ test('composition_and_emoji_roundtrip plus title composition flush on native clo
   await page.waitForTimeout(150);
   expect(await logs(page, 'edits')).toHaveLength(0);
   await body.dispatchEvent('compositionend');
-  await expect(page.getByText('输入已同步', { exact: true })).toBeVisible();
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
+  );
   await expect(body).toHaveText('校对😀中文');
   const title = page.getByLabel('文章标题', { exact: true });
   await title.dispatchEvent('compositionstart');
@@ -776,9 +104,7 @@ test('middle_splice_across_image preserves main range and one undo history event
   await expect(body).toContainText('后文');
   await expect(page.getByRole('img')).toHaveCount(1);
 });
-test('undo_image_after_save and mode_switch_preserves_doc', async ({
-  page,
-}) => {
+test('undo_image_after_save in unified editor', async ({ page }) => {
   await mount(page, 'existing');
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.click();
@@ -787,12 +113,8 @@ test('undo_image_after_save and mode_switch_preserves_doc', async ({
   await body.press('Backspace');
   await body.pressSequentially('删图后正文');
   await page.getByRole('button', { name: '保存修改', exact: true }).click();
-  await expect(
-    page.getByText('文章已保存到本机', { exact: true }),
-  ).toBeVisible();
-  await page.getByRole('button', { name: '手动录入', exact: true }).click();
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
   await expect(body).toContainText('删图后正文');
-  await page.getByRole('button', { name: '富文本粘贴', exact: true }).click();
   await body.press('Control+z');
   await expect(page.getByRole('img')).toHaveCount(1);
   await expect(body).toContainText('前文😀');
@@ -809,7 +131,10 @@ test('rejected paste preserves selection and next command uses exact new floor',
   await expect(body).toContainText('保留');
   await body.press('ArrowRight');
   await body.pressSequentially('后续');
-  await expect(page.getByText('输入已同步', { exact: true })).toBeVisible();
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
+  );
   expect(
     (await logs(page, 'commands')).map(
       (c: DocumentCommand) => c.clientSequence,
@@ -823,13 +148,23 @@ test('800x600_keyboard_reachable and dirty discard dialog', async ({
   await page.setViewportSize({ width: 800, height: 600 });
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.pressSequentially('键盘正文');
-  await page.getByRole('button', { name: '手动录入', exact: true }).click();
-  await page.getByRole('button', { name: '添加图片', exact: true }).focus();
+  await page.getByRole('button', { name: '插入图片', exact: true }).focus();
   await page.keyboard.press('Tab');
   await expect(
-    page.getByRole('button', { name: '保存到文章池', exact: true }),
+    page.getByRole('button', { name: '正文格式帮助', exact: true }),
   ).toBeFocused();
-  await page.getByRole('button', { name: '放弃录入', exact: true }).click();
+  await expect(
+    page.getByRole('tooltip').filter({ hasText: '加粗、斜体、下划线' }),
+  ).toBeVisible();
+  await page.keyboard.press('Tab');
+  await expect(page.getByLabel('文章标题', { exact: true })).toBeFocused();
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .focus();
+  await expect(
+    page.getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true }),
+  ).toBeFocused();
+  await page.getByRole('button', { name: '返回文章池', exact: true }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
   await page.keyboard.press('Shift+Tab');
   await expect(
@@ -846,11 +181,9 @@ test('800x600_keyboard_reachable and dirty discard dialog', async ({
   await expect(body).toContainText('键盘正文');
   const textBounds = await body.locator('p').first().boundingBox();
   const saveBounds = await page
-    .getByRole('button', { name: '保存到文章池', exact: true })
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
     .boundingBox();
-  expect(saveBounds!.y).toBeGreaterThanOrEqual(
-    textBounds!.y + textBounds!.height,
-  );
+  expect(saveBounds!.y + saveBounds!.height).toBeLessThanOrEqual(textBounds!.y);
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,
@@ -870,7 +203,10 @@ test('ready_patch_keeps_history and retained key restores a ready image after un
   await body.click();
   await body.press('Control+End');
   await body.pressSequentially('校对');
-  await expect(page.getByText('输入已同步', { exact: true })).toBeVisible();
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
+  );
   await page.evaluate(() => Reflect.get(window, 'fixtureReady')());
   await expect(page.getByRole('img')).toHaveCount(1);
   await body.press('Control+z');
@@ -900,7 +236,7 @@ test('visible_images_release_late_blobs and queued lightweight images load autom
   expect(
     await page.evaluate(() => Reflect.get(window, 'blobActive')),
   ).toBeGreaterThan(0);
-  await page.getByRole('button', { name: '结束编辑', exact: true }).click();
+  await page.getByRole('button', { name: '返回文章池', exact: true }).click();
   await expect
     .poll(() => page.evaluate(() => Reflect.get(window, 'blobActive')))
     .toBe(0);
@@ -934,12 +270,12 @@ for (const scenario of ['bytes', 'pixels'])
         await page.evaluate(() => Reflect.get(window, 'blobMax')),
       ).toBeLessThanOrEqual(2);
   });
-test('late image response after session close never creates an obsolete Blob', async ({
+test('late image response after hiding the retained session never creates an obsolete Blob', async ({
   page,
 }) => {
   await mount(page, 'late-image');
   await expect.poll(async () => (await logs(page, 'reads')).length).toBe(1);
-  await page.getByRole('button', { name: '结束编辑', exact: true }).click();
+  await page.getByRole('button', { name: '返回文章池', exact: true }).click();
   await expect(page.getByText('还没有文章', { exact: true })).toBeVisible();
   await page.evaluate(() => Reflect.get(window, 'releaseImage')());
   await page.waitForTimeout(100);
@@ -957,12 +293,16 @@ test('Enter, soft break and emoji keyboard edits roundtrip through main without 
   await body.pressSequentially('软换行');
   await body.press('Enter');
   await body.pressSequentially('第二');
-  await expect(page.getByText('输入已同步', { exact: true })).toBeVisible();
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
+  );
   const last = (await logs(page, 'edits')).at(-1);
-  expect(last.blocks.map((b: { text: string }) => b.text)).toEqual([
-    '第一😀\n软换行',
-    '第二',
-  ]);
+  expect(
+    last.blocks.map((b: { content: { text: string }[] }) =>
+      b.content.map((run) => run.text).join(''),
+    ),
+  ).toEqual(['第一😀\n软换行', '第二']);
   expect(
     new Set(last.blocks.map((b: { blockKey: string }) => b.blockKey)).size,
   ).toBe(2);
@@ -990,13 +330,33 @@ test('oversized title stays visible, never crosses bridge, and explicit discard 
   const title = page.getByLabel('文章标题', { exact: true });
   await title.fill('长'.repeat(513));
   await expect(page.getByRole('alert')).toContainText('超出');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
+  const body = page.getByRole('textbox', { name: '文章正文', exact: true });
+  await body.pressSequentially('正文仍保留');
+  await expect(body).toHaveText('正文仍保留');
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
   await expect(title).toHaveValue('长'.repeat(513));
   expect(await logs(page, 'edits')).toHaveLength(0);
   expect(await logs(page, 'saves')).toHaveLength(0);
-  await page.getByRole('button', { name: '放弃录入', exact: true }).click();
+  await title.fill('已修正标题');
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
+  );
+  expect((await logs(page, 'edits')).at(-1)).toMatchObject({
+    title: '已修正标题',
+    blocks: [{ content: [{ text: '正文仍保留' }] }],
+  });
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
+  await body.pressSequentially('新增未保存');
+
+  await page.getByRole('button', { name: '返回文章池', exact: true }).click();
   await page.getByRole('button', { name: '放弃修改', exact: true }).click();
-  await expect(page.getByText('还没有文章', { exact: true })).toBeVisible();
+  await expect(body).toHaveCount(0);
 });
 test('raw invalid title preserves body and history; corrected explicit title saves', async ({
   page,
@@ -1005,7 +365,9 @@ test('raw invalid title preserves body and history; corrected explicit title sav
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.pressSequentially('保留校对');
   await page.getByLabel('文章标题', { exact: true }).fill(' 标题 ');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
   await expect(
     page.getByRole('alert').filter({ hasText: '请填写有效标题' }),
   ).toBeVisible();
@@ -1014,10 +376,10 @@ test('raw invalid title preserves body and history; corrected explicit title sav
   );
   await expect(body).toContainText('保留校对');
   await page.getByLabel('文章标题', { exact: true }).fill('标题');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
-  await expect(
-    page.getByText('文章已保存到本机', { exact: true }),
-  ).toBeVisible();
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
   await body.press('Control+z');
   await expect(body).not.toContainText('保留校对');
 });
@@ -1029,8 +391,10 @@ test('lost edit and save responses query matching main results without automatic
   await body.pressSequentially('不会重放');
   await expect
     .poll(async () =>
-      page.evaluate(
-        () => Reflect.get(window, 'fixtureRead')().draft.blocks[0].text,
+      page.evaluate(() =>
+        Reflect.get(window, 'fixtureRead')()
+          .draft.blocks[0].content.map((run: { text: string }) => run.text)
+          .join(''),
       ),
     )
     .toBe('不会重放');
@@ -1048,10 +412,10 @@ test('lost save result queries operation receipt and never repeats commit', asyn
     .getByRole('textbox', { name: '文章正文' })
     .pressSequentially('正文');
   await page.getByLabel('文章标题', { exact: true }).fill('提交一次');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
-  await expect(
-    page.getByText('文章已保存到本机', { exact: true }),
-  ).toBeVisible();
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
   await expect
     .poll(async () => (await logs(page, 'lookups')).length)
     .toBeGreaterThan(0);
@@ -1097,7 +461,12 @@ test('active Copy flushes fresh input before sending the confirmed selection', a
   expect(copy.cut).toBe(false);
   expect(copy.range.anchor).toMatchObject({ kind: 'edge', side: 'before' });
   expect(copy.range.head).toMatchObject({ kind: 'edge', side: 'after' });
-  expect((await logs(page, 'edits')).at(-1).blocks[0].text).toBe('选择😀');
+  expect(
+    (await logs(page, 'edits'))
+      .at(-1)
+      .blocks[0].content.map((run: { text: string }) => run.text)
+      .join(''),
+  ).toBe('选择😀');
 });
 
 test('unknown commit remains frozen even when main state read still says editing', async ({
@@ -1107,7 +476,9 @@ test('unknown commit remains frozen even when main state read still says editing
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.pressSequentially('提交状态未知');
   await page.getByLabel('文章标题', { exact: true }).fill('标题');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
   await expect
     .poll(async () => (await logs(page, 'lookups')).length)
     .toBeGreaterThan(0);
@@ -1131,10 +502,13 @@ test('BODY composition holds CtrlS until final input and late ACK does not reloa
   expect(await logs(page, 'saves')).toHaveLength(0);
   await expect(body).toHaveText('校对😀中文');
   await body.dispatchEvent('compositionend');
-  await expect(
-    page.getByText('文章已保存到本机', { exact: true }),
-  ).toBeVisible();
-  expect((await logs(page, 'edits')).at(-1).blocks[0].text).toBe('校对😀中文');
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
+  expect(
+    (await logs(page, 'edits'))
+      .at(-1)
+      .blocks[0].content.map((run: { text: string }) => run.text)
+      .join(''),
+  ).toBe('校对😀中文');
   expect(await logs(page, 'saves')).toHaveLength(1);
 });
 test('TITLE composition holds CtrlS until final title after delayed input acknowledgement', async ({
@@ -1152,9 +526,7 @@ test('TITLE composition holds CtrlS until final title after delayed input acknow
   expect(await logs(page, 'saves')).toHaveLength(0);
   await title.fill('中文标题');
   await title.dispatchEvent('compositionend');
-  await expect(
-    page.getByText('文章已保存到本机', { exact: true }),
-  ).toBeVisible();
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
   expect((await logs(page, 'edits')).at(-1).title).toBe('中文标题');
 });
 test('saving and cleanup unknown freeze keyboard history and show committed local fact', async ({
@@ -1164,15 +536,15 @@ test('saving and cleanup unknown freeze keyboard history and show committed loca
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.pressSequentially('已保存正文');
   await page.getByLabel('文章标题', { exact: true }).fill('标题');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
-  await expect(
-    page.getByText('文章已保存到本机', { exact: true }),
-  ).toBeVisible();
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
   await expect(body).not.toBeEditable();
   await body.press('Control+z');
   await expect(body).toContainText('已保存正文');
   await expect(
-    page.getByRole('button', { name: '放弃录入', exact: true }),
+    page.getByRole('button', { name: '返回文章池', exact: true }),
   ).toBeDisabled();
 });
 test('save cancellation preserves body and resumes the same editor', async ({
@@ -1182,7 +554,9 @@ test('save cancellation preserves body and resumes the same editor', async ({
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.pressSequentially('正在保存');
   await page.getByLabel('文章标题', { exact: true }).fill('标题');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
+  await page
+    .getByRole('button', { name: /^(保存到本机|保存修改)$/, exact: true })
+    .click();
   await expect(body).not.toBeEditable();
   await page.getByRole('button', { name: '取消保存', exact: true }).click();
   await expect(body).toBeEditable();
@@ -1194,8 +568,7 @@ test('manual picker is optional and shares current body range and undo history',
   await mount(page);
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.pressSequentially('连续正文');
-  await page.getByRole('button', { name: '手动录入', exact: true }).click();
-  await page.getByRole('button', { name: '添加图片', exact: true }).click();
+  await page.getByRole('button', { name: '插入图片', exact: true }).click();
   await expect(page.getByRole('img')).toHaveCount(1);
   expect((await logs(page, 'pickers'))[0].anchor.offset).toBe(4);
   await body.press('Control+z');
@@ -1207,10 +580,9 @@ test('cancelled picker, busy preview, and retry only use the authorized current 
   page,
 }) => {
   await mount(page, 'cancel-picker');
-  await page.getByRole('button', { name: '手动录入', exact: true }).click();
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.pressSequentially('原正文');
-  await page.getByRole('button', { name: '添加图片', exact: true }).click();
+  await page.getByRole('button', { name: '插入图片', exact: true }).click();
   await expect(body).toContainText('原正文');
   await expect(page.getByRole('img')).toHaveCount(0);
   expect(await logs(page, 'pickers')).toHaveLength(1);
@@ -1265,7 +637,7 @@ test('paste budget rejects before bridge and external HTML never executes or ent
   ).toBeUndefined();
   await expect(body.locator('script, img[src^="https:"]')).toHaveCount(0);
 });
-test('failed input sync retains raw text through query and blocks mode switch until retry correction', async ({
+test('failed input sync retains raw text through query and confirms retry correction', async ({
   page,
 }) => {
   await mount(page, 'sync-failure');
@@ -1274,13 +646,16 @@ test('failed input sync retains raw text through query and blocks mode switch un
   await expect(page.getByRole('alert')).toContainText('未获确认');
   await expect(body).toContainText('输入保留');
   await body.pressSequentially('校对');
-  await page.getByRole('button', { name: '手动录入', exact: true }).click();
-  await expect(
-    page.getByRole('button', { name: '手动录入', exact: true }),
-  ).toHaveAttribute('aria-pressed', 'true');
-  expect((await logs(page, 'edits')).at(-1).blocks[0].text).toBe(
-    '输入保留校对',
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
   );
+  expect(
+    (await logs(page, 'edits'))
+      .at(-1)
+      .blocks[0].content.map((run: { text: string }) => run.text)
+      .join(''),
+  ).toBe('输入保留校对');
 });
 test('middle text paste leaves caret after inserted fragment and is separate from following typing history', async ({
   page,
@@ -1308,7 +683,10 @@ for (const action of ['save', 'close'] as const) {
     await page.getByLabel('文章标题', { exact: true }).fill('连续输入法');
     const body = page.getByRole('textbox', { name: '文章正文' });
     await body.pressSequentially('校对');
-    await expect(page.getByText('输入已同步', { exact: true })).toBeVisible();
+    await expect(page.locator('.editor-save-status')).toHaveAttribute(
+      'data-input-pending',
+      'false',
+    );
     const baseline = (await logs(page, 'edits')).length;
     await body.evaluate((el) =>
       Object.assign(window, { compositionEditorDOM: el }),
@@ -1340,7 +718,12 @@ for (const action of ['save', 'close'] as const) {
     await page.clock.runFor(1);
     const edits = await logs(page, 'edits');
     expect(edits).toHaveLength(baseline + 1);
-    expect(edits.at(-1).blocks[0].text).toBe('校对甲中文😀');
+    expect(
+      edits
+        .at(-1)
+        .blocks[0].content.map((run: { text: string }) => run.text)
+        .join(''),
+    ).toBe('校对甲中文😀');
     const commands = await logs(page, 'commands');
     const confirmedSequence = commands.at(-1).clientSequence;
     if (action === 'save') {
@@ -1376,7 +759,12 @@ test('a harmless same-session projection rerender preserves native caret before 
   const body = page.getByRole('textbox', { name: '文章正文' });
   await body.pressSequentially('abcd');
   await expect
-    .poll(async () => (await logs(page, 'edits')).at(-1)?.blocks[0].text)
+    .poll(async () =>
+      (await logs(page, 'edits'))
+        .at(-1)
+        ?.blocks[0].content.map((run: { text: string }) => run.text)
+        .join(''),
+    )
     .toBe('abcd');
   const before = await logs(page, 'edits');
   await body.evaluate((el) => {
@@ -1396,12 +784,11 @@ test('a harmless same-session projection rerender preserves native caret before 
     0,
   );
   // Model an ACK/projection rerender before ProseMirror observes the native Home selection.
-  // Programmatic click does not move focus; it changes only the existing input mode.
-  await page
-    .getByRole('button', { name: '手动录入', exact: true })
-    .dispatchEvent('click');
+  await page.evaluate(() =>
+    Reflect.get(window, 'fixturePatch')({ issues: [] }),
+  );
   await expect(
-    page.getByRole('button', { name: '添加图片', exact: true }),
+    page.getByRole('button', { name: '插入图片', exact: true }),
   ).toBeVisible();
   expect(
     await body.evaluate((el) => el === Reflect.get(window, 'sameEditorBody')),
@@ -1434,6 +821,9 @@ for (const kind of ['node', 'all', 'reversed'] as const)
     const body = page.getByRole('textbox', { name: '文章正文' });
     await expect(body).toBeEditable();
     await expect(page.getByRole('img')).toHaveCount(1);
+    // Focused-page navigation starts on the header. Native reverse selection
+    // begins in the body before extending its range, just like pointer selection.
+    if (kind === 'reversed') await body.focus();
     if (kind === 'node') await page.getByRole('img').click();
     else if (kind === 'all') await body.press('Control+a');
     else
@@ -1448,11 +838,11 @@ for (const kind of ['node', 'all', 'reversed'] as const)
             1,
           );
       });
-    await page
-      .getByRole('button', { name: '手动录入', exact: true })
-      .dispatchEvent('click');
+    await page.evaluate(() =>
+      Reflect.get(window, 'fixturePatch')({ issues: [] }),
+    );
     await expect(
-      page.getByRole('button', { name: '添加图片', exact: true }),
+      page.getByRole('button', { name: '插入图片', exact: true }),
     ).toBeVisible();
     if (kind === 'node')
       await expect(body.locator('.ProseMirror-selectednode')).toHaveCount(1);
@@ -1582,7 +972,10 @@ for (const operation of ['paste', 'copy'] as const) {
         'Checked Alpha paragraph',
         operation === 'paste' ? 'Omega paragraph pasted' : 'Omega paragraph',
       ]);
-      await expect(page.getByText('输入已同步', { exact: true })).toBeVisible();
+      await expect(page.locator('.editor-save-status')).toHaveAttribute(
+        'data-input-pending',
+        'false',
+      );
       const state = await page.evaluate(() =>
         Reflect.get(window, 'fixtureRead')(),
       );
@@ -1590,7 +983,9 @@ for (const operation of ['paste', 'copy'] as const) {
         {
           type: 'paragraph',
           blockKey: '11111111-1111-4111-8111-111111111111',
-          text: 'Checked Alpha paragraph',
+          content: [
+            { type: 'text', text: 'Checked Alpha paragraph', marks: [] },
+          ],
         },
         {
           type: 'image',
@@ -1600,10 +995,16 @@ for (const operation of ['paste', 'copy'] as const) {
         {
           type: 'paragraph',
           blockKey: '33333333-3333-4333-8333-333333333333',
-          text:
-            operation === 'paste'
-              ? 'Omega paragraph pasted'
-              : 'Omega paragraph',
+          content: [
+            {
+              type: 'text',
+              text:
+                operation === 'paste'
+                  ? 'Omega paragraph pasted'
+                  : 'Omega paragraph',
+              marks: [],
+            },
+          ],
         },
       ]);
     },
@@ -1656,7 +1057,7 @@ for (const destination of ['title', 'button', 'outside', 'tab'] as const) {
         await expect(title).toBeFocused();
       } else if (destination === 'button') {
         const button = page.getByRole('button', {
-          name: '新建文章',
+          name: '返回文章池',
           exact: true,
         });
         await button.focus();
@@ -1748,7 +1149,10 @@ test('ordinary refocus retains the prior caret across a projection before select
   await mount(page);
   const body = page.getByRole('textbox', { name: '文章正文', exact: true });
   await body.pressSequentially('abcd');
-  await expect(page.getByText('输入已同步', { exact: true })).toBeVisible();
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
+  );
   await page.getByLabel('文章标题', { exact: true }).focus();
   await page.clock.install();
   await page.clock.pauseAt(new Date());
@@ -1766,11 +1170,11 @@ test('ordinary refocus retains the prior caret across a projection before select
   });
   await body.focus();
   // No navigation occurred: a projection must not admit the browser's focus reset as user intent.
-  await page
-    .getByRole('button', { name: '手动录入', exact: true })
-    .dispatchEvent('click');
+  await page.evaluate(() =>
+    Reflect.get(window, 'fixturePatch')({ issues: [] }),
+  );
   await expect(
-    page.getByRole('button', { name: '添加图片', exact: true }),
+    page.getByRole('button', { name: '插入图片', exact: true }),
   ).toBeVisible();
   expect(
     await page.evaluate(() => ({
@@ -1839,4 +1243,99 @@ test('background body focus event cannot request focus from the foreground docum
   } finally {
     await foreground.close();
   }
+});
+
+test('rich V2 projection edits and explicitly saves the same nested document', async ({
+  page,
+}) => {
+  await mount(page, 'existing');
+  await page.evaluate(() => {
+    const state = Reflect.get(window, 'fixtureRead')();
+    const image = state.draft.blocks.find(
+      (b: { type: string }) => b.type === 'image',
+    );
+    Reflect.get(
+      window,
+      'fixturePatch',
+    )({
+      draft: {
+        ...state.draft,
+        blocks: [
+          {
+            type: 'heading',
+            blockKey: '44444444-4444-4444-8444-444444444444',
+            content: [{ type: 'text', text: '小标题😀', marks: ['bold'] }],
+          },
+          {
+            type: 'list',
+            kind: 'ordered',
+            start: 7,
+            blockKey: '55555555-5555-4555-8555-555555555555',
+            items: [
+              {
+                type: 'paragraph',
+                blockKey: '66666666-6666-4666-8666-666666666666',
+                content: [
+                  {
+                    type: 'text',
+                    text: '项目',
+                    marks: ['italic', 'underline'],
+                  },
+                ],
+              },
+            ],
+          },
+          image,
+          {
+            type: 'blockquote',
+            blockKey: '77777777-7777-4777-8777-777777777777',
+            paragraphs: [
+              {
+                type: 'paragraph',
+                blockKey: '88888888-8888-4888-8888-888888888888',
+                content: [{ type: 'text', text: '引用', marks: [] }],
+              },
+            ],
+          },
+        ],
+      },
+      dirty: true,
+    });
+  });
+  const body = page.getByRole('textbox', { name: '文章正文' });
+  await expect(body.locator('h2 strong')).toHaveText('小标题😀');
+  await expect(body.locator('ol')).toHaveAttribute('start', '7');
+  await expect(body.locator('ol em u,ol u em')).toHaveText('项目');
+  await expect(body.locator('blockquote p')).toHaveText('引用');
+  await expect(body.getByRole('img')).toHaveCount(1);
+  await body.locator('h2').click();
+  await page.keyboard.press('End');
+  await page.keyboard.insertText('校对');
+  await expect(page.locator('.editor-save-status')).toHaveAttribute(
+    'data-input-pending',
+    'false',
+  );
+  await page.getByRole('button', { name: '保存修改', exact: true }).click();
+  await expect(page.locator('.editor-save-status')).toHaveText('已保存到本机');
+  const state = await page.evaluate(() => Reflect.get(window, 'fixtureRead')());
+  expect(state.target).toMatchObject({
+    kind: 'existing',
+    articleKey: '11111111-1111-4111-8111-111111111111',
+  });
+  expect(state.draft.bodyVersion).toBe(2);
+  expect(state.draft.blocks[0]).toMatchObject({
+    type: 'heading',
+    content: [{ text: '小标题😀校对', marks: ['bold'] }],
+  });
+  expect(state.draft.blocks[1]).toMatchObject({
+    type: 'list',
+    start: 7,
+    items: [{ content: [{ text: '项目', marks: ['italic', 'underline'] }] }],
+  });
+  expect(state.draft.blocks[3]).toMatchObject({
+    type: 'blockquote',
+    paragraphs: [{ content: [{ text: '引用' }] }],
+  });
+  expect(state.dirty).toBe(false);
+  expect(await logs(page, 'legacy')).toEqual([]);
 });

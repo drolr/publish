@@ -208,3 +208,50 @@ it('allows complete associations for repeated body images beyond the distinct as
     }).success,
   ).toBe(true);
 });
+
+it('V2 image evidence uses top-level positions instead of the flattened compatibility projection', () => {
+  const task = makeDraftTask();
+  const assetKey = '55555555-5555-4555-8555-555555555555';
+  task.snapshot.article.body.push({ type: 'image', image_id: 'image' });
+  task.snapshot.article.assets.push({
+    assetKey,
+    imageId: 'image',
+    relativePath: task.articleKey + '/' + assetKey + '.png',
+    mime: 'image/png',
+    byteSize: 1,
+    width: 1,
+    height: 1,
+    sha256: 'a'.repeat(64),
+  });
+  task.snapshot = {
+    version: 2,
+    article: task.snapshot.article,
+    digest: 'a'.repeat(64),
+    editorBody: {
+      version: 2,
+      blocks: [
+        { type: 'paragraph', content: [] },
+        {
+          type: 'list',
+          kind: 'bullet',
+          items: [
+            {
+              type: 'paragraph',
+              content: [{ type: 'text', text: '仅用于离线测试。', marks: [] }],
+            },
+          ],
+        },
+        { type: 'image', imageId: 'image' },
+      ],
+    },
+  };
+  task.state = 'running';
+  task.stage = 'body';
+  task.possibleRemoteEffect = true;
+  task.evidence.images = [
+    { bodyIndex: 2, imageId: 'image', assetKey, resourceKey: 'b'.repeat(64) },
+  ];
+  expect(DraftTaskSchema.safeParse(task).success).toBe(true);
+  task.evidence.images[0].bodyIndex = 1;
+  expect(DraftTaskSchema.safeParse(task).success).toBe(false);
+});

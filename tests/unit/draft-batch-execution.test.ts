@@ -18,7 +18,7 @@ async function setup() {
   const reserved = h.tasks.reserve({
     taskId: randomUUID(),
     preparationId: randomUUID(),
-    snapshot: await h.snapshots.capture(article.article),
+    snapshot: await h.snapshots.capture(article),
     store: probe.store,
     expectedArticleRevision: article.articleRevision,
     expectedCoverRevision: cover.coverRevision,
@@ -31,17 +31,29 @@ async function setup() {
 it('executes a freshly reserved batch task through the same durable checkpoints once', async () => {
   const { h, task, generation } = await setup();
   h.control.pauseAt = 'none';
-  const result = await h.api.executeBatchTask(task.taskId, generation);
+  const result = await h.api.executeBatchTask(
+    task.taskId,
+    generation,
+    h.control.capabilities.revision,
+  );
   expect(result.state).toBe('draft_saved');
   expect(h.calls.filter((c) => c === 'save')).toHaveLength(1);
   await expect(
-    h.api.executeBatchTask(task.taskId, generation),
+    h.api.executeBatchTask(
+      task.taskId,
+      generation,
+      h.control.capabilities.revision,
+    ),
   ).rejects.toThrow();
   expect(h.calls.filter((c) => c === 'save')).toHaveLength(1);
 });
 it('rejects changed session generation before any batch remote action', async () => {
   const { h, task } = await setup();
-  const result = await h.api.executeBatchTask(task.taskId, randomUUID());
+  const result = await h.api.executeBatchTask(
+    task.taskId,
+    randomUUID(),
+    h.control.capabilities.revision,
+  );
   expect(result).toMatchObject({
     state: 'needs_human',
     reason: 'STALE_PREPARATION',
@@ -54,7 +66,11 @@ it('a stop while verifying a reserved snapshot prevents any batch remote action'
   h.control.verify = async () => {
     h.api.requestStop();
   };
-  const result = await h.api.executeBatchTask(task.taskId, generation);
+  const result = await h.api.executeBatchTask(
+    task.taskId,
+    generation,
+    h.control.capabilities.revision,
+  );
   expect(result).toMatchObject({
     state: 'stopped',
     possibleRemoteEffect: false,

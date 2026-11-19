@@ -1,5 +1,9 @@
+import { DraftContentCapabilitiesSchema } from '../contracts/draft-content';
+import { checkContentSupport } from '../domain/draft-content';
+import { snapshotImageCount } from '../contracts/draft-task';
 import {
   AdapterOutcomeSchema,
+  HandledTaskInputSchema,
   DraftAbsenceResultSchema,
   DraftViewSchema,
   ReasonCodeSchema,
@@ -13,6 +17,7 @@ import {
   type ReasonCode,
   type SessionProbe,
   type SessionView,
+  type StoreBinding,
   type TaskEvent,
   type TaskView,
   type TaskClosureProof,
@@ -30,7 +35,22 @@ import type {
 
 export interface DraftController extends DraftApi {
   /** Main/application only: executes an atomically linked, freshly queued task. */
-  executeBatchTask(taskId: string, generation: string): Promise<DraftTask>;
+  executeBatchTask(
+    taskId: string,
+    generation: string,
+    capabilityRevision: string,
+  ): Promise<DraftTask>;
+  releaseHandledTask(taskId: string): Promise<void>;
+  releaseHandledTaskForContinuation(
+    taskId: string,
+    cancelled: () => boolean,
+  ): ReturnType<DraftController['recoverBatchSession']>;
+  recoverBatchSession(
+    store: StoreBinding,
+  ): Promise<
+    | { status: 'ready'; generation: string; capabilityRevision: string }
+    | { status: 'blocked'; reason: ReasonCode }
+  >;
   requestStop(): void;
   /** Explicit user stop: close the owned browser, drain writers, retain results and release admission. */
   stopForRestart(): Promise<void>;
@@ -57,6 +77,7 @@ const localReasons = new Set<ReasonCode>([
 ]);
 
 export function createDraftController(deps: {
+  invalidateBrowserHealth(): void;
   tasks: DraftTaskRepository;
   preparation: DraftPreparation;
   snapshots: SnapshotPort;
@@ -93,6 +114,13 @@ export function createDraftController(deps: {
   let closing = false;
   let shutdown = false;
   let closeFlight: Promise<DraftCommandResult> | undefined;
+  // Cleanup owns a separate flight: drain must not wait for itself, while shutdown must.
+  let releaseFlight: Promise<unknown> | undefined;
+  let continuationFlight: Promise<unknown> | undefined;
+  // Never persisted: a restarted controller cannot offer an old live browser.
+  const liveBatchTasks = new Map<string, string>();
+  let offeredSession: Extract<SessionProbe, { status: 'ready' }> | undefined;
+  let openFlight: Promise<DraftCommandResult> | undefined;
   let epoch = 0;
   let browserBusy = false;
   let execution: Promise<void> | undefined;
@@ -221,6 +249,7 @@ export function createDraftController(deps: {
   function gateReason(): ReasonCode | undefined {
     if (storageFailed) return 'STORAGE_UNAVAILABLE';
     if (closing) return 'STOP_REQUESTED';
+    if (releaseFlight) return 'PLATFORM_BUSY';
     const gate = deps.gate();
     return gate === 'busy'
       ? 'PLATFORM_BUSY'
@@ -238,6 +267,7 @@ export function createDraftController(deps: {
     return promise;
   }
   function offered(probe: SessionProbe) {
+    offeredSession = probe.status === 'ready' ? probe : undefined;
     const old = session.bindingToken;
     session = deps.preparation.offer(probe);
     if (old !== session.bindingToken || probe.status === 'blocked') {
@@ -293,6 +323,13 @@ export function createDraftController(deps: {
     if (outcome.status === 'submission_recorded') {
       if (task.stopRequested || stopped.has(id)) {
         apply(id, {
+          type: 'evidence',
+          evidence: {
+            ...outcome.evidence,
+            submission: outcome.submission,
+          },
+        });
+        apply(id, {
           type: 'settle',
           state: 'needs_human',
           reason: 'STOP_REQUESTED',
@@ -322,8 +359,30 @@ export function createDraftController(deps: {
           : 'needs_human';
     apply(id, { type: 'settle', state, reason: outcome.reason });
   }
-  async function execute(task: DraftTask, operatorSubmissionReview = false) {
+  function capabilityMatches(expected: string, task: DraftTask): boolean {
     try {
+      const current = DraftContentCapabilitiesSchema.parse(
+        deps.platform.contentCapabilities(),
+      );
+      return (
+        current.revision === expected &&
+        (task.snapshot.version === 1 ||
+          checkContentSupport(task.snapshot.editorBody, current).ok)
+      );
+    } catch {
+      return false;
+    }
+  }
+  async function execute(
+    task: DraftTask,
+    capabilityRevision: string,
+    operatorSubmissionReview = false,
+  ) {
+    try {
+      if (!capabilityMatches(capabilityRevision, task)) {
+        settle(task.taskId, { status: 'blocked', reason: 'PAGE_CHANGED' });
+        return;
+      }
       const outcome = AdapterOutcomeSchema.parse(
         await deps.platform.execute(task, {
           ...(operatorSubmissionReview
@@ -337,6 +396,8 @@ export function createDraftController(deps: {
             }
           },
           checkpoint: async (stage) => {
+            if (!capabilityMatches(capabilityRevision, task))
+              throw Error('PAGE_CHANGED');
             assertEffect(task.taskId);
             apply(
               task.taskId,
@@ -409,10 +470,26 @@ export function createDraftController(deps: {
       if (browserBusy || execution) return result('PLATFORM_BUSY');
       const ticket = epoch;
       browserBusy = true;
+      let openingView: SessionView | undefined;
+      if (open) {
+        invalidate();
+        session = openingView = {
+          status: 'opening',
+          bindingToken: null,
+          storeName: null,
+          reason: null,
+        };
+      }
       try {
         const value = await probe(open);
-        if (ticket !== epoch || gateReason())
-          return result(gateReason() ?? 'STOP_REQUESTED');
+        if (ticket !== epoch || gateReason()) {
+          const reason = gateReason() ?? 'STOP_REQUESTED';
+          // Retire only this operation's projection. A newer lifecycle owner
+          // may already have replaced it while this probe was pending.
+          if (openingView && session === openingView)
+            session = { ...openingView, status: 'blocked', reason };
+          return result(reason);
+        }
         offered(value);
         return result(value.status === 'blocked' ? value.reason : undefined);
       } finally {
@@ -423,6 +500,7 @@ export function createDraftController(deps: {
   async function drain() {
     closing = true;
     epoch++;
+    deps.invalidateBrowserHealth();
     invalidate();
     try {
       const task = current();
@@ -441,6 +519,7 @@ export function createDraftController(deps: {
     shutdown = true;
     await drain();
     await closeFlight;
+    await releaseFlight;
   }
   async function closureProof(
     task: DraftTask,
@@ -564,11 +643,241 @@ export function createDraftController(deps: {
     /* no browser startup on recovery failure */
   }
 
+  function releaseHandledTask(taskId: string): Promise<void> {
+    if (releaseFlight) return Promise.reject(Error('PLATFORM_BUSY'));
+    const flight = (async () => {
+      const task = get(StorageIdSchema.parse(taskId));
+      const selected = current();
+      if (
+        !task ||
+        selected?.taskId !== taskId ||
+        ![
+          'needs_human',
+          'interrupted',
+          'failed',
+          'stopped',
+          'stopped_by_user',
+        ].includes(task.state)
+      )
+        throw Error('INPUT_UNSUPPORTED');
+      await stopForRestart(taskId);
+      if (get(taskId)?.state !== 'stopped_by_user')
+        throw Error('RESULT_AMBIGUOUS');
+    })();
+    releaseFlight = flight;
+    void flight.then(
+      () => {
+        if (releaseFlight === flight) releaseFlight = undefined;
+      },
+      () => {
+        if (releaseFlight === flight) releaseFlight = undefined;
+      },
+    );
+    return flight;
+  }
+  function releaseHandledTaskForContinuation(
+    taskId: string,
+    cancelled: () => boolean,
+  ): ReturnType<DraftController['recoverBatchSession']> {
+    const blocked = (reason: ReasonCode) => ({
+      status: 'blocked' as const,
+      reason,
+    });
+    if (releaseFlight) return Promise.resolve(blocked('PLATFORM_BUSY'));
+    const reason = gateReason();
+    if (reason) return Promise.resolve(blocked(reason));
+    const flight = (async () => {
+      try {
+        const task = get(StorageIdSchema.parse(taskId));
+        const generation = liveBatchTasks.get(taskId);
+        if (
+          !task ||
+          current()?.taskId !== taskId ||
+          !generation ||
+          ![
+            'needs_human',
+            'interrupted',
+            'failed',
+            'stopped',
+            'stopped_by_user',
+          ].includes(task.state)
+        )
+          return blocked('INPUT_UNSUPPORTED');
+        if (!deps.platform.returnHomeAfterHandledTask)
+          return blocked('INPUT_UNSUPPORTED');
+        if (cancelled()) return blocked('STOP_REQUESTED');
+        // Capture synchronously at the explicit skip boundary, before stop/drain
+        // can deliver another response. The capability holds no execution grant.
+        const continueHandled = deps.platform.captureHandledTaskContinuation
+          ? deps.platform.captureHandledTaskContinuation(task)
+          : (cancelled: () => boolean) =>
+              deps.platform.returnHomeAfterHandledTask!(task, cancelled);
+        // Task-local quiesce. Do not invalidate browser health or call drain:
+        // the main health invalidator retires the actual browser generation.
+        closing = true;
+        const ticket = ++epoch;
+        invalidate();
+        stopped.add(taskId);
+        if (!terminal(task) && !task.stopRequested)
+          apply(taskId, { type: 'stop' });
+        const isCancelled = () => cancelled() || shutdown || epoch !== ticket;
+        await Promise.allSettled([...pending]);
+        await execution;
+        await closeFlight;
+        if (storageFailed) return blocked('STORAGE_UNAVAILABLE');
+        if (isCancelled()) return blocked('STOP_REQUESTED');
+        const settled = get(taskId);
+        if (
+          !settled ||
+          current()?.taskId !== taskId ||
+          ![
+            'needs_human',
+            'interrupted',
+            'failed',
+            'stopped',
+            'stopped_by_user',
+          ].includes(settled.state)
+        )
+          return blocked('RESULT_AMBIGUOUS');
+        const value = SessionProbeSchema.parse(
+          await continueHandled(isCancelled),
+        );
+        if (isCancelled()) return blocked('STOP_REQUESTED');
+        if (value.status === 'blocked') return blocked(value.reason);
+        if (value.generation !== generation) return blocked('PAGE_CHANGED');
+        if (!sameStore(settled, value)) return blocked('STORE_CHANGED');
+        // A successful late result must never be overwritten by manual release.
+        const fresh = get(taskId);
+        if (
+          !fresh ||
+          current()?.taskId !== taskId ||
+          ![
+            'needs_human',
+            'interrupted',
+            'failed',
+            'stopped',
+            'stopped_by_user',
+          ].includes(fresh.state)
+        )
+          return blocked('RESULT_AMBIGUOUS');
+        if (fresh.state !== 'stopped_by_user')
+          apply(taskId, { type: 'release-after-stop' });
+        offered(value);
+        return {
+          status: 'ready' as const,
+          generation,
+          capabilityRevision: deps.platform.contentCapabilities().revision,
+        };
+      } catch (error) {
+        const parsed =
+          error instanceof Error
+            ? ReasonCodeSchema.safeParse(error.message)
+            : undefined;
+        return blocked(
+          storageFailed
+            ? 'STORAGE_UNAVAILABLE'
+            : parsed?.success
+              ? parsed.data
+              : 'RESULT_AMBIGUOUS',
+        );
+      } finally {
+        closing = shutdown;
+      }
+    })();
+    releaseFlight = flight;
+    continuationFlight = flight;
+    void flight.finally(() => {
+      if (releaseFlight === flight) releaseFlight = undefined;
+      if (continuationFlight === flight) continuationFlight = undefined;
+    });
+    return flight;
+  }
+  async function stopForRestart(expectedTaskId?: string) {
+    const drained = drain();
+    try {
+      try {
+        await deps.platform.closeSession();
+      } catch {
+        throw Error('BROWSER_UNAVAILABLE');
+      }
+      await drained;
+      await closeFlight;
+      if (storageFailed) throw Error('STORAGE_UNAVAILABLE');
+      const task = current();
+      if (expectedTaskId && task?.taskId !== expectedTaskId)
+        throw Error('INPUT_UNSUPPORTED');
+      if (
+        task &&
+        (!terminal(task) || ['failed', 'stopped'].includes(task.state))
+      )
+        apply(task.taskId, { type: 'release-after-stop' });
+      session = {
+        status: 'closed',
+        bindingToken: null,
+        storeName: null,
+        reason: null,
+      };
+    } finally {
+      await drained;
+      closing = shutdown;
+    }
+  }
   return {
-    executeBatchTask: (taskId, generation) =>
+    releaseHandledTask,
+    releaseHandledTaskForContinuation,
+    async finishHandledTask(input) {
+      const parsed = HandledTaskInputSchema.safeParse(input);
+      if (!parsed.success) return result('INPUT_UNSUPPORTED');
+      const reason = gateReason();
+      if (reason) return result(reason);
+      const task = get(parsed.data.taskId);
+      if (!task || task.revision !== parsed.data.expectedRevision)
+        return result('STALE_PREPARATION');
+      try {
+        await releaseHandledTask(task.taskId);
+        return result();
+      } catch (error) {
+        return closureError(error);
+      }
+    },
+    recoverBatchSession: (store) =>
+      track(async () => {
+        const reason = gateReason();
+        if (reason) return { status: 'blocked', reason };
+        if (browserBusy || execution || current()?.holdsPlatform)
+          return { status: 'blocked', reason: 'PLATFORM_BUSY' };
+        browserBusy = true;
+        const ticket = epoch;
+        try {
+          const value = await probe(true);
+          if (ticket !== epoch || gateReason())
+            return {
+              status: 'blocked',
+              reason: gateReason() ?? 'STOP_REQUESTED',
+            };
+          offered(value);
+          if (value.status === 'blocked') return value;
+          if (!sameStore({ store }, value))
+            return { status: 'blocked', reason: 'STORE_CHANGED' };
+          return {
+            status: 'ready',
+            generation: value.generation,
+            capabilityRevision: deps.platform.contentCapabilities().revision,
+          };
+        } finally {
+          browserBusy = false;
+        }
+      }),
+    executeBatchTask: (taskId, generation, capabilityRevision) =>
       track(async () => {
         const task = get(StorageIdSchema.parse(taskId));
-        if (!task || task.state !== 'queued' || browserBusy || execution)
+        if (
+          !task ||
+          task.state !== 'queued' ||
+          current()?.taskId !== taskId ||
+          browserBusy ||
+          execution
+        )
           throw Error('Batch task is not newly reserved');
         const ticket = epoch;
         browserBusy = true;
@@ -577,9 +886,26 @@ export function createDraftController(deps: {
           return get(taskId)!;
         };
         try {
+          if (!capabilityMatches(capabilityRevision, task))
+            return block('PAGE_CHANGED');
           const reason = gateReason();
           if (reason || isStopped(taskId))
             return block(reason ?? 'STOP_REQUESTED');
+          // Reserve has already linked this exact queued task. Bind its original
+          // ready session before a fresh probe can pause for manual login.
+          if (!offeredSession || offeredSession.generation !== generation)
+            return block('STALE_PREPARATION');
+          if (!sameStore(task, offeredSession)) return block('STORE_CHANGED');
+          try {
+            deps.platform.bindTaskForContinuation?.(task, generation);
+            liveBatchTasks.set(taskId, generation);
+          } catch (error) {
+            const parsed =
+              error instanceof Error
+                ? ReasonCodeSchema.safeParse(error.message)
+                : undefined;
+            return block(parsed?.success ? parsed.data : 'PAGE_CHANGED');
+          }
           if (
             deps.controlledPilot &&
             task.store.identity.value !== deps.controlledPilot.storeIdentity
@@ -615,12 +941,14 @@ export function createDraftController(deps: {
           if (last.generation !== generation) return block('STALE_PREPARATION');
           const finalGate = gateReason();
           if (finalGate) return block(finalGate);
+          if (!capabilityMatches(capabilityRevision, task))
+            return block('PAGE_CHANGED');
           const runningTask = apply(taskId, { type: 'begin' });
           invalidate();
           // Retire consumed summaries, then retain the just-verified session
           // under a fresh binding for the next article. No extra browser probe.
           offered(last);
-          const running = execute(runningTask, true);
+          const running = execute(runningTask, capabilityRevision, true);
           execution = running;
           try {
             await running;
@@ -634,6 +962,7 @@ export function createDraftController(deps: {
       }),
     requestStop() {
       epoch++;
+      deps.invalidateBrowserHealth();
       invalidate();
       const task = current();
       if (task && !terminal(task)) {
@@ -642,7 +971,8 @@ export function createDraftController(deps: {
           apply(task.taskId, { type: 'stop' });
       }
     },
-    isActive: () => !!execution || !!closeFlight || pending.size > 0,
+    isActive: () =>
+      !!execution || !!closeFlight || !!releaseFlight || pending.size > 0,
     isBlocked: () => {
       try {
         return storageFailed || closing || !!current()?.holdsPlatform;
@@ -652,30 +982,19 @@ export function createDraftController(deps: {
     },
     stopAndWait,
     async stopForRestart() {
-      // Closing admission is synchronous. Closing the owned session also interrupts
-      // a pending browser operation; never release a task while its writer is alive.
-      const drained = drain();
-      try {
-        await deps.platform.closeSession();
-        await drained;
-        await closeFlight;
-        if (storageFailed) throw Error('Storage unavailable');
-        const task = current();
-        if (
-          task &&
-          (!terminal(task) || ['failed', 'stopped'].includes(task.state))
-        )
-          apply(task.taskId, { type: 'release-after-stop' });
-        session = {
-          status: 'closed',
-          bindingToken: null,
-          storeName: null,
-          reason: null,
-        };
-      } finally {
-        await drained;
-        closing = shutdown;
+      const continuation = !!continuationFlight;
+      if (releaseFlight) {
+        // A real stop interrupts a live handoff synchronously, then still owns
+        // normal browser closing. Legacy finish already owns its own close.
+        if (continuation) {
+          epoch++;
+          deps.invalidateBrowserHealth();
+          invalidate();
+        }
+        await releaseFlight;
+        if (!continuation) return;
       }
+      await stopForRestart();
     },
     prepareTaskClosure: (taskId) =>
       track(async () => {
@@ -775,7 +1094,20 @@ export function createDraftController(deps: {
         }
       }),
     getDraftState: async () => view(),
-    openDraftSession: () => sessionCommand(true),
+    openDraftSession: () => {
+      if (openFlight) return openFlight;
+      const flight = sessionCommand(true);
+      openFlight = flight;
+      void flight.then(
+        () => {
+          if (openFlight === flight) openFlight = undefined;
+        },
+        () => {
+          if (openFlight === flight) openFlight = undefined;
+        },
+      );
+      return flight;
+    },
     checkDraftSession: () => sessionCommand(false),
     closeDraftSession: () => {
       if (closeFlight) return closeFlight;
@@ -860,10 +1192,7 @@ export function createDraftController(deps: {
             preparation.title !== prepared.snapshot.article.title ||
             preparation.contentDeclaration !==
               prepared.snapshot.article.contentDeclaration ||
-            preparation.bodyImageCount !==
-              prepared.snapshot.article.body.filter(
-                (block) => block.type === 'image',
-              ).length
+            preparation.bodyImageCount !== snapshotImageCount(prepared.snapshot)
           )
             return result('STALE_PREPARATION');
           if (
@@ -944,7 +1273,7 @@ export function createDraftController(deps: {
             offered(finalProbe);
             // Both normal single and batch entries use operator review when the
             // production page capability supports it. No remote list gate.
-            const running = execute(task, true);
+            const running = execute(task, prepared.capabilityRevision, true);
             execution = running;
             void running.finally(() => {
               if (execution === running) execution = undefined;
@@ -960,6 +1289,7 @@ export function createDraftController(deps: {
     stopDraft: async (taskId) => {
       closure = undefined;
       epoch++;
+      deps.invalidateBrowserHealth();
       // The in-memory stop is synchronous and precedes all storage or awaits.
       stopped.add(taskId);
       try {

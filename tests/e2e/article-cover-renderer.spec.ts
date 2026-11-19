@@ -1,5 +1,19 @@
 import { test, expect, type Page } from '@playwright/test';
-import { mount, body } from './article-workspace-fixture';
+import { mount as mountEditor, body } from './article-workspace-fixture';
+async function returnToPool(page: Page) {
+  const back = page.getByRole('button', { name: '返回文章池', exact: true });
+  if (await back.isVisible()) await back.click();
+}
+async function mount(...args: Parameters<typeof mountEditor>) {
+  await mountEditor(...args);
+  await returnToPool(args[0]);
+}
+async function edit(page: Page) {
+  if (!(await body(page).isVisible()))
+    await page.getByRole('button', { name: /文章1 文章编号/ }).click();
+  await expect(body(page)).toBeEditable();
+}
+
 const cover = (p: Page) => p.getByRole('region', { name: '封面图片' });
 test('stop while cover leave is reading prevents late selection and editor handover', async ({
   page,
@@ -67,12 +81,12 @@ test('stop while cover leave is reading prevents late selection and editor hando
     page.getByRole('dialog', { name: '离开封面编辑？' }),
   ).not.toBeVisible();
 });
-test('stop during handover composition wait prevents late commit and close', async ({
+test('stop during save-and-return composition wait prevents late commit and close', async ({
   page,
 }) => {
   test.setTimeout(20000);
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
   await body(page).fill('停止时保留的修改');
   await page.evaluate(() => {
     Object.assign(window, { lateHandoverCalls: [] });
@@ -93,7 +107,7 @@ test('stop during handover composition wait prevents late commit and close', asy
       }),
     });
   });
-  await page.getByRole('button', { name: '检查登录状态', exact: true }).click();
+  await returnToPool(page);
   const dialog = page.getByRole('dialog', { name: '离开当前编辑？' });
   await expect(dialog).toBeVisible();
   await body(page).dispatchEvent('compositionstart');
@@ -106,7 +120,7 @@ test('stop during handover composition wait prevents late commit and close', asy
     .click();
   await body(page).dispatchEvent('compositionend');
   await expect(
-    page.getByRole('button', { name: '检查登录状态', exact: true }),
+    page.getByRole('button', { name: '返回文章池', exact: true }),
   ).toBeEnabled();
   await expect(body(page)).toHaveText('停止时保留的修改');
   await expect
@@ -159,7 +173,8 @@ test('stop bypasses pending browser command and waits for actual settlement', as
   page,
 }) => {
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
+  await returnToPool(page);
   await page.evaluate(() => {
     let stopped = false,
       settled = false,
@@ -206,11 +221,11 @@ test('stop bypasses pending browser command and waits for actual settlement', as
     '已停止并释放占用',
   );
 });
-test('stop cancels pending dirty editor handover without discarding text or opening browser', async ({
+test('stop cancels dirty return without discarding text or reaching browser controls', async ({
   page,
 }) => {
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
   await body(page).fill('保留此未保存正文');
   await page.evaluate(() => {
     Object.assign(window, { stopBrowserCalls: 0 });
@@ -226,7 +241,7 @@ test('stop cancels pending dirty editor handover without discarding text or open
       }),
     });
   });
-  await page.getByRole('button', { name: '检查登录状态', exact: true }).click();
+  await returnToPool(page);
   const dialog = page.getByRole('dialog', { name: '离开当前编辑？' });
   await expect(dialog).toBeVisible();
   await dialog
@@ -245,7 +260,8 @@ test('browser control completes clean editor handover before invoking main', asy
   page,
 }) => {
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
+  await returnToPool(page);
   await page.evaluate(() => {
     const check = window.desktopApi.checkDraftSession;
     Object.assign(window.desktopApi, {
@@ -264,10 +280,11 @@ test('browser control completes clean editor handover before invoking main', asy
     .toBe('idle');
 });
 
-test('browser control preserves dirty editor when operator keeps editing', async ({
+test('dirty return preserves editor before browser controls become reachable', async ({
   page,
 }) => {
   await mount(page);
+  await edit(page);
   await body(page).fill('本机未保存的修改');
   await page.evaluate(() => {
     Object.assign(window, { browserControlCalls: 0 });
@@ -283,7 +300,7 @@ test('browser control preserves dirty editor when operator keeps editing', async
       },
     });
   });
-  await page.getByRole('button', { name: '检查登录状态', exact: true }).click();
+  await returnToPool(page);
   const dialog = page.getByRole('dialog', { name: '离开当前编辑？' });
   await expect(dialog).toBeVisible();
   await dialog.getByRole('button', { name: '继续编辑', exact: true }).click();
@@ -315,6 +332,7 @@ for (const fault of [
         let request:
           | import('../../src/contracts/article-cover').CoverSaveCommand
           | undefined;
+        const lookups: string[] = [];
         let fixed = false,
           writes = 0;
         Object.assign(window, {
@@ -323,6 +341,8 @@ for (const fault of [
               fixed = true;
             },
             writes: () => writes,
+            lookups: () => [...lookups],
+            operationId: () => request?.operationId,
           },
         });
         Object.assign(window.desktopApi, {
@@ -333,17 +353,20 @@ for (const fault of [
             writes++;
             throw Error('lost result');
           },
-          getCoverSaveResult: async (id: string) => ({
-            status:
-              !fixed &&
-              ['pending', 'not_started', 'needs_review'].includes(fault)
-                ? fault
-                : 'failed',
-            operationId:
-              !fixed && fault === 'operation'
-                ? '00000000-0000-4000-8000-000000000999'
-                : id,
-          }),
+          getCoverSaveResult: async (id: string) => {
+            lookups.push(id);
+            return {
+              status:
+                !fixed &&
+                ['pending', 'not_started', 'needs_review'].includes(fault)
+                  ? fault
+                  : 'failed',
+              operationId:
+                !fixed && fault === 'operation'
+                  ? '00000000-0000-4000-8000-000000000999'
+                  : id,
+            };
+          },
           getCoverEditState: async () => {
             const state = await read();
             if (!request || fixed || !('sessionId' in state)) return state;
@@ -398,12 +421,22 @@ for (const fault of [
         await page.evaluate(() => Reflect.get(window, 'failedProbe').writes()),
       ).toBe(1);
       await page.evaluate(() => Reflect.get(window, 'failedProbe').fix());
-      await cover(page)
-        .getByRole('button', { name: '核对封面保存结果', exact: true })
-        .click();
+      // The existing background receipt poll can settle before another click.
+      // Assert its canonical release instead of racing a removed reconcile button.
       await expect(
         cover(page).getByRole('button', { name: '保存封面', exact: true }),
       ).toBeEnabled();
+      const proof = await page.evaluate(() => {
+        const fixture = Reflect.get(window, 'failedProbe');
+        return {
+          writes: fixture.writes(),
+          lookups: fixture.lookups(),
+          operationId: fixture.operationId(),
+        };
+      });
+      expect(proof.writes).toBe(1);
+      expect(proof.lookups.length).toBeGreaterThan(0);
+      expect([...new Set(proof.lookups)]).toEqual([proof.operationId]);
     },
   );
 for (const transport of ['rejected', 'hung'])
@@ -487,6 +520,7 @@ for (const transport of ['rejected', 'hung'])
     },
   );
 async function begin(p: Page) {
+  await returnToPool(p);
   await p.getByRole('button', { name: '编辑封面', exact: true }).click();
   await expect(
     cover(p).getByRole('radio', { name: '单图', exact: true }),
@@ -497,15 +531,16 @@ async function pick(p: Page) {
     .getByRole('button', { name: '从本地选择封面', exact: true })
     .click();
 }
-test('new article must save formally before cover editing', async ({
+test('unsaved focused article keeps cover admission unreachable until formal save', async ({
   page,
 }) => {
   await mount(page);
   await page.getByRole('button', { name: '新建文章', exact: true }).click();
-  await expect(cover(page)).toContainText('请先将文章保存到本机，再配置封面');
+  await expect(body(page)).toBeEditable();
+  await expect(cover(page)).toBeHidden();
   await expect(
     cover(page).getByRole('button', { name: '编辑封面', exact: true }),
-  ).toBeDisabled();
+  ).toHaveCount(0);
 });
 test('single first edit default and triple needs exactly three with numbered keyboard controls', async ({
   page,
@@ -587,26 +622,28 @@ for (const choice of ['继续编辑', '放弃修改', '保存并继续'])
       await expect(cover(page).getByRole('img')).toHaveCount(1);
     else {
       await expect(page.getByLabel('文章标题')).toHaveValue('文章2');
+      await returnToPool(page);
       await expect(cover(page)).toContainText('未配置封面');
     }
   });
-test('body must settle explicitly before cover begins and continue preserves content', async ({
+test('dirty return must settle explicitly before cover begins and continue preserves content', async ({
   page,
 }) => {
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
   await body(page).fill('未保存正文');
-  await page.getByRole('button', { name: '编辑封面', exact: true }).click();
+  await returnToPool(page);
   await page
     .getByRole('dialog', { name: '离开当前编辑？' })
     .getByRole('button', { name: '继续编辑', exact: true })
     .click();
   await expect(body(page)).toHaveText('未保存正文');
-  await page.getByRole('button', { name: '编辑封面', exact: true }).click();
+  await returnToPool(page);
   await page
     .getByRole('dialog', { name: '离开当前编辑？' })
     .getByRole('button', { name: '保存并继续', exact: true })
     .click();
+  await begin(page);
   await expect(
     cover(page).getByRole('radio', { name: '单图', exact: true }),
   ).toBeChecked();
@@ -652,9 +689,10 @@ test('stored cover reopen remains visible while body editing does not overwrite 
     .getByRole('button', { name: '完成封面编辑', exact: true })
     .click();
   await page.getByRole('button', { name: /文章1 文章编号/ }).click();
-  await expect(body(page)).toBeEditable();
+  await edit(page);
   await body(page).fill('修改后正文');
   await page.getByRole('button', { name: '保存修改', exact: true }).click();
+  await returnToPool(page);
   await expect(cover(page).getByRole('img')).toHaveCount(1);
   await expect(cover(page)).toContainText('单图');
 });
@@ -673,6 +711,7 @@ test('late preview different article never creates stray blobs and transfers are
     .click();
   await expect(page.getByLabel('文章标题')).toHaveValue('文章2');
   await page.evaluate(() => Reflect.get(window, 'releaseCoverImage')());
+  await returnToPool(page);
   await expect(cover(page).getByRole('img')).toHaveCount(0);
   await expect
     .poll(() =>
@@ -725,7 +764,8 @@ for (const phase of [
     'body result remains independent of cover ' + phase,
     async ({ page }) => {
       await mount(page);
-      await expect(body(page)).toBeEditable();
+      await edit(page);
+      await returnToPool(page);
       await page.evaluate((phase) => {
         const task = {
           taskId: '33333333-3333-4333-8333-333333333333',
@@ -845,7 +885,8 @@ test('formal new-article save enables cover and newly saved none remains none on
   await page.getByRole('button', { name: '新建文章', exact: true }).click();
   await page.getByLabel('文章标题').fill('新建正式文章');
   await body(page).fill('新建正文');
-  await page.getByRole('button', { name: '保存到文章池', exact: true }).click();
+  await page.getByRole('button', { name: '保存到本机', exact: true }).click();
+  await returnToPool(page);
   await expect(
     cover(page).getByRole('button', { name: '编辑封面', exact: true }),
   ).toBeEnabled();
@@ -871,7 +912,8 @@ test('live canonical platform task disables cover admission but stop remains rea
   page,
 }) => {
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
+  await returnToPool(page);
   await expect(
     cover(page).getByRole('button', { name: '编辑封面', exact: true }),
   ).toBeEnabled();
@@ -926,7 +968,8 @@ for (const mode of ['single', 'triple'] as const)
       ' after an enabled none baseline',
     async ({ page }) => {
       await mount(page);
-      await expect(body(page)).toBeEditable();
+      await edit(page);
+      await returnToPool(page);
       await page.evaluate(() => {
         const get = window.desktopApi.getDraftState;
         const prepare = window.desktopApi.prepareDraft;
@@ -1106,17 +1149,20 @@ for (const notice of ['conflict', 'blocked'] as const)
       ).toBeVisible();
     },
   );
-test('human body decision does not start a cover command timeout or submit twice', async ({
+test('human dirty-return decision does not start a cover command timeout or submit twice', async ({
   page,
 }) => {
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
   await body(page).fill('等待人工决定的正文');
-  await page.getByRole('button', { name: '编辑封面', exact: true }).click();
+  await returnToPool(page);
   const d = page.getByRole('dialog', { name: '离开当前编辑？' });
   await expect(d).toBeVisible();
   await page.waitForTimeout(3300);
-  await expect(cover(page)).not.toContainText('状态待核对');
+  expect(
+    await page.evaluate(() => window.desktopApi.getCoverEditState()),
+  ).toMatchObject({ status: 'idle' });
+  await expect(page.getByText('状态待核对', { exact: false })).toHaveCount(0);
   expect(
     await page.evaluate(
       () =>
@@ -1128,7 +1174,7 @@ test('human body decision does not start a cover command timeout or submit twice
   await d.getByRole('button', { name: '继续编辑', exact: true }).click();
   await expect(body(page)).toHaveText('等待人工决定的正文');
   await expect(
-    page.getByRole('button', { name: '编辑封面', exact: true }),
+    page.getByRole('button', { name: '返回文章池', exact: true }),
   ).toBeEnabled();
 });
 test('committed receipt releases a hung save and late reply cannot unlock another cover save', async ({
@@ -1389,12 +1435,20 @@ test('wrong-article committed receipt and mismatched formal cover keep unknown s
       getArticleCover: Reflect.get(window, 'correctFormalCover'),
     }),
   );
-  await cover(page)
-    .getByRole('button', { name: '核对封面保存结果', exact: true })
-    .click();
+  // The normal background poll may already remove the reconciliation control.
   await expect(
     cover(page).getByRole('button', { name: '编辑封面', exact: true }),
   ).toBeEnabled();
+  const log = await page.evaluate(() =>
+    Reflect.get(window, 'coverFixture').log(),
+  );
+  const writes = log.filter((entry: unknown[]) => entry[0] === 'save');
+  const receipts = log.filter((entry: unknown[]) => entry[0] === 'receipt');
+  expect(writes).toHaveLength(1);
+  expect(receipts.length).toBeGreaterThan(0);
+  expect([...new Set(receipts.map((entry: unknown[]) => entry[1]))]).toEqual([
+    writes[0][1].operationId,
+  ]);
 });
 
 for (const status of ['conflict', 'blocked'] as const)
@@ -1483,7 +1537,8 @@ test('authoritative main close after an observed hung begin retires its late rep
   page,
 }) => {
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
+  await returnToPool(page);
   await page.evaluate(() => {
     const begin = window.desktopApi.beginCoverEdit;
     let first = true;
@@ -1538,7 +1593,8 @@ test('initial idle cannot release a timed-out begin before main admits the origi
   page,
 }) => {
   await mount(page);
-  await expect(body(page)).toBeEditable();
+  await edit(page);
+  await returnToPool(page);
   await page.evaluate(() => {
     const begin = window.desktopApi.beginCoverEdit;
     Object.assign(window.desktopApi, {
@@ -1814,4 +1870,76 @@ test('a retired cover state read rejection cannot freeze the initialized workspa
       new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
   );
   expect(await fresh.isEnabled()).toBe(true);
+});
+
+test('saved row thumbnails discard old page transfers and reload the current head after a cover epoch', async ({
+  page,
+}) => {
+  await mount(page, false, false, false, false, false, 11);
+  const firstKey = '11111111-1111-4111-8111-111111111111';
+  const lastKey = '11111111-1111-4111-8111-000000000011';
+  await page.evaluate(
+    ({ firstKey, lastKey }) => {
+      const fixture = Reflect.get(window, 'coverFixture');
+      fixture.configure(firstKey, 'single', 1);
+      fixture.configure(lastKey, 'single', 1);
+      fixture.holdImage();
+    },
+    { firstKey, lastKey },
+  );
+  await page.getByRole('tab', { name: '批量存草稿', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => typeof Reflect.get(window, 'releaseCoverImage')),
+    )
+    .toBe('function');
+  await page
+    .getByRole('navigation', { name: '文章分页', exact: true })
+    .getByRole('button', { name: '下一页', exact: true })
+    .click();
+  const lastRow = page
+    .locator('.article-rows li')
+    .filter({ hasText: '文章11' });
+  await expect(lastRow.locator('.article-cover-thumbnail')).toHaveAttribute(
+    'data-cover-revision',
+    '1',
+  );
+  await expect(lastRow.locator('.article-cover-thumbnail')).toContainText(
+    '正在读取第1张封面',
+  );
+  await page.evaluate(() => Reflect.get(window, 'releaseCoverImage')());
+  await expect(lastRow.locator('.article-cover-thumbnail img')).toBeVisible();
+  await expect(page.locator('.article-rows li')).toHaveCount(1);
+  expect(
+    await page.evaluate(() => Reflect.get(window, 'coverFixture').max()),
+  ).toBe(1);
+  const blobsBeforeClear = await page.evaluate(() =>
+    Reflect.get(window, 'coverFixture').blobs(),
+  );
+  await page.evaluate(
+    (key) => Reflect.get(window, 'coverFixture').configure(key, 'none', 0),
+    lastKey,
+  );
+  await page.getByRole('tab', { name: '单篇存草稿', exact: true }).click();
+  await expect(lastRow.locator('.article-cover-thumbnail')).toHaveText(
+    '未设封面',
+  );
+  await expect(lastRow.locator('.article-cover-thumbnail img')).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() => Reflect.get(window, 'coverFixture').blobs()),
+    )
+    .toBeLessThan(blobsBeforeClear);
+  await page.evaluate((key) => {
+    Reflect.get(window, 'coverFixture').configure(key, 'single', 1);
+    window.desktopApi.getCoverImage = async () => ({
+      status: 'ok',
+      mime: 'image/png',
+      bytes: new Uint8Array([1]),
+    });
+  }, lastKey);
+  await page.getByRole('tab', { name: '批量存草稿', exact: true }).click();
+  await expect(
+    lastRow.locator('.article-cover-thumbnail').getByRole('alert'),
+  ).toContainText('封面暂时无法读取');
 });

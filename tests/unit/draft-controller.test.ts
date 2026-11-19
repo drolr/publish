@@ -615,6 +615,31 @@ it('allows readonly verification after an issued save races with stop, and never
   });
   expect(h.calls).not.toContain('reconcile');
 });
+it('retains a returned operator observation when stop already reached the controller', async () => {
+  const h = await setup();
+  h.control.pauseAt = 'after-save';
+  h.control.outcome = {
+    status: 'submission_recorded',
+    submission: { observation: 'rejected', attemptedAt: h.control.now },
+    evidence: { remote: null, images: [], cover: null },
+  };
+  await h.api.startDraft(h.preparationId);
+  await vi.waitFor(() => expect(h.calls).toContain('save'));
+  h.api.requestStop();
+  h.releaseExecute();
+  await vi.waitFor(() => expect(h.api.isActive()).toBe(false));
+  const task = h.tasks.latest()!;
+  expect(task).toMatchObject({
+    state: 'needs_human',
+    stopRequested: true,
+    holdsPlatform: true,
+    reason: 'STOP_REQUESTED',
+    evidence: { submission: { observation: 'rejected' } },
+  });
+  expect(h.calls.filter((call) => call === 'save')).toHaveLength(1);
+  h.api.requestStop();
+  expect(h.tasks.get(task.taskId)).toEqual(task);
+});
 
 it.each(['evidence', 'settle'] as const)(
   'result %s write failure does not report verified success',
@@ -700,6 +725,113 @@ it('waits for an in-flight session command and rejects its stale result on shutd
     reason: 'STOP_REQUESTED',
   });
 });
+
+it('concurrent first opens share initialization and expose opening until the single probe settles', async () => {
+  const h = await setup();
+  const api = await h.restart();
+  h.calls.length = 0;
+  const hold = deferred();
+  h.platform.openSession = async () => {
+    h.calls.push('open');
+    await hold.promise;
+    return h.control.probe;
+  };
+  const first = api.openDraftSession();
+  const second = api.openDraftSession();
+  const during = await api.getDraftState();
+  hold.release();
+  const replies = await Promise.all([first, second]);
+  expect(during.session.status).toBe('opening');
+  expect(replies[0]).toEqual(replies[1]);
+  expect(replies[0]).toMatchObject({
+    status: 'ok',
+    view: { session: { status: 'ready' } },
+  });
+  expect(h.calls.filter((call) => call === 'open')).toHaveLength(1);
+});
+
+it.each(['close', 'stop'] as const)(
+  'a pending first open cannot become ready after %s',
+  async (action) => {
+    const h = await setup();
+    const api = await h.restart();
+    const hold = deferred();
+    h.platform.openSession = async () => {
+      await hold.promise;
+      return h.control.probe;
+    };
+    const first = api.openDraftSession();
+    const second = api.openDraftSession();
+    const stopping =
+      action === 'close' ? api.closeDraftSession() : api.stopAndWait();
+    hold.release();
+    expect(await first).toMatchObject({
+      status: 'blocked',
+      reason: 'STOP_REQUESTED',
+    });
+    expect(await second).toMatchObject({
+      status: 'blocked',
+      reason: 'STOP_REQUESTED',
+    });
+    await stopping;
+    expect((await api.getDraftState()).session.status).not.toBe('ready');
+  },
+);
+
+it.each([
+  'LOGIN_REQUIRED',
+  'VERIFICATION_REQUIRED',
+  'PAGE_CHANGED',
+  'BROWSER_UNAVAILABLE',
+] as const)(
+  'first open retains %s without automatically retrying',
+  async (reason) => {
+    const h = await setup();
+    h.calls.length = 0;
+    h.platform.openSession = async () => {
+      h.calls.push('open');
+      if (reason === 'BROWSER_UNAVAILABLE') throw Error('unavailable');
+      return { status: 'blocked', reason };
+    };
+    const opened = await h.api.openDraftSession();
+    expect(opened).toMatchObject({
+      status: 'blocked',
+      reason,
+      view: { session: { status: 'blocked', reason, bindingToken: null } },
+    });
+    expect((await h.api.getDraftState()).session.status).toBe('blocked');
+    expect(h.calls).toEqual(['open']);
+  },
+);
+
+it.each(['request-stop', 'busy', 'unavailable'] as const)(
+  'pending open retires opening when admission changes: %s',
+  async (change) => {
+    const h = await setup();
+    const api = await h.restart();
+    const hold = deferred();
+    h.platform.openSession = async () => {
+      await hold.promise;
+      return h.control.probe;
+    };
+    const opening = api.openDraftSession();
+    if (change === 'request-stop') api.requestStop();
+    else h.control.gate = change;
+    hold.release();
+    const reason =
+      change === 'request-stop'
+        ? 'STOP_REQUESTED'
+        : change === 'busy'
+          ? 'PLATFORM_BUSY'
+          : 'STORAGE_UNAVAILABLE';
+    expect(await opening).toMatchObject({
+      status: 'blocked',
+      reason,
+      view: { session: { status: 'blocked', reason } },
+    });
+    expect((await api.getDraftState()).session.status).toBe('blocked');
+  },
+);
 
 it('safety failures before first input retain platform occupation', async () => {
   const h = await setup();
@@ -1113,4 +1245,122 @@ it('normal single-entry selection retires the previous summary even without a co
     reason: 'STALE_PREPARATION',
   });
   expect(h.calls).not.toContain('execute');
+});
+
+it('close and every explicit stop invalidate browser health before asynchronous settlement', async () => {
+  const h = await setup();
+  const before = h.control.healthInvalidations;
+  h.api.requestStop();
+  expect(h.control.healthInvalidations).toBe(before + 1);
+  await h.api.stopDraft('missing');
+  expect(h.control.healthInvalidations).toBe(before + 2);
+  await h.api.closeDraftSession();
+  expect(h.control.healthInvalidations).toBeGreaterThan(before + 2);
+});
+
+it('manually finishes a stuck single task and admits a different article through the normal path', async () => {
+  const h = await setup();
+  h.control.pauseAt = 'none';
+  const verified = h.control.outcome;
+  h.control.outcome = { status: 'blocked', reason: 'RESULT_AMBIGUOUS' };
+  await h.api.startDraft(h.preparationId);
+  await vi.waitFor(() => expect(h.api.isActive()).toBe(false));
+  const task = h.tasks.latest()!;
+  expect(task.state).toBe('needs_human');
+  const bad = await h.api.finishHandledTask({
+    taskId: task.taskId,
+    expectedRevision: task.revision - 1,
+  });
+  expect(bad).toMatchObject({ status: 'blocked', reason: 'STALE_PREPARATION' });
+  expect(
+    (
+      await h.api.finishHandledTask({
+        taskId: task.taskId,
+        expectedRevision: task.revision,
+      })
+    ).status,
+  ).toBe('ok');
+  expect(h.tasks.get(task.taskId)).toMatchObject({
+    state: 'stopped_by_user',
+    saveAttempted: true,
+    reason: task.reason,
+    evidence: task.evidence,
+  });
+  expect(h.api.isBlocked()).toBe(false);
+  if (verified.status !== 'verified') throw Error('fixture');
+  h.control.outcome = {
+    ...verified,
+    evidence: { ...verified.evidence, images: [] },
+  };
+  const other = await h.addArticle('Single next article');
+  const opened = await h.api.openDraftSession();
+  const prepared = await h.api.prepareDraft(
+    other,
+    opened.view.session.bindingToken!,
+  );
+  if (prepared.status !== 'ready') throw Error('not prepared');
+  expect(
+    (await h.api.startDraft(prepared.preparation.preparationId)).status,
+  ).toBe('ok');
+  await vi.waitFor(() => expect(h.api.isActive()).toBe(false));
+  expect(h.tasks.latest()).toMatchObject({
+    articleKey: other,
+    state: 'draft_saved',
+  });
+  expect(h.calls.filter((c) => c === 'save')).toHaveLength(2);
+});
+it('never releases a different latest task through the bound cleanup entry', async () => {
+  const h = await setup();
+  await expect(
+    h.api.releaseHandledTask('11111111-1111-4111-8111-111111111111'),
+  ).rejects.toThrow('INPUT_UNSUPPORTED');
+  expect(h.calls).not.toContain('close');
+});
+it('manual single-task cleanup waits for close and cannot deadlock on its own command', async () => {
+  const h = await setup();
+  h.control.pauseAt = 'none';
+  h.control.outcome = { status: 'blocked', reason: 'PAGE_CHANGED' };
+  await h.api.startDraft(h.preparationId);
+  await vi.waitFor(() => expect(h.api.isActive()).toBe(false));
+  const task = h.tasks.latest()!;
+  const close = deferred();
+  vi.spyOn(h.platform, 'closeSession').mockImplementation(() => close.promise);
+  const flight = h.api.finishHandledTask({
+    taskId: task.taskId,
+    expectedRevision: task.revision,
+  });
+  expect(h.tasks.get(task.taskId)?.holdsPlatform).toBe(true);
+  expect((await h.api.openDraftSession()).status).toBe('blocked');
+  close.release();
+  expect((await flight).status).toBe('ok');
+  expect(h.tasks.get(task.taskId)?.holdsPlatform).toBe(false);
+});
+
+it('shutdown waits for manually handled cleanup and its durable release before storage can close', async () => {
+  const h = await setup();
+  h.control.pauseAt = 'none';
+  h.control.outcome = { status: 'blocked', reason: 'PAGE_CHANGED' };
+  await h.api.startDraft(h.preparationId);
+  await vi.waitFor(() => expect(h.api.isActive()).toBe(false));
+  const task = h.tasks.latest()!;
+  const close = deferred();
+  vi.spyOn(h.platform, 'closeSession').mockImplementation(() => close.promise);
+  const release = h.api.finishHandledTask({
+    taskId: task.taskId,
+    expectedRevision: task.revision,
+  });
+  expect(h.api.isActive()).toBe(true);
+  let stopped = false;
+  const shutdown = h.api.stopAndWait().then(() => {
+    stopped = true;
+  });
+  await Promise.resolve();
+  expect(stopped).toBe(false);
+  expect(h.tasks.get(task.taskId)?.holdsPlatform).toBe(true);
+  close.release();
+  await shutdown;
+  expect((await release).status).toBe('ok');
+  expect(h.tasks.get(task.taskId)?.state).toBe('stopped_by_user');
+  expect(h.api.isActive()).toBe(false);
+  expect(h.api.isBlocked()).toBe(true); // shutdown admission stays closed
 });

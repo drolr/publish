@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { DraftSnapshotBudgetSchema } from './web-paste';
+import { PersistedEditorBodyV2Schema } from './rich-text-body';
 import { StorageIdSchema, StoredArticleSchema } from './stored-article';
 import {
   CoverPlanSchema,
@@ -72,6 +74,7 @@ export const TaskStageSchema = z.enum([
 export const ReasonCodeSchema = z.enum([
   'INPUT_UNSUPPORTED',
   'TITLE_UNSUPPORTED',
+  'FORMAT_UNSUPPORTED',
   'IMAGE_FORMAT_UNSUPPORTED',
   'IMAGE_SIZE_UNSUPPORTED',
   'ASSET_UNAVAILABLE',
@@ -85,6 +88,7 @@ export const ReasonCodeSchema = z.enum([
   'EDITOR_NOT_EMPTY',
   'COVER_UNAVAILABLE',
   'COVER_REQUIRED',
+  'COVER_UPLOAD_FAILED',
   'DECLARATION_REQUIRED',
   'RESULT_AMBIGUOUS',
   'MANUAL_REVIEW_REQUIRED',
@@ -105,11 +109,54 @@ export const StoreBindingSchema = z.strictObject({
     value: PrivateTextSchema,
   }),
 });
-export const DraftSnapshotSchema = z.strictObject({
+export const DraftSnapshotV1Schema = z.strictObject({
   version: z.literal(1),
   article: StoredArticleSchema,
   digest: DigestSchema,
 });
+export const DraftSnapshotV2Schema = z
+  .strictObject({
+    version: z.literal(2),
+    article: StoredArticleSchema,
+    editorBody: PersistedEditorBodyV2Schema,
+    digest: DigestSchema,
+  })
+  .superRefine((snapshot, ctx) => {
+    const budget = DraftSnapshotBudgetSchema.safeParse(snapshot);
+    if (!budget.success)
+      for (const issue of budget.error.issues)
+        ctx.addIssue({
+          code: 'custom',
+          message: issue.message,
+          path: issue.path,
+        });
+  });
+export const DraftSnapshotSchema = z.discriminatedUnion('version', [
+  DraftSnapshotV1Schema,
+  DraftSnapshotV2Schema,
+]);
+// Images use the original version's top-level coordinate system, never its compatibility projection.
+export function snapshotImageAt(
+  snapshot: DraftSnapshot,
+  index: number,
+): { imageId: string } | undefined {
+  const block =
+    snapshot.version === 2
+      ? snapshot.editorBody.blocks[index]
+      : snapshot.article.body[index];
+  if (block?.type !== 'image') return undefined;
+  return { imageId: 'imageId' in block ? block.imageId : block.image_id };
+}
+export function snapshotImageCount(snapshot: DraftSnapshot): number {
+  return (
+    snapshot.version === 2 ? snapshot.editorBody.blocks : snapshot.article.body
+  ).filter((b) => b.type === 'image').length;
+}
+export function snapshotBodyLength(snapshot: DraftSnapshot): number {
+  return snapshot.version === 2
+    ? snapshot.editorBody.blocks.length
+    : snapshot.article.body.length;
+}
 export const RemoteRefSchema = z.strictObject({
   recordKey: PrivateTextSchema,
   editUrl: EditUrlSchema,
@@ -129,12 +176,20 @@ export const SubmissionSchema = z.strictObject({
   attemptedAt: z.iso.datetime(),
 });
 export type Submission = z.infer<typeof SubmissionSchema>;
+export const CoverAbortSchema = z.strictObject({
+  attempts: z.union([z.literal(1), z.literal(2)]),
+  step: z.enum(['wait-for-upload', 'confirm']),
+  modalClosed: z.literal(true),
+  editorClean: z.literal(true),
+});
+export type CoverAbort = z.infer<typeof CoverAbortSchema>;
 export const DraftEvidenceSchema = z
   .strictObject({
     remote: RemoteRefSchema.nullable(),
     submission: SubmissionSchema.optional(),
     images: z.array(ImageEvidenceSchema).max(1000),
     cover: CoverEvidenceSchema.nullable(),
+    coverAbort: CoverAbortSchema.optional(),
   })
   .refine(
     (value) =>
@@ -242,9 +297,7 @@ export const DraftTaskSchema = z
         (!task.coverPlan &&
           task.coverPolicy === 'store-material-first' &&
           !task.evidence.cover) ||
-        task.evidence.images.length !==
-          task.snapshot.article.body.filter((block) => block.type === 'image')
-            .length)
+        task.evidence.images.length !== snapshotImageCount(task.snapshot))
     )
       invalid();
     if (
@@ -278,10 +331,10 @@ export const DraftTaskSchema = z
     )
       invalid();
     for (const image of task.evidence.images) {
-      const block = task.snapshot.article.body[image.bodyIndex];
+      const block = snapshotImageAt(task.snapshot, image.bodyIndex);
       if (
-        block?.type !== 'image' ||
-        block.image_id !== image.imageId ||
+        !block ||
+        block.imageId !== image.imageId ||
         !task.snapshot.article.assets.some(
           (asset) =>
             asset.assetKey === image.assetKey &&
@@ -515,6 +568,8 @@ export type TaskState = z.infer<typeof TaskStateSchema>;
 export type TaskStage = z.infer<typeof TaskStageSchema>;
 export type ReasonCode = z.infer<typeof ReasonCodeSchema>;
 export type StoreBinding = z.infer<typeof StoreBindingSchema>;
+export type DraftSnapshotV1 = z.infer<typeof DraftSnapshotV1Schema>;
+export type DraftSnapshotV2 = z.infer<typeof DraftSnapshotV2Schema>;
 export type DraftSnapshot = z.infer<typeof DraftSnapshotSchema>;
 export type RemoteRef = z.infer<typeof RemoteRefSchema>;
 export type ImageEvidence = z.infer<typeof ImageEvidenceSchema>;
@@ -532,7 +587,14 @@ export type ReserveInput = z.infer<typeof ReserveInputSchema>;
 export type ReserveResult = z.infer<typeof ReserveResultSchema>;
 export type SessionProbe = z.infer<typeof SessionProbeSchema>;
 export type AdapterOutcome = z.infer<typeof AdapterOutcomeSchema>;
+export const HandledTaskInputSchema = z.strictObject({
+  taskId: StorageIdSchema,
+  expectedRevision: z.number().int().nonnegative(),
+});
 export interface DraftApi {
+  finishHandledTask(
+    input: z.infer<typeof HandledTaskInputSchema>,
+  ): Promise<DraftCommandResult>;
   prepareTaskClosure(taskId: string): Promise<DraftCommandResult>;
   confirmTaskClosure(token: string): Promise<DraftCommandResult>;
   openDraftSession(): Promise<DraftCommandResult>;
@@ -550,6 +612,7 @@ export interface DraftApi {
   openSavedDraft(taskId: string): Promise<DraftCommandResult>;
 }
 export const draftChannels = {
+  finishHandledTask: 'draft:finish-handled',
   prepareTaskClosure: 'draft:prepare-closure',
   confirmTaskClosure: 'draft:confirm-closure',
   openDraftSession: 'draft:open-session',
@@ -563,6 +626,7 @@ export const draftChannels = {
   openSavedDraft: 'draft:open-saved',
 } as const;
 export const draftRequests = {
+  finishHandledTask: z.tuple([HandledTaskInputSchema]),
   prepareTaskClosure: z.tuple([StorageIdSchema]),
   confirmTaskClosure: z.tuple([StorageIdSchema]),
   openDraftSession: z.tuple([]),
@@ -580,6 +644,7 @@ export const draftRequests = {
   openSavedDraft: z.tuple([StorageIdSchema]),
 };
 export const draftResponses = {
+  finishHandledTask: DraftCommandResultSchema,
   prepareTaskClosure: DraftCommandResultSchema,
   confirmTaskClosure: DraftCommandResultSchema,
   openDraftSession: DraftCommandResultSchema,

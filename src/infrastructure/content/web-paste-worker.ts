@@ -1,18 +1,28 @@
 import { parentPort } from 'node:worker_threads';
 import { WebPasteInputSchema } from '../../contracts/web-paste';
-import type { WebPasteWorkerReply } from '../../contracts/web-paste-worker';
+import {
+  RichWebPasteWorkerRequestSchema,
+  type RichWebPasteWorkerReply,
+  type WebPasteWorkerReply,
+} from '../../contracts/web-paste-worker';
 import { WebPasteFailure } from '../../domain/web-paste-error';
-import { convertWebPaste } from './web-paste-parser';
+import { convertRichWebPaste, convertWebPaste } from './web-paste-parser';
 
 const port = parentPort;
 if (port)
   port.once('message', (message: unknown) => {
-    let reply: WebPasteWorkerReply;
-    const input = WebPasteInputSchema.safeParse(message);
-    if (!input.success) reply = { ok: false, code: 'INPUT_LIMIT' };
+    let reply: WebPasteWorkerReply | RichWebPasteWorkerReply;
+    const rich = RichWebPasteWorkerRequestSchema.safeParse(message);
+    const legacy = WebPasteInputSchema.safeParse(message);
+    if (!rich.success && !legacy.success)
+      reply = { ok: false, code: 'INPUT_LIMIT' };
     else {
       try {
-        reply = { ok: true, result: convertWebPaste(input.data) };
+        if (rich.success)
+          reply = { ok: true, result: convertRichWebPaste(rich.data.input) };
+        else if (legacy.success)
+          reply = { ok: true, result: convertWebPaste(legacy.data) };
+        else reply = { ok: false, code: 'INPUT_LIMIT' };
       } catch (error) {
         reply = {
           ok: false,

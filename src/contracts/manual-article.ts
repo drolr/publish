@@ -1,4 +1,11 @@
+import {
+  CoverModeSchema,
+  CoverSaveResultSchema,
+  CoverImageResultSchema,
+  CoverMimeSchema,
+} from './article-cover';
 import { z } from 'zod';
+import { ManualDraftV2Schema, type ManualDraftV2 } from './manual-rich-draft';
 import {
   ImageResultSchema,
   ImportOutcomeSchema,
@@ -86,8 +93,10 @@ const DraftShape = z
     if (new Set(candidateIds).size !== candidateIds.length)
       ctx.addIssue({ code: 'custom', message: '图片位置标识重复。' });
   });
-export const ManualDraftSchema = DraftSnapshotBudgetSchema.pipe(DraftShape);
-export type ManualDraft = z.infer<typeof ManualDraftSchema>;
+export const ManualDraftV1Schema = DraftSnapshotBudgetSchema.pipe(DraftShape);
+export type ManualDraftV1 = z.infer<typeof ManualDraftV1Schema>;
+export const ManualDraftSchema = ManualDraftV2Schema;
+export type ManualDraft = ManualDraftV2;
 export const ManualImageSchema = z
   .strictObject({
     imageToken: StorageIdSchema,
@@ -98,6 +107,31 @@ export const ManualImageSchema = z
   })
   .refine((image) => image.width * image.height <= webPasteLimits.imagePixels);
 export type ManualImage = z.infer<typeof ManualImageSchema>;
+export const ManualCoverEditCommandSchema = z.strictObject({
+  sessionId: StorageIdSchema,
+  expectedCoverDraftRevision: RevisionSchema,
+});
+export type ManualCoverEditCommand = z.output<
+  typeof ManualCoverEditCommandSchema
+>;
+export const ManualCoverSnapshotSchema = z.strictObject({
+  draftRevision: RevisionSchema,
+  baseCoverRevision: RevisionSchema,
+  mode: CoverModeSchema,
+  dirty: z.boolean(),
+  image: z
+    .strictObject({
+      imageToken: StorageIdSchema,
+      mime: CoverMimeSchema,
+      width: z.number().int().positive().max(10000),
+      height: z.number().int().positive().max(10000),
+    })
+    .refine((image) => image.width * image.height <= 25_000_000)
+    .optional(),
+  outcome: CoverSaveResultSchema.optional(),
+  notice: z.string().max(300).optional(),
+});
+export type ManualCoverSnapshot = z.output<typeof ManualCoverSnapshotSchema>;
 const ManualIssuesSchema = z
   .array(
     z.strictObject({
@@ -144,6 +178,8 @@ export const ManualStateSchema = z.discriminatedUnion('state', [
       draft: ManualDraftSchema,
       images: z.array(ManualImageSchema).max(webPasteLimits.images),
       dirty: z.boolean(),
+      cover: ManualCoverSnapshotSchema.optional(),
+      hasUnsavedChanges: z.boolean().optional(),
       jobId: StorageIdSchema.optional(),
       result: ImportOutcomeSchema.optional(),
       issues: ManualIssuesSchema.optional(),
@@ -174,6 +210,16 @@ export const ManualReplySchema = z.strictObject({
 });
 export type ManualReply = z.infer<typeof ManualReplySchema>;
 export interface ManualArticleApi extends ContinuousManualArticleApi {
+  reconcileManualCoverSave(sessionId: string): Promise<ManualReply>;
+  pickManualCoverImage(command: ManualCoverEditCommand): Promise<ManualReply>;
+  setManualCoverMode(
+    command: ManualCoverEditCommand,
+    mode: 'none' | 'single',
+  ): Promise<ManualReply>;
+  getManualCoverImage(
+    sessionId: string,
+    imageToken: string,
+  ): Promise<import('./article-cover').CoverImageResult>;
   startManualPaste(
     command: PasteCommand,
     input: WebPasteInput,
@@ -205,6 +251,10 @@ export interface ManualArticleApi extends ContinuousManualArticleApi {
   ): Promise<ManualReply>;
 }
 export const manualChannels = {
+  reconcileManualCoverSave: 'manual:reconcile-cover',
+  pickManualCoverImage: 'manual:pick-cover',
+  setManualCoverMode: 'manual:cover-mode',
+  getManualCoverImage: 'manual:cover-image',
   openManualArticle: 'manual:open',
   applyManualEdit: 'manual:edit',
   spliceManualPaste: 'manual:splice-paste',
@@ -226,6 +276,13 @@ export const manualChannels = {
   discardManualArticle: 'manual:discard',
 } as const;
 export const manualRequests = {
+  reconcileManualCoverSave: z.tuple([StorageIdSchema]),
+  pickManualCoverImage: z.tuple([ManualCoverEditCommandSchema]),
+  setManualCoverMode: z.tuple([
+    ManualCoverEditCommandSchema,
+    z.enum(['none', 'single']),
+  ]),
+  getManualCoverImage: z.tuple([StorageIdSchema, StorageIdSchema]),
   openManualArticle: z.tuple([StorageIdSchema]),
   applyManualEdit: z.tuple([DocumentCommandSchema, ManualDraftSchema]),
   spliceManualPaste: z.tuple([
@@ -264,6 +321,10 @@ export const manualRequests = {
   discardManualArticle: z.tuple([StorageIdSchema, RevisionSchema]),
 };
 export const manualResponses = {
+  reconcileManualCoverSave: ManualReplySchema,
+  pickManualCoverImage: ManualReplySchema,
+  setManualCoverMode: ManualReplySchema,
+  getManualCoverImage: CoverImageResultSchema,
   openManualArticle: ManualReplySchema,
   applyManualEdit: ManualReplySchema,
   spliceManualPaste: ManualReplySchema,
@@ -284,3 +345,12 @@ export const manualResponses = {
   cancelManualOperation: ManualReplySchema,
   discardManualArticle: ManualReplySchema,
 };
+export {
+  ManualDraftV2Schema,
+  ManualFragmentV2Schema,
+  isManualImageBlock,
+  type ManualDraftV2,
+  type ManualFragmentV2,
+  type ManualRichBlock,
+  type ManualRichParagraph,
+} from './manual-rich-draft';

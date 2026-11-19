@@ -1,3 +1,4 @@
+import type { ConvertedRichPaste } from '../../src/contracts/rich-web-paste';
 import { expect, it, vi, afterEach } from 'vitest';
 import {
   createManualArticleController,
@@ -25,9 +26,16 @@ const image: ManualImage = {
   byteSize: 10,
 };
 const draft: ManualDraft = {
+  bodyVersion: 2 as const,
   title: '人工文章',
   contentDeclaration: 'repost',
-  blocks: [{ blockKey: uuid(80), type: 'paragraph', text: '正文' }],
+  blocks: [
+    {
+      blockKey: uuid(80),
+      type: 'paragraph',
+      content: [{ type: 'text' as const, text: '正文', marks: [] }],
+    },
+  ],
 };
 const imported: ImportResult = {
   status: 'imported',
@@ -70,7 +78,14 @@ function setup(overrides: Partial<ManualArticleControllerPorts> = {}) {
     save: vi.fn(async () => imported),
     converter: {
       convert: async () => ({
-        blocks: [{ type: 'paragraph', text: '新正文' }],
+        version: 2 as const,
+        warnings: [],
+        blocks: [
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: '新正文', marks: [] }],
+          },
+        ],
         plainOnly: false,
       }),
     },
@@ -112,7 +127,11 @@ it('admits all once and replays only the original command identity, then appends
   await flush();
   const after = session(controller.getManualArticleState());
   expect(after.draft.blocks).toEqual([
-    { blockKey: expect.any(String), type: 'paragraph', text: '新正文' },
+    {
+      blockKey: expect.any(String),
+      type: 'paragraph',
+      content: [{ type: 'text' as const, text: '新正文', marks: [] }],
+    },
   ]);
   expect(
     (
@@ -153,8 +172,13 @@ it('keeps old title/declaration/blocks and retries only a failed middle image in
   const { controller, edit } = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [
-          { type: 'paragraph', text: 'new' },
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: 'new', marks: [] }],
+          },
           ...['a', 'b', 'c'].map((s) => ({
             type: 'image' as const,
             source: `https://example.com/${s}`,
@@ -209,10 +233,7 @@ it('keeps old title/declaration/blocks and retries only a failed middle image in
   expect(JSON.stringify(retried)).not.toContain('https://');
 });
 it('cancellation before admission retains initial body; cancellation after admission awaits late ready cleanup', async () => {
-  const converted = deferred<{
-    blocks: { type: 'paragraph'; text: string }[];
-    plainOnly: boolean;
-  }>();
+  const converted = deferred<ConvertedRichPaste>();
   const early = setup({ converter: { convert: () => converted.promise } });
   const initial = await early.begin();
   const started = session(
@@ -221,7 +242,14 @@ it('cancellation before admission retains initial body; cancellation after admis
   );
   early.controller.cancelManualOperation(initial.sessionId, started.jobId!);
   converted.resolve({
-    blocks: [{ type: 'paragraph', text: 'new' }],
+    version: 2 as const,
+    warnings: [],
+    blocks: [
+      {
+        type: 'paragraph',
+        content: [{ type: 'text' as const, text: 'new', marks: [] }],
+      },
+    ],
     plainOnly: false,
   });
   await flush();
@@ -234,8 +262,13 @@ it('cancellation before admission retains initial body; cancellation after admis
   const late = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [
-          { type: 'paragraph', text: 'new' },
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: 'new', marks: [] }],
+          },
           { type: 'image', source: 'https://example.com/a' },
           { type: 'image', source: 'https://example.com/b' },
         ],
@@ -273,6 +306,8 @@ it('counts failed candidates before opening a local picker and refuses meaningle
   const { controller, begin } = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: Array.from({ length: 200 }, () => ({
           type: 'image' as const,
           source: undefined,
@@ -312,7 +347,11 @@ it('does not replace an initial block that has ceased to be the pristine initial
         ...initial.draft,
         blocks: [
           ...initial.draft.blocks,
-          { blockKey: uuid(900), type: 'paragraph', text: '曾有正文' },
+          {
+            blockKey: uuid(900),
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: '曾有正文', marks: [] }],
+          },
         ],
       })
     ).snapshot,
@@ -339,6 +378,8 @@ it.each(['blocks', 'text', 'images', 'paragraph'] as const)(
     const { controller, begin } = setup({
       converter: {
         convert: async () => ({
+          version: 2 as const,
+          warnings: [],
           blocks:
             limit === 'images'
               ? Array.from({ length: 201 }, () => ({
@@ -348,7 +389,13 @@ it.each(['blocks', 'text', 'images', 'paragraph'] as const)(
               : [
                   {
                     type: 'paragraph',
-                    text: limit === 'paragraph' ? '😀'.repeat(20001) : 'x',
+                    content: [
+                      {
+                        type: 'text' as const,
+                        text: limit === 'paragraph' ? '😀'.repeat(20001) : 'x',
+                        marks: [],
+                      },
+                    ],
                   },
                   { type: 'image', source: 'https://example.com/a' },
                 ],
@@ -368,13 +415,15 @@ it.each(['blocks', 'text', 'images', 'paragraph'] as const)(
         ? Array.from({ length: 1000 }, (_, i) => ({
             blockKey: uuid(1000 + i),
             type: 'paragraph',
-            text: '',
+            content: [],
           }))
         : limit === 'text'
           ? Array.from({ length: 10 }, (_, i) => ({
               blockKey: uuid(1000 + i),
               type: 'paragraph',
-              text: '😀'.repeat(20000),
+              content: [
+                { type: 'text' as const, text: '😀'.repeat(20000), marks: [] },
+              ],
             }))
           : initial.draft.blocks;
     const before = session(
@@ -402,7 +451,14 @@ it('schema rejection does not consume its token, and plain-only admission report
   const { controller, begin } = setup({
     converter: {
       convert: async () => ({
-        blocks: [{ type: 'paragraph', text: 'plain' }],
+        version: 2 as const,
+        warnings: ['PLAIN_ONLY' as const],
+        blocks: [
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: 'plain', marks: [] }],
+          },
+        ],
         plainOnly: true,
       }),
     },
@@ -430,7 +486,14 @@ it('parses the same input snapshot used by command identity even if the caller m
   const { controller, begin } = setup({
     converter: {
       convert: async (input) => ({
-        blocks: [{ type: 'paragraph', text: input.plain }],
+        version: 2 as const,
+        warnings: ['PLAIN_ONLY' as const],
+        blocks: [
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: input.plain, marks: [] }],
+          },
+        ],
         plainOnly: true,
       }),
     },
@@ -442,13 +505,19 @@ it('parses the same input snapshot used by command identity even if the caller m
   await request;
   await flush();
   expect(session(controller.getManualArticleState()).draft.blocks).toEqual([
-    { blockKey: expect.any(String), type: 'paragraph', text: 'original' },
+    {
+      blockKey: expect.any(String),
+      type: 'paragraph',
+      content: [{ type: 'text' as const, text: 'original', marks: [] }],
+    },
   ]);
 });
 it('an immediately cancelled retry retains exactly one unresolved cancelled position', async () => {
   const { controller, begin } = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [{ type: 'image', source: 'https://example.com/a' }],
         plainOnly: false,
       }),
@@ -492,8 +561,13 @@ it('a deadline leaves no late authorization and freezes writes until its delayed
   const { controller, begin } = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [
-          { type: 'paragraph', text: 'text' },
+          {
+            type: 'paragraph',
+            content: [{ type: 'text' as const, text: 'text', marks: [] }],
+          },
           { type: 'image', source: 'https://example.com/a' },
           { type: 'image', source: 'https://example.com/b' },
         ],
@@ -546,6 +620,8 @@ it('holds the writer when cancel arrives during successful ready retain and clea
   const { controller, begin } = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [
           { type: 'image', source: 'https://example.com/a' },
           { type: 'image', source: 'https://example.com/b' },
@@ -584,6 +660,8 @@ it('unknown resource settlement stops subsequent images and denies every new wri
   const { controller, begin } = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [
           { type: 'image', source: 'https://example.com/a' },
           { type: 'image', source: 'https://example.com/b' },
@@ -622,6 +700,8 @@ it('removing unresolved positions clears the save gate but preserves final conte
   const { controller, begin, ports } = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [{ type: 'image', source: undefined }],
         plainOnly: false,
       }),
@@ -679,6 +759,8 @@ it('keeps repeated existing image tokens as one independent image while counting
     chooseImage: async () => image,
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: Array.from({ length: 199 }, () => ({
           type: 'image' as const,
           source: undefined,
@@ -717,6 +799,8 @@ it('image byte overflow preserves its position without stopping smaller followin
   const { controller, begin } = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: Array.from({ length: 13 }, (_, i) => ({
           type: 'image' as const,
           source: `https://example.com/${i}`,
@@ -747,7 +831,7 @@ it('starts with an empty paragraph ready for input without claiming unsaved edit
   const { begin, controller } = setup();
   const state = await begin();
   expect(state.draft.blocks).toEqual([
-    { blockKey: expect.any(String), type: 'paragraph', text: '' },
+    { blockKey: expect.any(String), type: 'paragraph', content: [] },
   ]);
   expect(controller.hasUnsavedChanges()).toBe(false);
 });
@@ -1123,7 +1207,7 @@ it('uses the shared final article validator with safe title and block positions'
       await controller.updateManualDraft(state.sessionId, state.revision, {
         ...draft,
         title: '',
-        blocks: [{ blockKey: uuid(80), type: 'paragraph', text: '' }],
+        blocks: [{ blockKey: uuid(80), type: 'paragraph', content: [] }],
       })
     ).snapshot,
   );
@@ -1387,8 +1471,15 @@ it.each(
         convert: async () => {
           conversions++;
           return {
+            version: 2 as const,
+            warnings: [],
             blocks: [
-              { type: 'paragraph', text: 'admitted text' },
+              {
+                type: 'paragraph',
+                content: [
+                  { type: 'text' as const, text: 'admitted text', marks: [] },
+                ],
+              },
               { type: 'image', source: 'https://example.com/a' },
             ],
             plainOnly: false,
@@ -1819,6 +1910,8 @@ it('restart stop drains in-flight paste image acquisition without reviving its l
   const f = setup({
     converter: {
       convert: async () => ({
+        version: 2 as const,
+        warnings: [],
         blocks: [{ type: 'image', source: 'https://example.com/a.png' }],
         plainOnly: false,
       }),
@@ -1840,4 +1933,36 @@ it('restart stop drains in-flight paste image acquisition without reviving its l
   expect(retained.images).toEqual([]);
   expect(retained.candidates[0].state).toBe('cancelled');
   expect(f.controller.hasSession()).toBe(true);
+});
+
+it('legacy fallback rejects rich semantics deterministically and retains the editable body', async () => {
+  const { controller, begin, ports } = setup();
+  const initial = await begin();
+  const rich = {
+    ...draft,
+    blocks: [
+      {
+        type: 'heading' as const,
+        blockKey: uuid(80),
+        content: [
+          { type: 'text' as const, text: 'same', marks: ['bold' as const] },
+        ],
+      },
+    ],
+  };
+  const changed = session(
+    (
+      await controller.updateManualDraft(
+        initial.sessionId,
+        initial.revision,
+        rich,
+      )
+    ).snapshot,
+  );
+  expect(
+    controller.saveManualArticle(changed.sessionId, changed.revision).status,
+  ).toBe('invalid');
+  expect(session(controller.getManualArticleState()).draft).toEqual(rich);
+  expect(session(controller.getManualArticleState()).state).toBe('editing');
+  expect(ports.save).not.toHaveBeenCalled();
 });

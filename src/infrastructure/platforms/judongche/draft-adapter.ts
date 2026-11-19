@@ -1,3 +1,10 @@
+import {
+  DraftContentCapabilitiesSchema,
+  type DraftContentCapabilities,
+} from '../../../contracts/draft-content';
+import { checkContentSupport } from '../../../domain/draft-content';
+import { verifyDraftSnapshotIntegrity } from '../../draft-snapshot-integrity';
+import { richEvidenceKnown } from './rich-content-evidence';
 import { JudongcheCoverRequiredError } from './production-state';
 import { createHash } from 'node:crypto';
 import {
@@ -18,6 +25,11 @@ import type {
   DraftPlatform,
   ExecutionHooks,
 } from '../../../domain/ports/draft-task';
+
+const diag = (event: string, data?: unknown) => {
+  if (process.env.JUDONGCHE_DIAG !== '1') return;
+  console.error('[jdc-adapter] ' + event + ' ' + JSON.stringify(data));
+};
 import { effectiveCoverPolicy } from '../../../domain/cover-task';
 import { canCloseWithoutSave } from '../../../domain/draft-task';
 import {
@@ -25,7 +37,7 @@ import {
   type BrowserSession,
 } from '../../automation/browser-session';
 import {
-  matchesContent,
+  matchesOperationContent,
   sameRemote,
   sameStore,
   validRemote,
@@ -99,7 +111,15 @@ export async function reconcileWithPages(
     if (!located || !sameRemote(located, task.evidence.remote))
       return uncertain('RESULT_AMBIGUOUS');
     await checkStore(pages, task);
-    const observed = await pages.inspectDraft(located);
+    const observed =
+      task.snapshot.version === 2
+        ? await pages.inspectRichDraft?.(located)
+        : await pages.inspectDraft(located);
+    if (
+      task.snapshot.version === 2 &&
+      (!observed || !richEvidenceKnown(observed))
+    )
+      return uncertain('PAGE_CHANGED');
     await checkStore(pages, task);
     if (!observed) return uncertain('CONTENT_MISMATCH');
     const report =
@@ -117,13 +137,35 @@ export async function reconcileWithPages(
     return uncertain(reasonOf(error, 'RESULT_AMBIGUOUS'));
   }
 }
-/** Internal infrastructure composition seam. Product composition always uses
- * createJudongcheAdapter, whose page capabilities remain fail-closed. */
+/** Verified rich-text declaration for the production Judongche writer. */
+const JUDONGCHE_CONTENT_CAPABILITIES: DraftContentCapabilities = {
+  revision: 'judongche-rich-v1',
+  features: {
+    bold: 'verified',
+    italic: 'verified',
+    underline: 'verified',
+    heading: 'verified',
+    ordered_list: 'verified',
+    bullet_list: 'verified',
+    blockquote: 'verified',
+  },
+};
+/** Internal infrastructure composition seam. createJudongcheAdapter forwards the
+ * verified production declaration; tests may inject synthetic capabilities. */
 export function createAdapterWithPages(
   session: BrowserSession,
   pages: JudongchePages,
+  /** Capability declaration, injectable for synthetic infrastructure fixtures. */
+  fixtureCapabilities?: DraftContentCapabilities,
 ): DraftPlatform {
+  const capabilities = fixtureCapabilities
+    ? DraftContentCapabilitiesSchema.parse(fixtureCapabilities)
+    : { revision: 'judongche-rich-unknown-v1', features: {} };
   const attempted = new Set<string>();
+  const continuationOwners = new Map<
+    string,
+    { generation: string; storeKey: string }
+  >();
   let checkedSession:
     Awaited<ReturnType<JudongcheReadPages['probe']>> | undefined;
   const probe = async () => {
@@ -133,13 +175,74 @@ export function createAdapterWithPages(
   const reads: JudongcheReadPages = {
     probe,
     inspectEditor: () => pages.inspectEditor(),
+    inspectRichEditor: pages.inspectRichEditor
+      ? () => pages.inspectRichEditor!()
+      : undefined,
+    inspectRichDraft: pages.inspectRichDraft
+      ? (ref) => pages.inspectRichDraft!(ref)
+      : undefined,
     locateDraft: (ref) => pages.locateDraft(ref),
     inspectDraft: (ref) => pages.inspectDraft(ref),
     inspectDraftAbsence: pages.inspectDraftAbsence
       ? (title) => pages.inspectDraftAbsence!(title)
       : undefined,
   };
+  const captureHandledTaskContinuation = (task: DraftTask) => {
+    const generation = session.generation();
+    const context = session.current();
+    const owner = continuationOwners.get(task.taskId);
+    if (!context || !generation) return fail('BROWSER_UNAVAILABLE');
+    if (!owner || owner.generation !== generation) return fail('PAGE_CHANGED');
+    if (owner.storeKey !== task.store.storeKey) return fail('STORE_CHANGED');
+    if (!pages.captureHandledTaskContinuation) return fail('INPUT_UNSUPPORTED');
+    const proceed = pages.captureHandledTaskContinuation(task.taskId);
+    return async (cancelled: () => boolean) => {
+      try {
+        if (cancelled())
+          return {
+            status: 'blocked' as const,
+            reason: 'STOP_REQUESTED' as const,
+          };
+        if (
+          session.current() !== context ||
+          session.generation() !== generation
+        )
+          return {
+            status: 'blocked' as const,
+            reason: 'PAGE_CHANGED' as const,
+          };
+        const value = await proceed(cancelled);
+        if (cancelled())
+          return {
+            status: 'blocked' as const,
+            reason: 'STOP_REQUESTED' as const,
+          };
+        if (
+          session.current() !== context ||
+          session.generation() !== generation ||
+          (value.status === 'ready' && value.generation !== generation)
+        )
+          return {
+            status: 'blocked' as const,
+            reason: 'PAGE_CHANGED' as const,
+          };
+        if (value.status === 'ready' && !sameStore(value.store, task.store))
+          return {
+            status: 'blocked' as const,
+            reason: 'STORE_CHANGED' as const,
+          };
+        checkedSession = value;
+        return value;
+      } catch (error) {
+        return {
+          status: 'blocked' as const,
+          reason: reasonOf(error, 'PAGE_CHANGED'),
+        };
+      }
+    };
+  };
   return {
+    contentCapabilities: () => structuredClone(capabilities),
     async openSession() {
       try {
         await session.open();
@@ -170,13 +273,44 @@ export function createAdapterWithPages(
       return probe();
     },
     closeSession: () => session.close(),
+    bindTaskForContinuation(task, generation) {
+      const existing = checkedSession;
+      if (
+        task.state !== 'queued' ||
+        !session.current() ||
+        session.generation() !== generation ||
+        existing?.status !== 'ready' ||
+        existing.generation !== generation
+      )
+        return fail('PAGE_CHANGED');
+      if (!sameStore(existing.store, task.store)) fail('STORE_CHANGED');
+      pages.bindTaskForContinuation?.(task.taskId, generation);
+      continuationOwners.set(task.taskId, {
+        generation,
+        storeKey: task.store.storeKey,
+      });
+    },
+    captureHandledTaskContinuation,
+    async returnHomeAfterHandledTask(task, cancelled) {
+      try {
+        return await captureHandledTaskContinuation(task)(cancelled);
+      } catch (error) {
+        return { status: 'blocked', reason: reasonOf(error, 'PAGE_CHANGED') };
+      }
+    },
     async reconcile(task) {
       if (!pages.manualReview) return reconcileWithPages(reads, task);
-      if (!pages.reviewSavedDraft)
+      if (
+        !(task.snapshot.version === 2
+          ? pages.reviewRichSavedDraft
+          : pages.reviewSavedDraft)
+      )
         return blocked(
-          task.reason === 'MANUAL_REVIEW_REQUIRED'
-            ? task.reason
-            : 'RESULT_AMBIGUOUS',
+          task.snapshot.version === 2
+            ? 'PAGE_CHANGED'
+            : task.reason === 'MANUAL_REVIEW_REQUIRED'
+              ? task.reason
+              : 'RESULT_AMBIGUOUS',
         );
       try {
         if (
@@ -218,11 +352,11 @@ export function createAdapterWithPages(
           fail('RESULT_AMBIGUOUS');
         const readGeneration = session.generation();
         await checkStore(reads, task);
-        const observed = await pages.reviewSavedDraft(
-          task.taskId,
-          task.snapshot.article.title,
-          titleEdit?.editedTitle,
-        );
+        const observed = await (
+          task.snapshot.version === 2
+            ? pages.reviewRichSavedDraft!
+            : pages.reviewSavedDraft!
+        )(task.taskId, task.snapshot.article.title, titleEdit?.editedTitle);
         if (session.generation() !== readGeneration) fail('PAGE_CHANGED');
         if (
           diagnosticOnly ||
@@ -233,6 +367,8 @@ export function createAdapterWithPages(
             ) !== true)
         )
           return blocked('RESULT_AMBIGUOUS');
+        if (task.snapshot.version === 2 && !richEvidenceKnown(observed))
+          fail('PAGE_CHANGED');
         const evidence = { ...task.evidence, remote: observed.remote };
         if (
           !evidence.remote ||
@@ -263,7 +399,9 @@ export function createAdapterWithPages(
       }
     },
     async checkAbsence(task) {
-      if (pages.manualReview) return blocked('RESULT_AMBIGUOUS');
+      // Closure proof must not depend on what the platform draft box contains:
+      // the operator confirms the closure in the closure panel, and the local
+      // task record (no save attempt, no remote evidence) is authoritative.
       try {
         if (
           !DraftTaskSchema.safeParse(task).success ||
@@ -272,8 +410,6 @@ export function createAdapterWithPages(
           return blocked('RESULT_AMBIGUOUS');
         const generation = session.generation();
         const before = await checkStore(reads, task);
-        if (!(await reads.inspectDraftAbsence?.(task.snapshot.article.title)))
-          return blocked('RESULT_AMBIGUOUS');
         const after = await checkStore(reads, task);
         if (
           session.generation() !== generation ||
@@ -301,6 +437,69 @@ export function createAdapterWithPages(
       if (result.status === 'blocked') fail(result.reason);
     },
     async execute(task, hooks) {
+      // No V2 task reaches the writer without a capability declaration and a
+      // snapshot whose rich semantics the adapter can reproduce exactly.
+      if (task.snapshot.version === 2) {
+        if (!fixtureCapabilities) return blocked('FORMAT_UNSUPPORTED');
+        try {
+          verifyDraftSnapshotIntegrity(task.snapshot);
+        } catch {
+          return blocked('INPUT_UNSUPPORTED');
+        }
+        if (
+          !pages.appendTextBlock ||
+          !pages.inspectRichEditor ||
+          !pages.inspectRichDraft ||
+          (pages.manualReview &&
+            pages.automaticDraftReview &&
+            !pages.reviewRichSavedDraft)
+        )
+          return blocked('PAGE_CHANGED');
+        if (!checkContentSupport(task.snapshot.editorBody, capabilities).ok)
+          return blocked('FORMAT_UNSUPPORTED');
+        // The platform exposes no starting-number control: reject before any
+        // block write so an unsupported list cannot leave a partial draft.
+        if (
+          task.snapshot.editorBody.blocks.some(
+            (block) =>
+              block.type === 'list' &&
+              block.kind === 'ordered' &&
+              block.start !== 1,
+          )
+        )
+          return blocked('FORMAT_UNSUPPORTED');
+      }
+      const rich = task.snapshot.version === 2;
+      const plainArticle =
+        pages.writesOnEditorReady &&
+        task.snapshot.version === 2 &&
+        task.snapshot.editorBody.blocks.every(
+          (b) =>
+            b.type === 'image' ||
+            (b.type === 'paragraph' &&
+              b.content.every((run) => run.marks.length === 0)),
+        );
+
+      const inspect = async () => {
+        const value = pages.inspectOperationEditor
+          ? await pages.inspectOperationEditor()
+          : rich
+            ? await pages.inspectRichEditor!()
+            : await pages.inspectEditor();
+        if (
+          !value.known ||
+          !value.store ||
+          !value.contextKey ||
+          !value.editorUrl ||
+          !validEditorUrl(value.editorUrl)
+        )
+          fail('PAGE_CHANGED');
+        return value;
+      };
+      const review =
+        task.snapshot.version === 2
+          ? pages.reviewRichSavedDraft
+          : pages.reviewSavedDraft;
       if (
         attempted.has(task.taskId) ||
         task.saveAttempted ||
@@ -330,10 +529,16 @@ export function createAdapterWithPages(
           (pages.localCoverUpload !== 'supported' || !pages.uploadLocalCover)
         )
           fail('INPUT_UNSUPPORTED');
-        for (const block of task.snapshot.article.body) {
+        const body =
+          task.snapshot.version === 2
+            ? task.snapshot.editorBody.blocks
+            : task.snapshot.article.body;
+        for (const block of body) {
           if (block.type === 'image') {
             const asset = task.snapshot.article.assets.find(
-              (value) => value.imageId === block.image_id,
+              (value) =>
+                value.imageId ===
+                ('imageId' in block ? block.imageId : block.image_id),
             );
             if (!asset) fail('ASSET_UNAVAILABLE');
             if (asset!.mime !== 'image/jpeg' && asset!.mime !== 'image/png')
@@ -359,7 +564,14 @@ export function createAdapterWithPages(
             await pages.checkWritingContext!(
               () => task.stopRequested || hooks.stopped(),
             );
-            if (session.generation() !== generation) fail('PAGE_CHANGED');
+            if (session.generation() !== generation) {
+              diag('guard-generation', {
+                at: 'checkWritingContext',
+                generation,
+                now: session.generation(),
+              });
+              fail('PAGE_CHANGED');
+            }
             stop();
             if (
               !coverPlan ||
@@ -370,21 +582,43 @@ export function createAdapterWithPages(
           }
           await checkStore(reads, task);
           stop();
-          if (session.generation() !== generation) fail('PAGE_CHANGED');
+          if (session.generation() !== generation) {
+            diag('guard-generation', {
+              at: 'checkStore',
+              generation,
+              now: session.generation(),
+            });
+            fail('PAGE_CHANGED');
+          }
           if (context) {
-            const current = await reads.inspectEditor();
+            const current = await inspect();
             stop();
-            if (session.generation() !== generation) fail('PAGE_CHANGED');
+            if (session.generation() !== generation) {
+              diag('guard-generation', {
+                at: 'inspect',
+                generation,
+                now: session.generation(),
+              });
+              fail('PAGE_CHANGED');
+            }
             if (
               !current.known ||
               current.contextKey !== context.contextKey ||
               current.editorUrl !== context.editorUrl
-            )
+            ) {
+              diag('guard-inspect', {
+                known: current.known,
+                contextKey: current.contextKey,
+                expectedContextKey: context.contextKey,
+                editorUrl: current.editorUrl,
+                expectedEditorUrl: context.editorUrl,
+              });
               fail('PAGE_CHANGED');
+            }
             if (!sameStore(current.store, task.store)) fail('STORE_CHANGED');
             if (current.remote) fail('CONTENT_MISMATCH');
             if (titleWritten) {
-              if (!matchesContent(local(), current, count))
+              if (!matchesOperationContent(local(), current, count))
                 fail('CONTENT_MISMATCH');
             } else if (
               current.title !== '' ||
@@ -401,9 +635,12 @@ export function createAdapterWithPages(
           action: () => Promise<void>,
           retainEvidence = false,
         ) => {
+          diag('effect-start', { stage });
           await guard();
+          diag('effect-checkpoint', { stage });
           await hooks.checkpoint(stage);
           await guard();
+          diag('effect-action', { stage });
           await action();
           if (!retainEvidence) stop();
         };
@@ -428,36 +665,65 @@ export function createAdapterWithPages(
             hooks.batchSubmissionReview === 'operator',
           ),
         );
-        context = await reads.inspectEditor();
-        stop();
-        if (
-          !context.known ||
-          !context.contextKey ||
-          !context.editorUrl ||
-          !validEditorUrl(context.editorUrl)
-        )
-          fail('PAGE_CHANGED');
-        if (
-          checkpointed &&
-          (context.title ||
-            context.blocks.length ||
-            context.remote ||
-            context.pendingUploads ||
-            !sameStore(context.store, task.store))
-        )
-          fail('CONTENT_MISMATCH');
+        if (!pages.writesOnEditorReady) {
+          context = await inspect();
+          stop();
+          if (
+            !context.known ||
+            !context.contextKey ||
+            !context.editorUrl ||
+            !validEditorUrl(context.editorUrl)
+          )
+            fail('PAGE_CHANGED');
+          if (
+            checkpointed &&
+            (context.title ||
+              context.blocks.length ||
+              context.remote ||
+              context.pendingUploads ||
+              !sameStore(context.store, task.store))
+          )
+            fail('CONTENT_MISMATCH');
+        }
         await effect('body', () =>
           pages.fillTitle(task.snapshot.article.title),
         );
         titleWritten = true;
-        for (const [bodyIndex, block] of task.snapshot.article.body.entries()) {
-          if (block.type === 'paragraph') {
-            await effect('body', () => pages.appendParagraph(block.text));
+        if (!context) {
+          context = await inspect();
+          if (!sameStore(context.store, task.store)) fail('STORE_CHANGED');
+          if (
+            context.remote ||
+            context.pendingUploads ||
+            context.title !== task.snapshot.article.title
+          )
+            fail('CONTENT_MISMATCH');
+        }
+        for (const [bodyIndex, block] of body.entries()) {
+          if (
+            plainArticle &&
+            block.type === 'paragraph' &&
+            'content' in block
+          ) {
+            const text = block.content.map((run) => run.text).join('');
+            await effect('body', () => pages.appendParagraph(text));
+            count++;
+          } else if (block.type !== 'image') {
+            await effect('body', () =>
+              rich
+                ? pages.appendTextBlock!(
+                    block as import('../../../contracts/rich-text-body').RichTextBlock,
+                    () => task.stopRequested || hooks.stopped(),
+                  )
+                : pages.appendParagraph((block as { text: string }).text),
+            );
             count++;
           } else {
             await guard();
             const asset = task.snapshot.article.assets.find(
-              (value) => value.imageId === block.image_id,
+              (value) =>
+                value.imageId ===
+                ('imageId' in block ? block.imageId : block.image_id),
             )!;
             const bytes = await hooks.readImage(asset.assetKey);
             stop();
@@ -479,7 +745,7 @@ export function createAdapterWithPages(
                 ...evidence.images,
                 {
                   bodyIndex,
-                  imageId: block.image_id,
+                  imageId: 'imageId' in block ? block.imageId : block.image_id,
                   assetKey: asset.assetKey,
                   resourceKey,
                 },
@@ -490,7 +756,7 @@ export function createAdapterWithPages(
         }
         await guard();
         if (checkpointed) {
-          const final = await reads.inspectEditor();
+          const final = await inspect();
           stop();
           if (
             session.generation() !== generation ||
@@ -500,7 +766,7 @@ export function createAdapterWithPages(
           )
             fail('PAGE_CHANGED');
           if (!sameStore(final.store, task.store)) fail('STORE_CHANGED');
-          if (final.remote || !matchesContent(local(), final, count))
+          if (final.remote || !matchesOperationContent(local(), final, count))
             fail('CONTENT_MISMATCH');
         }
         const reportCover = async (
@@ -522,7 +788,7 @@ export function createAdapterWithPages(
         };
         const freshCoverEditor = async () => {
           await guard();
-          const current = await reads.inspectEditor();
+          const current = await inspect();
           stop();
           if (
             session.generation() !== generation ||
@@ -532,7 +798,10 @@ export function createAdapterWithPages(
           )
             fail('PAGE_CHANGED');
           if (!sameStore(current.store, task.store)) fail('STORE_CHANGED');
-          if (current.remote || !matchesContent(local(), current, count))
+          if (
+            current.remote ||
+            !matchesOperationContent(local(), current, count)
+          )
             fail('CONTENT_MISMATCH');
           return current;
         };
@@ -589,6 +858,22 @@ export function createAdapterWithPages(
                 () => task.stopRequested || hooks.stopped(),
               );
               if (outcome.status === 'blocked') {
+                if (
+                  outcome.reason === 'COVER_UPLOAD_FAILED' &&
+                  outcome.safeEditorProof
+                ) {
+                  await reportCover('failed', 'COVER_UPLOAD_FAILED');
+                  await persist({
+                    ...evidence,
+                    coverAbort: {
+                      attempts: 2,
+                      step: 'wait-for-upload',
+                      modalClosed: true,
+                      editorClean: true,
+                    },
+                  });
+                  return fail(outcome.reason);
+                }
                 await reportCover('needs_human', 'PAGE_UNVERIFIED');
                 return fail(outcome.reason);
               }
@@ -613,15 +898,11 @@ export function createAdapterWithPages(
                   proof.storeKey !== task.store.storeKey ||
                   proof.modalClosed !== true ||
                   proof.uploadsSettled !== true ||
-                  proof.bodyDigest !==
-                    createHash('sha256')
-                      .update(
-                        JSON.stringify({
-                          title: current.title,
-                          blocks: current.blocks,
-                        }),
-                      )
-                      .digest('hex')
+                  proof.editorUrl !== current.editorUrl ||
+                  proof.operation?.taskId !== current.operation?.taskId ||
+                  proof.operation?.rootKey !== current.operation?.rootKey ||
+                  proof.operation?.coverKey !== current.operation?.coverKey ||
+                  current.operation?.saving === true
                 )
                   fail('PAGE_CHANGED');
               }
@@ -640,10 +921,14 @@ export function createAdapterWithPages(
           await effect(
             'save',
             async () => {
+              if (rich) saveContext = await freshCoverEditor();
               saving = true;
               submission = await pages.saveForOperatorReview!(
                 () => task.stopRequested || hooks.stopped(),
+                (observed) => persist({ ...evidence, submission: observed }),
               );
+              if (!evidence.submission)
+                await persist({ ...evidence, submission });
             },
             true,
           );
@@ -663,6 +948,7 @@ export function createAdapterWithPages(
         await effect(
           'save',
           async () => {
+            if (rich) saveContext = await freshCoverEditor();
             saving = true;
             await pages.saveOnce();
           },
@@ -671,18 +957,19 @@ export function createAdapterWithPages(
         if (pages.manualReview) {
           if (!pages.automaticDraftReview)
             return blocked('MANUAL_REVIEW_REQUIRED');
-          if (!pages.reviewSavedDraft) fail('RESULT_AMBIGUOUS');
+          if (!review) fail('RESULT_AMBIGUOUS');
           stop();
           if (session.generation() !== generation) fail('PAGE_CHANGED');
           await checkStore(reads, task);
           stop();
           await hooks.verifying();
-          const observed = await pages.reviewSavedDraft!(
+          const observed = await review!(
             task.taskId,
             task.snapshot.article.title,
           );
           stop();
           if (session.generation() !== generation) fail('PAGE_CHANGED');
+          if (rich && !richEvidenceKnown(observed)) fail('PAGE_CHANGED');
           if (!observed.remote || !validRemote(observed.remote))
             fail('RESULT_AMBIGUOUS');
           const next = { ...evidence, remote: observed.remote };
@@ -697,7 +984,11 @@ export function createAdapterWithPages(
               : {}),
           };
         }
-        const saved = await reads.inspectEditor();
+        // The sole save may reopen its associated record in a new document.
+        // Result association is read-only; the writing root remains retired.
+        const saved = rich
+          ? await pages.inspectRichEditor!()
+          : await pages.inspectEditor();
         if (
           !saved.known ||
           saved.contextKey !== context.contextKey ||
@@ -718,6 +1009,16 @@ export function createAdapterWithPages(
               result.status === 'blocked' ? result.reason : 'RESULT_AMBIGUOUS',
             );
       } catch (error) {
+        if (
+          error instanceof JudongchePageError &&
+          error.reason === 'CONTENT_MISMATCH'
+        ) {
+          try {
+            pages.reportAdapterFailure?.(error);
+          } catch {
+            // Optional diagnostics cannot replace the original execution result.
+          }
+        }
         if (
           coverPlan &&
           saving &&
@@ -751,7 +1052,7 @@ export function createAdapterWithPages(
             return blocked('RESULT_AMBIGUOUS');
           try {
             const before = await checkStore(reads, task);
-            const current = await reads.inspectEditor();
+            const current = await inspect();
             const after = await checkStore(reads, task);
             if (task.stopRequested || hooks.stopped())
               return blocked('STOP_REQUESTED');
@@ -763,7 +1064,7 @@ export function createAdapterWithPages(
               current.remote ||
               current.contextKey !== saveContext.contextKey ||
               current.editorUrl !== saveContext.editorUrl ||
-              !matchesContent({ ...task, evidence }, current)
+              !matchesOperationContent({ ...task, evidence }, current)
             )
               return blocked('RESULT_AMBIGUOUS');
             return blocked('COVER_REQUIRED');
@@ -786,5 +1087,6 @@ export function createJudongcheAdapter(
   return createAdapterWithPages(
     session,
     createJudongchePages(session, diagnostic, options),
+    JUDONGCHE_CONTENT_CAPABILITIES,
   );
 }
